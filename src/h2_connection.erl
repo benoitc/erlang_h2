@@ -17,7 +17,9 @@
 
 %% API
 -export([start_link/3, start_link/4]).
--export([send_request/4, send_response/4, send_data/3, send_data/4]).
+-export([activate/1]).
+-export([wait_connected/1, wait_connected/2]).
+-export([send_request/4, send_request/5, send_request_headers/3, send_response/4, send_data/3, send_data/4]).
 -export([send_trailers/3]).
 -export([cancel_stream/2, cancel_stream/3]).
 -export([send_goaway/1, send_goaway/2, close/1]).
@@ -40,6 +42,7 @@
     window_size :: integer(),
     recv_window_size :: integer(),
     send_buffer = <<>> :: binary(),
+    pending_end_stream = false :: boolean(),  %% Track if buffered data should end stream
     header_buffer = <<>> :: binary(),
     request_headers = [] :: [{binary(), binary()}],
     response_headers = [] :: [{binary(), binary()}]
@@ -81,7 +84,10 @@
 
     %% Timers
     settings_timer :: reference() | undefined,
-    close_timer :: reference() | undefined
+    close_timer :: reference() | undefined,
+
+    %% Callers waiting for connected state
+    waiters = [] :: [gen_statem:from()]
 }).
 
 %% ============================================================================
@@ -98,11 +104,44 @@ start_link(client, Socket, Opts) ->
 start_link(Mode, Socket, Owner, Opts) ->
     gen_statem:start_link(?MODULE, {Mode, Socket, Owner, Opts}, []).
 
+%% @doc Wait for the connection to reach connected state.
+-spec wait_connected(pid()) -> ok | {error, term()}.
+wait_connected(Conn) ->
+    wait_connected(Conn, 30000).
+
+%% @doc Wait for the connection to reach connected state with timeout.
+-spec wait_connected(pid(), timeout()) -> ok | {error, term()}.
+wait_connected(Conn, Timeout) ->
+    try
+        gen_statem:call(Conn, wait_connected, Timeout)
+    catch
+        exit:{Reason, _} -> {error, Reason};
+        exit:Reason -> {error, Reason}
+    end.
+
+%% @doc Activate the socket after ownership transfer.
+%% Must be called after transferring socket ownership to this process.
+-spec activate(pid()) -> ok.
+activate(Conn) ->
+    gen_statem:cast(Conn, activate).
+
 %% @doc Send a request (client mode).
 -spec send_request(pid(), binary(), binary(), [{binary(), binary()}]) ->
     {ok, non_neg_integer()} | {error, term()}.
 send_request(Conn, Method, Path, Headers) ->
-    gen_statem:call(Conn, {send_request, Method, Path, Headers}).
+    send_request(Conn, Method, Path, Headers, true).
+
+%% @doc Send a request with EndStream flag (client mode).
+-spec send_request(pid(), binary(), binary(), [{binary(), binary()}], boolean()) ->
+    {ok, non_neg_integer()} | {error, term()}.
+send_request(Conn, Method, Path, Headers, EndStream) ->
+    gen_statem:call(Conn, {send_request, Method, Path, Headers, EndStream}).
+
+%% @doc Send a request with a pre-built header list (including pseudo-headers).
+-spec send_request_headers(pid(), [{binary(), binary()}], boolean()) ->
+    {ok, non_neg_integer()} | {error, term()}.
+send_request_headers(Conn, Headers, EndStream) ->
+    gen_statem:call(Conn, {send_request_headers, Headers, EndStream}).
 
 %% @doc Send a response (server mode).
 -spec send_response(pid(), non_neg_integer(), non_neg_integer(), [{binary(), binary()}]) ->
@@ -175,9 +214,9 @@ init({Mode, Socket, Owner, Opts}) ->
     process_flag(trap_exit, true),
 
     %% Determine transport
-    Transport = case Socket of
-        {sslsocket, _, _} -> ssl;
-        _ -> gen_tcp
+    Transport = case is_ssl_socket(Socket) of
+        true -> ssl;
+        false -> gen_tcp
     end,
 
     %% Initialize settings
@@ -206,8 +245,9 @@ init({Mode, Socket, Owner, Opts}) ->
         recv_conn_window_size = RecvWindow
     },
 
-    %% Set socket to active mode
-    ok = set_active(Transport, Socket),
+    %% Note: Socket is NOT set to active here - it will be activated
+    %% in the preface state after socket ownership is properly transferred.
+    %% The caller must transfer socket ownership before the connection can receive data.
 
     {ok, preface, State}.
 
@@ -231,19 +271,10 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %% State: preface
 %% ============================================================================
 
-preface(enter, _OldState, #state{mode = Mode} = State) ->
-    %% Send connection preface
-    State1 = case Mode of
-        client ->
-            %% Client sends preface + SETTINGS
-            send_preface(State);
-        server ->
-            %% Server just sends SETTINGS
-            send_settings_frame(State)
-    end,
-    %% Start settings timer
-    Timer = erlang:start_timer(?SETTINGS_TIMEOUT_MS, self(), settings_timeout),
-    {keep_state, State1#state{settings_timer = Timer}};
+preface(enter, _OldState, State) ->
+    %% Don't send preface/settings yet - wait for socket activation
+    %% The caller will transfer socket ownership and call activate
+    {keep_state, State};
 
 preface(info, {tcp, Socket, Data}, #state{socket = Socket} = State) ->
     handle_data(preface, Data, State);
@@ -251,19 +282,39 @@ preface(info, {ssl, Socket, Data}, #state{socket = Socket} = State) ->
     handle_data(preface, Data, State);
 
 preface(info, {tcp_closed, Socket}, #state{socket = Socket} = State) ->
-    {stop, {shutdown, tcp_closed}, State};
+    stop_and_notify_waiters({shutdown, tcp_closed}, State);
 preface(info, {ssl_closed, Socket}, #state{socket = Socket} = State) ->
-    {stop, {shutdown, ssl_closed}, State};
+    stop_and_notify_waiters({shutdown, ssl_closed}, State);
 
 preface(info, {tcp_error, Socket, Reason}, #state{socket = Socket} = State) ->
-    {stop, {shutdown, {tcp_error, Reason}}, State};
+    stop_and_notify_waiters({shutdown, {tcp_error, Reason}}, State);
 preface(info, {ssl_error, Socket, Reason}, #state{socket = Socket} = State) ->
-    {stop, {shutdown, {ssl_error, Reason}}, State};
+    stop_and_notify_waiters({shutdown, {ssl_error, Reason}}, State);
 
 preface(info, {timeout, Timer, settings_timeout}, #state{settings_timer = Timer} = State) ->
     %% Peer didn't respond in time
     State1 = send_goaway_frame(0, settings_timeout, State),
     {next_state, closing, State1};
+
+preface(cast, activate, #state{mode = Mode, transport = Transport, socket = Socket} = State) ->
+    %% Socket ownership has been transferred, now we can send and receive
+    case set_active(Transport, Socket) of
+        ok ->
+            %% Send connection preface/settings
+            State1 = case Mode of
+                client ->
+                    %% Client sends preface + SETTINGS
+                    send_preface(State);
+                server ->
+                    %% Server just sends SETTINGS
+                    send_settings_frame(State)
+            end,
+            %% Start settings timer
+            Timer = erlang:start_timer(?SETTINGS_TIMEOUT_MS, self(), settings_timeout),
+            {keep_state, State1#state{settings_timer = Timer}};
+        {error, Reason} ->
+            stop_and_notify_waiters({shutdown, {socket_error, Reason}}, State)
+    end;
 
 preface({call, From}, Request, State) ->
     %% Queue or reject requests until connected
@@ -285,13 +336,18 @@ settings(info, {ssl, Socket, Data}, #state{socket = Socket} = State) ->
     handle_data(settings, Data, State);
 
 settings(info, {tcp_closed, Socket}, #state{socket = Socket} = State) ->
-    {stop, {shutdown, tcp_closed}, State};
+    stop_and_notify_waiters({shutdown, tcp_closed}, State);
 settings(info, {ssl_closed, Socket}, #state{socket = Socket} = State) ->
-    {stop, {shutdown, ssl_closed}, State};
+    stop_and_notify_waiters({shutdown, ssl_closed}, State);
 
 settings(info, {timeout, Timer, settings_timeout}, #state{settings_timer = Timer} = State) ->
     State1 = send_goaway_frame(0, settings_timeout, State),
     {next_state, closing, State1};
+
+settings(cast, activate, #state{transport = Transport, socket = Socket} = State) ->
+    %% Socket ownership has been transferred, set to active mode
+    ok = set_active(Transport, Socket),
+    {keep_state, State};
 
 settings({call, From}, Request, State) ->
     handle_call_early(From, Request, settings, State);
@@ -303,13 +359,17 @@ settings(EventType, Event, State) ->
 %% State: connected
 %% ============================================================================
 
-connected(enter, _OldState, #state{settings_timer = Timer} = State) ->
+connected(enter, _OldState, #state{settings_timer = Timer, waiters = Waiters} = State) ->
     %% Cancel settings timer if still running
     case Timer of
         undefined -> ok;
         _ -> erlang:cancel_timer(Timer)
     end,
-    {keep_state, State#state{settings_timer = undefined}};
+    %% Notify owner that connection is ready
+    notify_owner({h2, self(), connected}, State),
+    %% Reply to all waiters
+    Replies = [{reply, From, ok} || From <- Waiters],
+    {keep_state, State#state{settings_timer = undefined, waiters = []}, Replies};
 
 connected(info, {tcp, Socket, Data}, #state{socket = Socket} = State) ->
     handle_data(connected, Data, State);
@@ -323,8 +383,11 @@ connected(info, {ssl_closed, Socket}, #state{socket = Socket} = State) ->
     notify_owner({h2, self(), closed}, State),
     {stop, {shutdown, ssl_closed}, State};
 
-connected({call, From}, {send_request, Method, Path, Headers}, State) ->
-    handle_send_request(From, Method, Path, Headers, State);
+connected({call, From}, {send_request, Method, Path, Headers, EndStream}, State) ->
+    handle_send_request(From, Method, Path, Headers, EndStream, State);
+
+connected({call, From}, {send_request_headers, Headers, EndStream}, State) ->
+    handle_send_request_headers(From, Headers, EndStream, State);
 
 connected({call, From}, {send_response, StreamId, Status, Headers}, State) ->
     handle_send_response(From, StreamId, Status, Headers, State);
@@ -340,6 +403,10 @@ connected({call, From}, {cancel_stream, StreamId, ErrorCode}, State) ->
 
 connected({call, From}, {send_goaway, ErrorCode}, State) ->
     handle_send_goaway(From, ErrorCode, connected, State);
+
+connected({call, From}, wait_connected, State) ->
+    %% Already connected, reply immediately
+    {keep_state, State, [{reply, From, ok}]};
 
 connected({call, From}, Request, State) ->
     handle_call_common(From, Request, connected, State);
@@ -440,7 +507,9 @@ closing(EventType, Event, State) ->
 %% ============================================================================
 
 handle_data(StateName, Data, #state{buffer = Buffer, mode = Mode, preface_received = PrefaceReceived} = State) ->
-    NewBuffer = <<Buffer/binary, Data/binary>>,
+    %% Convert iolist to binary if needed
+    DataBin = iolist_to_binary(Data),
+    NewBuffer = <<Buffer/binary, DataBin/binary>>,
     State1 = State#state{buffer = NewBuffer},
 
     %% Check for preface if server and not yet received
@@ -485,15 +554,31 @@ process_frames(StateName, #state{buffer = Buffer} = State) ->
             end;
         {more, _Needed} ->
             ok = set_active(State#state.transport, State#state.socket),
-            case StateName of
-                preface when State#state.preface_received ->
-                    {next_state, settings, State};
-                _ ->
-                    {keep_state, State}
-            end;
+            %% Determine the correct state based on connection conditions
+            determine_state_transition(State);
         {error, Reason} ->
             State1 = send_goaway_frame(State#state.last_peer_stream_id, Reason, State),
             {next_state, closing, State1}
+    end.
+
+%% Determine the correct state based on connection conditions
+determine_state_transition(#state{mode = Mode, preface_received = PrefaceReceived,
+                                   settings_acked = SettingsAcked} = State) ->
+    %% For client: connected when we've received and acked peer's settings,
+    %% and received ack for our settings
+    %% For server: connected when preface received, settings exchanged
+    case Mode of
+        client ->
+            case SettingsAcked of
+                true -> {next_state, connected, State};
+                false -> {next_state, settings, State}
+            end;
+        server ->
+            case {PrefaceReceived, SettingsAcked} of
+                {true, true} -> {next_state, connected, State};
+                {true, false} -> {next_state, settings, State};
+                {false, _} -> {keep_state, State}
+            end
     end.
 
 %% ============================================================================
@@ -660,23 +745,36 @@ apply_local_settings(Settings, #state{decode_context = DecCtx} = State) ->
 %% Internal: Headers Handling
 %% ============================================================================
 
-handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, _Priority, #state{mode = Mode} = State) ->
-    %% Validate stream ID
-    case validate_stream_id(StreamId, Mode, State) of
-        ok ->
+handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, _Priority, #state{mode = Mode, streams = Streams} = State) ->
+    %% Check if this is a response on an existing stream or a new stream
+    case maps:find(StreamId, Streams) of
+        {ok, _Stream} ->
+            %% Existing stream - this is a response (client) or trailers
             case EndHeaders of
                 true ->
-                    %% Complete header block, decode and process
                     decode_and_process_headers(StreamId, HeaderBlock, EndStream, State);
                 false ->
-                    %% Need continuation frames
-                    Stream = get_or_create_stream(StreamId, State),
+                    Stream = maps:get(StreamId, Streams),
                     Stream1 = Stream#stream{header_buffer = HeaderBlock},
                     State1 = put_stream(StreamId, Stream1, State),
                     {ok, connected, State1}
             end;
-        {error, ErrorCode} ->
-            {error, ErrorCode, State}
+        error ->
+            %% New stream - validate stream ID
+            case validate_stream_id(StreamId, Mode, State) of
+                ok ->
+                    case EndHeaders of
+                        true ->
+                            decode_and_process_headers(StreamId, HeaderBlock, EndStream, State);
+                        false ->
+                            Stream = get_or_create_stream(StreamId, State),
+                            Stream1 = Stream#stream{header_buffer = HeaderBlock},
+                            State1 = put_stream(StreamId, Stream1, State),
+                            {ok, connected, State1}
+                    end;
+                {error, ErrorCode} ->
+                    {error, ErrorCode, State}
+            end
     end.
 
 handle_continuation(StreamId, HeaderBlock, EndHeaders, #state{streams = Streams} = State) ->
@@ -701,11 +799,40 @@ decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_conte
     case h2_hpack:decode(HeaderBlock, DecCtx) of
         {ok, Headers, DecCtx1} ->
             State1 = State#state{decode_context = DecCtx1},
-            Stream = get_or_create_stream(StreamId, State1),
+            %% Determine whether this is an initial HEADERS (request/response)
+            %% or a trailing HEADERS. Only initial HEADERS are subject to
+            %% pseudo-header validation (RFC 7540 §8.1.2.3 / §8.1.2.1).
+            IsInitialHeaders = case Mode of
+                server -> true;
+                client ->
+                    case maps:find(StreamId, State1#state.streams) of
+                        {ok, #stream{response_headers = []}} -> true;
+                        error -> true;
+                        _ -> false
+                    end
+            end,
+            case IsInitialHeaders andalso validate_pseudo_headers(Mode, Headers) of
+                false ->
+                    decode_and_process_headers_cont(StreamId, Headers, EndStream, State1);
+                ok ->
+                    decode_and_process_headers_cont(StreamId, Headers, EndStream, State1);
+                {error, ValidErr} ->
+                    send_rst_stream(StreamId, ValidErr, State1),
+                    State2 = case maps:is_key(StreamId, State1#state.streams) of
+                        true -> close_stream(StreamId, State1);
+                        false -> State1
+                    end,
+                    {ok, connected, State2}
+            end;
+        {error, Reason} ->
+            error_logger:error_msg("HPACK decode error: ~p~n", [Reason]),
+            {error, compression_error, State}
+    end.
 
-            %% Determine if this is a request or response
-            case Mode of
-                server ->
+decode_and_process_headers_cont(StreamId, Headers, EndStream, #state{mode = Mode} = State1) ->
+    Stream = get_or_create_stream(StreamId, State1),
+    case Mode of
+        server ->
                     %% This is a request
                     Stream1 = Stream#stream{
                         state = case EndStream of true -> half_closed_remote; false -> open end,
@@ -725,30 +852,109 @@ decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_conte
                     {ok, connected, State3};
 
                 client ->
-                    %% This is a response
-                    Stream1 = Stream#stream{
-                        state = case EndStream of true -> half_closed_remote; false -> open end,
-                        response_headers = Headers
-                    },
-                    State2 = put_stream(StreamId, Stream1, State1),
+                    %% Check if this is a response or trailers
+                    case Stream#stream.response_headers of
+                        [] ->
+                            %% This is a response (first HEADERS on this stream)
+                            Stream1 = Stream#stream{
+                                state = case EndStream of true -> half_closed_remote; false -> open end,
+                                response_headers = Headers
+                            },
+                            State2 = put_stream(StreamId, Stream1, State1),
 
-                    %% Notify owner
-                    Status = extract_status(Headers),
-                    OtherHeaders = lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers),
-                    notify_owner({h2, self(), {response, StreamId, Status, OtherHeaders}}, State2),
+                            %% Notify owner
+                            Status = extract_status(Headers),
+                            OtherHeaders = lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers),
+                            notify_owner({h2, self(), {response, StreamId, Status, OtherHeaders}}, State2),
 
-                    case EndStream of
-                        true ->
+                            case EndStream of
+                                true ->
+                                    State3 = close_stream(StreamId, State2),
+                                    {ok, connected, State3};
+                                false ->
+                                    {ok, connected, State2}
+                            end;
+                        _ ->
+                            %% This is trailers (subsequent HEADERS on this stream)
+                            Stream1 = Stream#stream{state = closed},
+                            State2 = put_stream(StreamId, Stream1, State1),
+
+                            %% Notify owner with trailers
+                            notify_owner({h2, self(), {trailers, StreamId, Headers}}, State2),
+
                             State3 = close_stream(StreamId, State2),
-                            {ok, connected, State3};
-                        false ->
-                            {ok, connected, State2}
+                            {ok, connected, State3}
                     end
-            end;
-        {error, Reason} ->
-            %% Compression error is connection-level
-            error_logger:error_msg("HPACK decode error: ~p~n", [Reason]),
-            {error, compression_error, State}
+            end.
+
+%% Validate pseudo-headers per RFC 7540 §8.1.2.3 (requests) and §8.1.2.4 (responses):
+%% - pseudo-headers must precede regular headers
+%% - unknown pseudo-headers MUST be rejected
+%% - requests MUST contain :method, :scheme, :path (except CONNECT); :authority optional
+%% - responses MUST contain :status
+%% - no duplicate pseudo-headers
+validate_pseudo_headers(Mode, Headers) ->
+    case check_pseudo_order(Headers) of
+        ok -> check_pseudo_set(Mode, Headers);
+        Err -> Err
+    end.
+
+check_pseudo_order(Headers) ->
+    check_pseudo_order(Headers, pseudo).
+
+check_pseudo_order([], _) -> ok;
+check_pseudo_order([{<<$:, _/binary>>, _} | Rest], pseudo) ->
+    check_pseudo_order(Rest, pseudo);
+check_pseudo_order([{<<$:, _/binary>>, _} | _], regular) ->
+    {error, protocol_error};
+check_pseudo_order([{_, _} | Rest], _) ->
+    check_pseudo_order(Rest, regular).
+
+check_pseudo_set(server, Headers) ->
+    Pseudos = [N || {<<$:, _/binary>> = N, _} <- Headers],
+    Uniq = lists:usort(Pseudos),
+    case length(Pseudos) =:= length(Uniq) of
+        false -> {error, protocol_error};
+        true ->
+            Allowed = [<<":method">>, <<":scheme">>, <<":path">>, <<":authority">>],
+            case [N || N <- Pseudos, not lists:member(N, Allowed)] of
+                [] ->
+                    Method = proplists:get_value(<<":method">>, Headers),
+                    case Method of
+                        undefined -> {error, protocol_error};
+                        <<"CONNECT">> ->
+                            case proplists:get_value(<<":authority">>, Headers) of
+                                undefined -> {error, protocol_error};
+                                _ -> ok
+                            end;
+                        _ ->
+                            case {proplists:get_value(<<":scheme">>, Headers),
+                                  proplists:get_value(<<":path">>, Headers)} of
+                                {undefined, _} -> {error, protocol_error};
+                                {_, undefined} -> {error, protocol_error};
+                                {_, <<>>} -> {error, protocol_error};
+                                _ -> ok
+                            end
+                    end;
+                _Unknown ->
+                    {error, protocol_error}
+            end
+    end;
+check_pseudo_set(client, Headers) ->
+    Pseudos = [N || {<<$:, _/binary>> = N, _} <- Headers],
+    Uniq = lists:usort(Pseudos),
+    case length(Pseudos) =:= length(Uniq) of
+        false -> {error, protocol_error};
+        true ->
+            case [N || N <- Pseudos, N =/= <<":status">>] of
+                [] ->
+                    case proplists:get_value(<<":status">>, Headers) of
+                        undefined -> {error, protocol_error};
+                        _ -> ok
+                    end;
+                _Unknown ->
+                    {error, protocol_error}
+            end
     end.
 
 extract_request_headers(Headers) ->
@@ -861,7 +1067,7 @@ maybe_send_window_update(StreamId, _DataSize, #state{recv_conn_window_size = Con
 %% Internal: Send Operations
 %% ============================================================================
 
-handle_send_request(From, Method, Path, Headers, #state{mode = client, next_stream_id = StreamId,
+handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client, next_stream_id = StreamId,
                                                         peer_settings = PeerSettings,
                                                         encode_context = EncCtx} = State) ->
     %% Check max concurrent streams
@@ -886,18 +1092,22 @@ handle_send_request(From, Method, Path, Headers, #state{mode = client, next_stre
             %% Encode headers
             {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
 
-            %% Create stream
+            %% Create stream with appropriate state
             InitialWindow = h2_settings:get(initial_window_size, PeerSettings),
             RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
+            StreamState = case EndStream of
+                true -> half_closed_local;
+                false -> open
+            end,
             Stream = #stream{
                 id = StreamId,
-                state = open,
+                state = StreamState,
                 window_size = InitialWindow,
                 recv_window_size = RecvWindow
             },
 
-            %% Send HEADERS frame (without END_STREAM, will send data separately)
-            Frame = h2_frame:headers(StreamId, HeaderBlock, false),
+            %% Send HEADERS frame with END_STREAM flag as specified
+            Frame = h2_frame:headers(StreamId, HeaderBlock, EndStream),
             send_frame(Frame, State),
 
             State1 = State#state{
@@ -909,7 +1119,38 @@ handle_send_request(From, Method, Path, Headers, #state{mode = client, next_stre
             {keep_state, State1, [{reply, From, {ok, StreamId}}]}
     end;
 
-handle_send_request(From, _Method, _Path, _Headers, State) ->
+handle_send_request(From, _Method, _Path, _Headers, _EndStream, State) ->
+    {keep_state, State, [{reply, From, {error, not_client}}]}.
+
+handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next_stream_id = StreamId,
+                                                              peer_settings = PeerSettings,
+                                                              encode_context = EncCtx} = State) ->
+    MaxStreams = h2_settings:get(max_concurrent_streams, PeerSettings),
+    ActiveStreams = count_active_streams(State),
+    case MaxStreams of
+        N when is_integer(N), ActiveStreams >= N ->
+            {keep_state, State, [{reply, From, {error, max_streams_exceeded}}]};
+        _ ->
+            {HeaderBlock, EncCtx1} = h2_hpack:encode(Headers, EncCtx),
+            InitialWindow = h2_settings:get(initial_window_size, PeerSettings),
+            RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
+            StreamState = case EndStream of true -> half_closed_local; false -> open end,
+            Stream = #stream{
+                id = StreamId,
+                state = StreamState,
+                window_size = InitialWindow,
+                recv_window_size = RecvWindow
+            },
+            Frame = h2_frame:headers(StreamId, HeaderBlock, EndStream),
+            send_frame(Frame, State),
+            State1 = State#state{
+                encode_context = EncCtx1,
+                streams = maps:put(StreamId, Stream, State#state.streams),
+                next_stream_id = StreamId + 2
+            },
+            {keep_state, State1, [{reply, From, {ok, StreamId}}]}
+    end;
+handle_send_request_headers(From, _Headers, _EndStream, State) ->
     {keep_state, State, [{reply, From, {error, not_client}}]}.
 
 handle_send_response(From, StreamId, Status, Headers, #state{mode = server, streams = Streams,
@@ -957,9 +1198,9 @@ handle_send_data(From, StreamId, Data, EndStream, #state{streams = Streams, conn
 
             case ToSend1 of
                 0 when byte_size(Data) > 0 ->
-                    %% Need to buffer
+                    %% Need to buffer - also track if EndStream should be set when flushing
                     NewBuffer = <<Buffer/binary, Data/binary>>,
-                    Stream1 = Stream#stream{send_buffer = NewBuffer},
+                    Stream1 = Stream#stream{send_buffer = NewBuffer, pending_end_stream = EndStream},
                     State1 = State#state{streams = maps:put(StreamId, Stream1, Streams)},
                     {keep_state, State1, [{reply, From, ok}]};
 
@@ -974,10 +1215,12 @@ handle_send_data(From, StreamId, Data, EndStream, #state{streams = Streams, conn
                     NewConnWindow = ConnWindow - ToSend1,
                     NewStreamWindow = StreamWindow - ToSend1,
 
-                    %% Update stream state
+                    %% Update stream state; Remaining is handled via recursion below,
+                    %% so it must not be appended to send_buffer (would cause duplication).
                     Stream1 = Stream#stream{
                         window_size = NewStreamWindow,
-                        send_buffer = <<Buffer/binary, Remaining/binary>>,
+                        send_buffer = Buffer,
+                        pending_end_stream = EndStream andalso Remaining =/= <<>>,
                         state = case IsEnd of
                             true ->
                                 case StreamState of
@@ -1068,8 +1311,11 @@ handle_send_goaway(From, ErrorCode, CurrentState, State) ->
 %% Internal: Common Call Handling
 %% ============================================================================
 
-handle_call_early(From, Request, StateName, State) ->
+handle_call_early(From, Request, StateName, #state{waiters = Waiters} = State) ->
     case Request of
+        wait_connected ->
+            %% Queue this caller to be notified when connected
+            {keep_state, State#state{waiters = [From | Waiters]}};
         get_settings ->
             {keep_state, State, [{reply, From, State#state.local_settings}]};
         get_peer_settings ->
@@ -1160,7 +1406,8 @@ flush_stream_buffer(StreamId, #state{streams = Streams, conn_window_size = ConnW
     case maps:find(StreamId, Streams) of
         {ok, #stream{send_buffer = <<>>}} ->
             State;
-        {ok, #stream{send_buffer = Buffer, window_size = StreamWindow} = Stream} ->
+        {ok, #stream{send_buffer = Buffer, window_size = StreamWindow,
+                     pending_end_stream = PendingEnd, state = StreamState} = Stream} ->
             MaxFrameSize = h2_settings:get(max_frame_size, PeerSettings),
             Available = min(ConnWindow, StreamWindow),
             ToSend = min(Available, byte_size(Buffer)),
@@ -1171,12 +1418,26 @@ flush_stream_buffer(StreamId, #state{streams = Streams, conn_window_size = ConnW
                     State;
                 _ ->
                     <<SendData:ToSend1/binary, Remaining/binary>> = Buffer,
-                    Frame = h2_frame:data(StreamId, SendData, false),
+                    IsEnd = PendingEnd andalso Remaining == <<>>,
+                    Frame = h2_frame:data(StreamId, SendData, IsEnd),
                     send_frame(Frame, State),
+
+                    NewStreamState = case IsEnd of
+                        true ->
+                            case StreamState of
+                                open -> half_closed_local;
+                                half_closed_remote -> closed;
+                                _ -> StreamState
+                            end;
+                        false ->
+                            StreamState
+                    end,
 
                     Stream1 = Stream#stream{
                         send_buffer = Remaining,
-                        window_size = StreamWindow - ToSend1
+                        window_size = StreamWindow - ToSend1,
+                        pending_end_stream = PendingEnd andalso Remaining =/= <<>>,
+                        state = NewStreamState
                     },
                     State1 = State#state{
                         conn_window_size = ConnWindow - ToSend1,
@@ -1227,18 +1488,22 @@ encode_setting_value(V) -> V.
 
 send_frame(Frame, #state{socket = Socket, transport = Transport}) ->
     Bin = h2_frame:encode(Frame),
-    ok = Transport:send(Socket, Bin).
+    case Transport:send(Socket, Bin) of
+        ok -> ok;
+        {error, _Reason} -> ok  %% Peer closed; let subsequent handling clean up
+    end.
 
 send_goaway_frame(LastStreamId, ErrorCode, #state{socket = Socket, transport = Transport} = State) ->
     Frame = h2_frame:goaway(LastStreamId, ErrorCode, <<>>),
     Bin = h2_frame:encode(Frame),
-    ok = Transport:send(Socket, Bin),
+    _ = Transport:send(Socket, Bin),
     State#state{goaway_sent = true, goaway_error = ErrorCode}.
 
 send_rst_stream(StreamId, ErrorCode, #state{socket = Socket, transport = Transport}) ->
     Frame = h2_frame:rst_stream(StreamId, ErrorCode),
     Bin = h2_frame:encode(Frame),
-    ok = Transport:send(Socket, Bin).
+    _ = Transport:send(Socket, Bin),
+    ok.
 
 %% ============================================================================
 %% Internal: Utilities
@@ -1248,6 +1513,20 @@ set_active(gen_tcp, Socket) ->
     inet:setopts(Socket, [{active, once}]);
 set_active(ssl, Socket) ->
     ssl:setopts(Socket, [{active, once}]).
+
+%% Stop the gen_statem with Reason, replying {error, Reason} to any waiters
+%% that called wait_connected before we reached the connected state.
+stop_and_notify_waiters(Reason, #state{waiters = Waiters} = State) ->
+    Replies = [{reply, From, {error, peel_reason(Reason)}} || From <- Waiters],
+    {stop_and_reply, Reason, Replies, State#state{waiters = []}}.
+
+peel_reason({shutdown, R}) -> R;
+peel_reason(R) -> R.
+
+is_ssl_socket(Socket) when is_tuple(Socket) ->
+    element(1, Socket) =:= sslsocket;
+is_ssl_socket(_) ->
+    false.
 
 notify_owner(Msg, #state{owner = Owner}) ->
     Owner ! Msg.

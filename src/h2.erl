@@ -61,16 +61,18 @@
 
 %% Client API
 -export([connect/2, connect/3]).
--export([request/4, request/5]).
+-export([wait_connected/1, wait_connected/2]).
+-export([request/2, request/3, request/4, request/5]).
 
 %% Server API
--export([start_server/2, stop_server/1]).
+-export([start_server/2, start_server/3, stop_server/1]).
 -export([send_response/4]).
 
 %% Common API
 -export([send_data/3, send_data/4]).
 -export([send_trailers/3]).
 -export([cancel/2, cancel/3]).
+-export([cancel_stream/2, cancel_stream/3]).
 -export([goaway/1, goaway/2]).
 -export([close/1]).
 -export([get_settings/1, get_peer_settings/1]).
@@ -87,8 +89,14 @@
 -type connect_opts() :: #{
     transport => tcp | ssl,
     ssl_opts => [ssl:tls_client_option()],
+    cert => binary() | string(),
+    key => binary() | string(),
+    cacerts => [binary()],
+    verify => verify_none | verify_peer,
     settings => h2_settings:settings(),
-    timeout => timeout()
+    timeout => timeout(),
+    connect_timeout => timeout(),
+    sync => boolean()
 }.
 
 -type server_opts() :: #{
@@ -175,33 +183,72 @@ connect_tcp(Host, Port, Opts, Timeout) ->
 
 start_connection(Mode, Socket, Opts) ->
     ConnOpts = maps:with([settings], Opts),
+    Timeout = maps:get(timeout, Opts, 30000),
     case h2_connection:start_link(Mode, Socket, ConnOpts) of
         {ok, Pid} ->
             %% Transfer socket ownership to connection process
-            Transport = case Socket of
-                {sslsocket, _, _} -> ssl;
-                _ -> gen_tcp
+            Transport = case is_ssl_socket(Socket) of
+                true -> ssl;
+                false -> gen_tcp
             end,
             case Transport of
                 ssl -> ssl:controlling_process(Socket, Pid);
                 gen_tcp -> gen_tcp:controlling_process(Socket, Pid)
             end,
-            {ok, Pid};
+            %% Activate the socket now that ownership is transferred
+            h2_connection:activate(Pid),
+            %% Wait for connection to complete handshake
+            case h2_connection:wait_connected(Pid, Timeout) of
+                ok ->
+                    {ok, Pid};
+                {error, Reason} ->
+                    catch h2_connection:close(Pid),
+                    {error, Reason}
+            end;
         {error, Reason} ->
             {error, Reason}
     end.
 
+is_ssl_socket(Socket) when is_tuple(Socket) ->
+    element(1, Socket) =:= sslsocket;
+is_ssl_socket(_) ->
+    false.
+
+%% @doc Wait for a client connection to reach the connected state.
+-spec wait_connected(connection()) -> ok | {error, term()}.
+wait_connected(Conn) ->
+    h2_connection:wait_connected(Conn).
+
+-spec wait_connected(connection(), timeout()) -> ok | {error, term()}.
+wait_connected(Conn, Timeout) ->
+    h2_connection:wait_connected(Conn, Timeout).
+
+%% @doc Send an HTTP/2 request with pre-built headers (matches quic_h3:request/2).
+%% Headers should include pseudo-headers (:method, :path, :scheme, :authority).
+-spec request(connection(), headers()) ->
+    {ok, stream_id()} | {error, term()}.
+request(Conn, Headers) ->
+    request(Conn, Headers, #{}).
+
+-spec request(connection(), headers(), map()) ->
+    {ok, stream_id()} | {error, term()}.
+request(Conn, Headers, Opts) ->
+    EndStream = maps:get(end_stream, Opts, true),
+    h2_connection:send_request_headers(Conn, Headers, EndStream).
+
 %% @doc Send an HTTP/2 request.
+%% For requests without a body (GET, HEAD, etc.), this sends HEADERS with END_STREAM.
 -spec request(connection(), binary(), binary(), headers()) ->
     {ok, stream_id()} | {error, term()}.
 request(Conn, Method, Path, Headers) ->
-    h2_connection:send_request(Conn, Method, Path, Headers).
+    h2_connection:send_request(Conn, Method, Path, Headers, true).
 
 %% @doc Send an HTTP/2 request with body.
+%% Sends HEADERS without END_STREAM, then sends DATA with END_STREAM.
 -spec request(connection(), binary(), binary(), headers(), binary()) ->
     {ok, stream_id()} | {error, term()}.
 request(Conn, Method, Path, Headers, Body) ->
-    case h2_connection:send_request(Conn, Method, Path, Headers) of
+    case h2_connection:send_request(Conn, Method, Path, Headers, false) of
         {ok, StreamId} ->
             case h2_connection:send_data(Conn, StreamId, Body, true) of
                 ok -> {ok, StreamId};
@@ -214,6 +261,18 @@ request(Conn, Method, Path, Headers, Body) ->
 %% ============================================================================
 %% Server API
 %% ============================================================================
+
+%% @doc Start a named HTTP/2 server (matches quic_h3:start_server/3).
+-spec start_server(atom(), inet:port_number(), server_opts()) ->
+    {ok, server_ref()} | {error, term()}.
+start_server(Name, Port, Opts) when is_atom(Name) ->
+    case start_server(Port, Opts) of
+        {ok, Ref} ->
+            persistent_term:put({?MODULE, server, Name}, Ref),
+            {ok, Ref};
+        Other ->
+            Other
+    end.
 
 %% @doc Start an HTTP/2 server.
 -spec start_server(inet:port_number(), server_opts()) ->
@@ -301,10 +360,18 @@ acceptor_loop(Owner, #{listen_socket := ListenSocket, handler := Handler, settin
                     %% Check ALPN
                     case ssl:negotiated_protocol(SSLSocket) of
                         {ok, <<"h2">>} ->
+                            %% Ensure socket is in passive mode before transfer
+                            ssl:setopts(SSLSocket, [{active, false}]),
                             %% Start connection handler
-                            spawn_link(fun() ->
-                                handle_server_connection(SSLSocket, Handler, Settings)
-                            end);
+                            %% First spawn the process, then transfer socket ownership to it
+                            Pid = spawn_link(fun() ->
+                                receive
+                                    {socket_ready, Sock} ->
+                                        handle_server_connection(Sock, Handler, Settings)
+                                end
+                            end),
+                            ssl:controlling_process(SSLSocket, Pid),
+                            Pid ! {socket_ready, SSLSocket};
                         _ ->
                             ssl:close(SSLSocket)
                     end;
@@ -323,6 +390,7 @@ handle_server_connection(Socket, Handler, Settings) ->
     case h2_connection:start_link(server, Socket, self(), ConnOpts) of
         {ok, Conn} ->
             ssl:controlling_process(Socket, Conn),
+            h2_connection:activate(Conn),
             server_connection_loop(Conn, Handler);
         {error, _Reason} ->
             ssl:close(Socket)
@@ -388,6 +456,16 @@ cancel(Conn, StreamId) ->
 -spec cancel(connection(), stream_id(), error_code()) -> ok | {error, term()}.
 cancel(Conn, StreamId, ErrorCode) ->
     h2_connection:cancel_stream(Conn, StreamId, ErrorCode).
+
+%% @doc Alias for cancel/2.
+-spec cancel_stream(connection(), stream_id()) -> ok | {error, term()}.
+cancel_stream(Conn, StreamId) ->
+    cancel(Conn, StreamId).
+
+%% @doc Alias for cancel/3.
+-spec cancel_stream(connection(), stream_id(), error_code()) -> ok | {error, term()}.
+cancel_stream(Conn, StreamId, ErrorCode) ->
+    cancel(Conn, StreamId, ErrorCode).
 
 %% @doc Initiate graceful connection shutdown.
 -spec goaway(connection()) -> ok | {error, term()}.
