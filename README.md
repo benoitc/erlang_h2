@@ -105,7 +105,7 @@ rebar3 eunit
 
 ## Documentation
 
-See [doc/features.md](doc/features.md) for detailed documentation.
+See [docs/features.md](docs/features.md) for detailed documentation.
 
 ## License
 
