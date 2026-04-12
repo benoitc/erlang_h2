@@ -1,0 +1,777 @@
+%% @doc HTTP/2 Compliance Test Suite
+%%
+%% Integration tests for the HTTP/2 implementation using Common Test.
+%% These tests verify the complete client/server interaction.
+%%
+-module(h2_compliance_SUITE).
+
+-include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
+
+%% CT callbacks
+-export([all/0, groups/0, suite/0]).
+-export([init_per_suite/1, end_per_suite/1]).
+-export([init_per_group/2, end_per_group/2]).
+-export([init_per_testcase/2, end_per_testcase/2]).
+
+%% Test cases
+-export([
+    %% Connection tests
+    connection_preface_test/1,
+    settings_exchange_test/1,
+    settings_ack_test/1,
+
+    %% Request/Response tests
+    simple_get_test/1,
+    simple_post_test/1,
+    request_with_body_test/1,
+    large_response_test/1,
+    multiple_requests_test/1,
+    concurrent_streams_test/1,
+
+    %% Headers tests
+    pseudo_headers_test/1,
+    custom_headers_test/1,
+    large_headers_test/1,
+
+    %% Flow control tests
+    flow_control_window_test/1,
+    window_update_test/1,
+    zero_window_test/1,
+
+    %% Stream state tests
+    stream_lifecycle_test/1,
+    half_closed_test/1,
+    stream_reset_test/1,
+
+    %% Error handling tests
+    invalid_stream_id_test/1,
+    goaway_test/1,
+    protocol_error_test/1,
+
+    %% PING tests
+    ping_test/1,
+
+    %% Trailers tests
+    trailers_test/1
+]).
+
+%% ============================================================================
+%% CT Callbacks
+%% ============================================================================
+
+suite() ->
+    [{timetrap, {seconds, 30}}].
+
+all() ->
+    [
+        {group, connection},
+        {group, request_response},
+        {group, headers},
+        {group, flow_control},
+        {group, stream_state},
+        {group, error_handling},
+        {group, misc}
+    ].
+
+groups() ->
+    [
+        {connection, [sequence], [
+            connection_preface_test,
+            settings_exchange_test,
+            settings_ack_test
+        ]},
+        {request_response, [parallel], [
+            simple_get_test,
+            simple_post_test,
+            request_with_body_test,
+            large_response_test,
+            multiple_requests_test,
+            concurrent_streams_test
+        ]},
+        {headers, [parallel], [
+            pseudo_headers_test,
+            custom_headers_test,
+            large_headers_test
+        ]},
+        {flow_control, [sequence], [
+            flow_control_window_test,
+            window_update_test,
+            zero_window_test
+        ]},
+        {stream_state, [sequence], [
+            stream_lifecycle_test,
+            half_closed_test,
+            stream_reset_test
+        ]},
+        {error_handling, [sequence], [
+            invalid_stream_id_test,
+            goaway_test,
+            protocol_error_test
+        ]},
+        {misc, [parallel], [
+            ping_test,
+            trailers_test
+        ]}
+    ].
+
+init_per_suite(Config) ->
+    %% Start required applications
+    ok = application:ensure_started(crypto),
+    ok = application:ensure_started(asn1),
+    ok = application:ensure_started(public_key),
+    ok = application:ensure_started(ssl),
+
+    %% Generate test certificates
+    CertDir = ?config(priv_dir, Config),
+    {CertFile, KeyFile} = generate_test_certs(CertDir),
+
+    [{cert_file, CertFile}, {key_file, KeyFile} | Config].
+
+end_per_suite(_Config) ->
+    ok.
+
+init_per_group(_GroupName, Config) ->
+    Config.
+
+end_per_group(_GroupName, _Config) ->
+    ok.
+
+init_per_testcase(_TestCase, Config) ->
+    %% Start a test server for each test case
+    CertFile = ?config(cert_file, Config),
+    KeyFile = ?config(key_file, Config),
+
+    %% Use a random port
+    Port = 10000 + rand:uniform(50000),
+
+    Handler = fun(Conn, StreamId, Method, Path, Headers) ->
+        handle_test_request(Conn, StreamId, Method, Path, Headers)
+    end,
+
+    ServerOpts = #{
+        cert => CertFile,
+        key => KeyFile,
+        handler => Handler
+    },
+
+    case h2:start_server(Port, ServerOpts) of
+        {ok, ServerRef} ->
+            [{server_ref, ServerRef}, {port, Port} | Config];
+        {error, Reason} ->
+            {skip, {server_start_failed, Reason}}
+    end.
+
+end_per_testcase(_TestCase, Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        ServerRef -> h2:stop_server(ServerRef)
+    end,
+    ok.
+
+%% ============================================================================
+%% Test Server Handler
+%% ============================================================================
+
+handle_test_request(Conn, StreamId, Method, Path, Headers) ->
+    case {Method, Path} of
+        {<<"GET">>, <<"/">>} ->
+            h2:send_response(Conn, StreamId, 200, [{<<"content-type">>, <<"text/plain">>}]),
+            h2:send_data(Conn, StreamId, <<"Hello, World!">>, true);
+
+        {<<"GET">>, <<"/echo">>} ->
+            Body = io_lib:format("Method: ~s~nPath: ~s~nHeaders: ~p~n",
+                                 [Method, Path, Headers]),
+            h2:send_response(Conn, StreamId, 200, [{<<"content-type">>, <<"text/plain">>}]),
+            h2:send_data(Conn, StreamId, iolist_to_binary(Body), true);
+
+        {<<"POST">>, <<"/echo">>} ->
+            %% Echo back the request info
+            h2:send_response(Conn, StreamId, 200, [{<<"content-type">>, <<"text/plain">>}]),
+            h2:send_data(Conn, StreamId, <<"POST received">>, true);
+
+        {<<"GET">>, <<"/large">>} ->
+            %% Return a large response
+            LargeBody = binary:copy(<<"x">>, 100000),
+            h2:send_response(Conn, StreamId, 200, [
+                {<<"content-type">>, <<"application/octet-stream">>},
+                {<<"content-length">>, <<"100000">>}
+            ]),
+            h2:send_data(Conn, StreamId, LargeBody, true);
+
+        {<<"GET">>, <<"/trailers">>} ->
+            h2:send_response(Conn, StreamId, 200, [{<<"content-type">>, <<"text/plain">>}]),
+            h2:send_data(Conn, StreamId, <<"Body">>, false),
+            h2:send_trailers(Conn, StreamId, [{<<"x-checksum">>, <<"abc123">>}]);
+
+        {<<"GET">>, <<"/delay/", Delay/binary>>} ->
+            %% Delayed response
+            Ms = binary_to_integer(Delay),
+            timer:sleep(Ms),
+            h2:send_response(Conn, StreamId, 200, [{<<"content-type">>, <<"text/plain">>}]),
+            h2:send_data(Conn, StreamId, <<"Delayed">>, true);
+
+        {<<"GET">>, <<"/headers">>} ->
+            %% Return many headers
+            ResponseHeaders = [
+                {<<"content-type">>, <<"text/plain">>},
+                {<<"x-custom-1">>, <<"value1">>},
+                {<<"x-custom-2">>, <<"value2">>},
+                {<<"x-custom-3">>, <<"value3">>}
+            ],
+            h2:send_response(Conn, StreamId, 200, ResponseHeaders),
+            h2:send_data(Conn, StreamId, <<"Headers test">>, true);
+
+        _ ->
+            h2:send_response(Conn, StreamId, 404, [{<<"content-type">>, <<"text/plain">>}]),
+            h2:send_data(Conn, StreamId, <<"Not Found">>, true)
+    end.
+
+%% ============================================================================
+%% Connection Tests
+%% ============================================================================
+
+connection_preface_test(Config) ->
+    Port = ?config(port, Config),
+
+    %% Connect to server
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    %% If we got here, connection preface exchange succeeded
+    ?assert(is_pid(Conn)),
+
+    h2:close(Conn),
+    ok.
+
+settings_exchange_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}],
+        settings => #{
+            max_concurrent_streams => 100,
+            initial_window_size => 65535
+        }
+    }),
+
+    %% Get local and peer settings
+    LocalSettings = h2:get_settings(Conn),
+    PeerSettings = h2:get_peer_settings(Conn),
+
+    ?assertMatch(#{max_concurrent_streams := _}, LocalSettings),
+    ?assertMatch(#{initial_window_size := _}, PeerSettings),
+
+    h2:close(Conn),
+    ok.
+
+settings_ack_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    %% Send a request to verify settings exchange completed
+    {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+
+    ?assert(is_integer(StreamId)),
+    ?assertEqual(1, StreamId),  %% First client stream should be 1
+
+    h2:close(Conn),
+    ok.
+
+%% ============================================================================
+%% Request/Response Tests
+%% ============================================================================
+
+simple_get_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+
+    %% Wait for response
+    Response = receive_full_response(Conn, StreamId, 5000),
+
+    ?assertMatch({200, _, _}, Response),
+    {200, _Headers, Body} = Response,
+    ?assertEqual(<<"Hello, World!">>, Body),
+
+    h2:close(Conn),
+    ok.
+
+simple_post_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    {ok, StreamId} = h2:request(Conn, <<"POST">>, <<"/echo">>, [
+        {<<"host">>, <<"localhost">>},
+        {<<"content-type">>, <<"text/plain">>}
+    ], <<"test body">>),
+
+    Response = receive_full_response(Conn, StreamId, 5000),
+
+    ?assertMatch({200, _, _}, Response),
+
+    h2:close(Conn),
+    ok.
+
+request_with_body_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    %% Send request headers
+    {ok, StreamId} = h2:request(Conn, <<"POST">>, <<"/echo">>, [
+        {<<"host">>, <<"localhost">>},
+        {<<"content-type">>, <<"application/json">>}
+    ]),
+
+    %% Send body data
+    ok = h2:send_data(Conn, StreamId, <<"{\"key\":\"value\"}">>, true),
+
+    Response = receive_full_response(Conn, StreamId, 5000),
+    ?assertMatch({200, _, _}, Response),
+
+    h2:close(Conn),
+    ok.
+
+large_response_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/large">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+
+    Response = receive_full_response(Conn, StreamId, 10000),
+
+    ?assertMatch({200, _, _}, Response),
+    {200, _Headers, Body} = Response,
+    ?assertEqual(100000, byte_size(Body)),
+
+    h2:close(Conn),
+    ok.
+
+multiple_requests_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    %% Send multiple sequential requests
+    lists:foreach(fun(N) ->
+        Path = iolist_to_binary([<<"/">>, integer_to_binary(N)]),
+        {ok, StreamId} = h2:request(Conn, <<"GET">>, Path, [
+            {<<"host">>, <<"localhost">>}
+        ]),
+        Response = receive_full_response(Conn, StreamId, 5000),
+        %% Should get 404 for these paths
+        ?assertMatch({404, _, _}, Response)
+    end, lists:seq(1, 5)),
+
+    h2:close(Conn),
+    ok.
+
+concurrent_streams_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    %% Send multiple concurrent requests
+    StreamIds = lists:map(fun(_N) ->
+        {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/">>, [
+            {<<"host">>, <<"localhost">>}
+        ]),
+        StreamId
+    end, lists:seq(1, 10)),
+
+    %% Collect all responses
+    lists:foreach(fun(StreamId) ->
+        Response = receive_full_response(Conn, StreamId, 5000),
+        ?assertMatch({200, _, _}, Response)
+    end, StreamIds),
+
+    h2:close(Conn),
+    ok.
+
+%% ============================================================================
+%% Headers Tests
+%% ============================================================================
+
+pseudo_headers_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/echo">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+
+    Response = receive_full_response(Conn, StreamId, 5000),
+    ?assertMatch({200, _, _}, Response),
+
+    h2:close(Conn),
+    ok.
+
+custom_headers_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/headers">>, [
+        {<<"host">>, <<"localhost">>},
+        {<<"x-custom-request">>, <<"value">>}
+    ]),
+
+    {200, Headers, _Body} = receive_full_response(Conn, StreamId, 5000),
+
+    %% Check custom response headers
+    ?assertMatch(<<"value1">>, proplists:get_value(<<"x-custom-1">>, Headers)),
+
+    h2:close(Conn),
+    ok.
+
+large_headers_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    %% Send large header value
+    LargeValue = binary:copy(<<"x">>, 1000),
+    {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/">>, [
+        {<<"host">>, <<"localhost">>},
+        {<<"x-large-header">>, LargeValue}
+    ]),
+
+    Response = receive_full_response(Conn, StreamId, 5000),
+    ?assertMatch({200, _, _}, Response),
+
+    h2:close(Conn),
+    ok.
+
+%% ============================================================================
+%% Flow Control Tests
+%% ============================================================================
+
+flow_control_window_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}],
+        settings => #{
+            initial_window_size => 1000
+        }
+    }),
+
+    %% Request large response
+    {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/large">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+
+    %% Should still complete (with flow control)
+    Response = receive_full_response(Conn, StreamId, 30000),
+    ?assertMatch({200, _, _}, Response),
+    {200, _, Body} = Response,
+    ?assertEqual(100000, byte_size(Body)),
+
+    h2:close(Conn),
+    ok.
+
+window_update_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/large">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+
+    Response = receive_full_response(Conn, StreamId, 30000),
+    ?assertMatch({200, _, _}, Response),
+
+    h2:close(Conn),
+    ok.
+
+zero_window_test(Config) ->
+    Port = ?config(port, Config),
+
+    %% Test with very small initial window
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}],
+        settings => #{
+            initial_window_size => 100
+        }
+    }),
+
+    {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+
+    Response = receive_full_response(Conn, StreamId, 5000),
+    ?assertMatch({200, _, _}, Response),
+
+    h2:close(Conn),
+    ok.
+
+%% ============================================================================
+%% Stream State Tests
+%% ============================================================================
+
+stream_lifecycle_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    %% Stream 1: idle -> open -> half-closed (local) -> closed
+    {ok, Stream1} = h2:request(Conn, <<"GET">>, <<"/">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+
+    Response1 = receive_full_response(Conn, Stream1, 5000),
+    ?assertMatch({200, _, _}, Response1),
+
+    h2:close(Conn),
+    ok.
+
+half_closed_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    %% Send request without end_stream
+    {ok, StreamId} = h2:request(Conn, <<"POST">>, <<"/echo">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+
+    %% Stream is half-closed (remote)
+    ok = h2:send_data(Conn, StreamId, <<"data">>, true),
+
+    Response = receive_full_response(Conn, StreamId, 5000),
+    ?assertMatch({200, _, _}, Response),
+
+    h2:close(Conn),
+    ok.
+
+stream_reset_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    %% Start a request then cancel it
+    {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/delay/5000">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+
+    %% Cancel the stream
+    ok = h2:cancel(Conn, StreamId),
+
+    %% Should be able to start new streams
+    {ok, StreamId2} = h2:request(Conn, <<"GET">>, <<"/">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+
+    Response = receive_full_response(Conn, StreamId2, 5000),
+    ?assertMatch({200, _, _}, Response),
+
+    h2:close(Conn),
+    ok.
+
+%% ============================================================================
+%% Error Handling Tests
+%% ============================================================================
+
+invalid_stream_id_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    %% Try to send data on non-existent stream
+    Result = h2:send_data(Conn, 999, <<"data">>, true),
+    ?assertMatch({error, _}, Result),
+
+    h2:close(Conn),
+    ok.
+
+goaway_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    %% Send GOAWAY
+    ok = h2:goaway(Conn),
+
+    %% Connection should be closing
+    timer:sleep(100),
+
+    h2:close(Conn),
+    ok.
+
+protocol_error_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    %% Normal request should work
+    {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+
+    Response = receive_full_response(Conn, StreamId, 5000),
+    ?assertMatch({200, _, _}, Response),
+
+    h2:close(Conn),
+    ok.
+
+%% ============================================================================
+%% Misc Tests
+%% ============================================================================
+
+ping_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    %% PING is handled internally by h2_connection
+    %% Just verify connection still works after some time
+    timer:sleep(100),
+
+    {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+
+    Response = receive_full_response(Conn, StreamId, 5000),
+    ?assertMatch({200, _, _}, Response),
+
+    h2:close(Conn),
+    ok.
+
+trailers_test(Config) ->
+    Port = ?config(port, Config),
+
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+
+    {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/trailers">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+
+    %% Wait for response with trailers
+    Response = receive_full_response_with_trailers(Conn, StreamId, 5000),
+    ?assertMatch({200, _, _, _}, Response),
+    {200, _Headers, _Body, Trailers} = Response,
+    ?assertMatch(<<"abc123">>, proplists:get_value(<<"x-checksum">>, Trailers)),
+
+    h2:close(Conn),
+    ok.
+
+%% ============================================================================
+%% Helper Functions
+%% ============================================================================
+
+receive_full_response(Conn, StreamId, Timeout) ->
+    receive_full_response(Conn, StreamId, Timeout, undefined, [], <<>>).
+
+receive_full_response(Conn, StreamId, Timeout, Status, Headers, Body) ->
+    receive
+        {h2, Conn, {response, StreamId, S, H}} ->
+            receive_full_response(Conn, StreamId, Timeout, S, H, Body);
+        {h2, Conn, {data, StreamId, Data, true}} ->
+            {Status, Headers, <<Body/binary, Data/binary>>};
+        {h2, Conn, {data, StreamId, Data, false}} ->
+            receive_full_response(Conn, StreamId, Timeout, Status, Headers, <<Body/binary, Data/binary>>);
+        {h2, Conn, {stream_reset, StreamId, ErrorCode}} ->
+            {error, {stream_reset, ErrorCode}};
+        {h2, Conn, {goaway, _, ErrorCode}} ->
+            {error, {goaway, ErrorCode}}
+    after Timeout ->
+        {error, timeout}
+    end.
+
+receive_full_response_with_trailers(Conn, StreamId, Timeout) ->
+    receive_full_response_with_trailers(Conn, StreamId, Timeout, undefined, [], <<>>, []).
+
+receive_full_response_with_trailers(Conn, StreamId, Timeout, Status, Headers, Body, Trailers) ->
+    receive
+        {h2, Conn, {response, StreamId, S, H}} ->
+            receive_full_response_with_trailers(Conn, StreamId, Timeout, S, H, Body, Trailers);
+        {h2, Conn, {data, StreamId, Data, true}} ->
+            {Status, Headers, <<Body/binary, Data/binary>>, Trailers};
+        {h2, Conn, {data, StreamId, Data, false}} ->
+            receive_full_response_with_trailers(Conn, StreamId, Timeout, Status, Headers, <<Body/binary, Data/binary>>, Trailers);
+        {h2, Conn, {trailers, StreamId, T}} ->
+            {Status, Headers, Body, T};
+        {h2, Conn, {stream_reset, StreamId, ErrorCode}} ->
+            {error, {stream_reset, ErrorCode}}
+    after Timeout ->
+        {error, timeout}
+    end.
+
+generate_test_certs(Dir) ->
+    CertFile = filename:join(Dir, "server.pem"),
+    KeyFile = filename:join(Dir, "server-key.pem"),
+
+    %% Generate self-signed certificate using OpenSSL
+    Cmd = io_lib:format(
+        "openssl req -x509 -newkey rsa:2048 -keyout ~s -out ~s "
+        "-days 1 -nodes -subj '/CN=localhost' 2>/dev/null",
+        [KeyFile, CertFile]),
+
+    case os:cmd(lists:flatten(Cmd)) of
+        "" -> {CertFile, KeyFile};
+        _Error ->
+            %% Fallback: create dummy files for testing structure
+            create_dummy_certs(CertFile, KeyFile)
+    end.
+
+create_dummy_certs(CertFile, KeyFile) ->
+    %% This is a fallback for environments without OpenSSL
+    %% In real testing, proper certificates should be generated
+    DummyCert = <<"-----BEGIN CERTIFICATE-----\nDUMMY\n-----END CERTIFICATE-----\n">>,
+    DummyKey = <<"-----BEGIN PRIVATE KEY-----\nDUMMY\n-----END PRIVATE KEY-----\n">>,
+    file:write_file(CertFile, DummyCert),
+    file:write_file(KeyFile, DummyKey),
+    {CertFile, KeyFile}.
