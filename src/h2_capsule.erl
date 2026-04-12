@@ -88,7 +88,7 @@ decode_type(?DATAGRAM) -> datagram;
 decode_type(N) -> N.
 
 %% @doc Decode all capsules from binary.
--spec decode_all(binary()) -> {ok, [capsule()], binary()} | {more, pos_integer()} | {error, term()}.
+-spec decode_all(binary()) -> {ok, [capsule()], binary()}.
 decode_all(Bin) ->
     decode_all(Bin, []).
 
@@ -99,9 +99,7 @@ decode_all(Bin, Acc) ->
         {ok, Capsule, Rest} ->
             decode_all(Rest, [Capsule|Acc]);
         {more, _N} ->
-            {ok, lists:reverse(Acc), Bin};
-        {error, _} = Err ->
-            Err
+            {ok, lists:reverse(Acc), Bin}
     end.
 
 -ifdef(TEST).

@@ -393,13 +393,9 @@ evict_entries([], _Size, _Target, Ctx) ->
 evict_entries(DynTable, Size, Target, Ctx) when Size =< Target ->
     Ctx#hpack_context{dynamic_table = DynTable, table_size = Size};
 evict_entries(DynTable, Size, Target, Ctx) ->
-    case lists:reverse(DynTable) of
-        [] ->
-            Ctx#hpack_context{dynamic_table = [], table_size = 0};
-        [{Name, Value}|Rest] ->
-            EntrySize = entry_size(Name, Value),
-            evict_entries(lists:reverse(Rest), Size - EntrySize, Target, Ctx)
-    end.
+    [{Name, Value}|Rest] = lists:reverse(DynTable),
+    EntrySize = entry_size(Name, Value),
+    evict_entries(lists:reverse(Rest), Size - EntrySize, Target, Ctx).
 
 entry_size(Name, Value) ->
     byte_size(Name) + byte_size(Value) + 32.
