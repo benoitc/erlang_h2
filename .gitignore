@@ -1,0 +1,15 @@
+_build/
+*.beam
+.rebar3/
+rebar.lock
+ebin/
+deps/
+*.plt
+*.swp
+*~
+.eunit/
+log/
+logs/
+.DS_Store
+*.crashdump
+
