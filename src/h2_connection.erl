@@ -719,10 +719,18 @@ handle_frame(_StateName, {continuation, StreamId, HeaderBlock, EndHeaders}, Stat
 handle_frame(_StateName, {data, StreamId, Data, EndStream}, State) ->
     handle_data_frame(StreamId, Data, EndStream, State);
 
-handle_frame(_StateName, {rst_stream, StreamId, ErrorCode}, State) ->
-    notify_owner({h2, self(), {stream_reset, StreamId, h2_error:name(ErrorCode)}}, State),
-    State1 = close_stream(StreamId, State),
-    {ok, connected, State1};
+handle_frame(_StateName, {rst_stream, StreamId, ErrorCode},
+             #state{streams = Streams} = State) ->
+    %% RFC 7540 §6.4 / §5.1: RST_STREAM on an "idle" stream (one that was
+    %% never opened by either side) is a connection PROTOCOL_ERROR.
+    case maps:is_key(StreamId, Streams) orelse in_closed_stream_range(StreamId, State) of
+        true ->
+            notify_owner({h2, self(), {stream_reset, StreamId, h2_error:name(ErrorCode)}}, State),
+            State1 = close_stream(StreamId, State),
+            {ok, connected, State1};
+        false ->
+            {error, protocol_error, State}
+    end;
 
 handle_frame(_StateName, {priority, _StreamId, _Exclusive, _DependsOn, _Weight}, State) ->
     %% Priority is advisory, ignore
@@ -748,14 +756,17 @@ handle_settings(Settings, #state{peer_settings = OldSettings} = State) ->
                 ok ->
                     %% Merge and apply
                     MergedSettings = h2_settings:merge(OldSettings, NewSettings),
-                    State1 = apply_peer_settings(MergedSettings, State),
-                    %% Send ACK
-                    send_frame(h2_frame:settings_ack(), State1),
-                    NewStateName = case State1#state.settings_acked of
-                        true -> connected;
-                        false -> settings
-                    end,
-                    {ok, NewStateName, State1};
+                    case apply_peer_settings(MergedSettings, State) of
+                        {ok, State1} ->
+                            send_frame(h2_frame:settings_ack(), State1),
+                            NewStateName = case State1#state.settings_acked of
+                                true -> connected;
+                                false -> settings
+                            end,
+                            {ok, NewStateName, State1};
+                        {error, ErrCode} ->
+                            {error, ErrCode, State}
+                    end;
                 {error, _Reason} ->
                     {error, protocol_error, State}
             end;
@@ -770,34 +781,44 @@ encode_settings_list(Settings) ->
 
 apply_peer_settings(Settings, #state{encode_context = EncCtx, streams = Streams,
                                       peer_settings = OldSettings} = State) ->
-    %% Update HPACK encoder table size
     NewTableSize = h2_settings:get(header_table_size, Settings),
     EncCtx1 = h2_hpack:set_max_table_size(NewTableSize, EncCtx),
 
-    %% Update stream windows if INITIAL_WINDOW_SIZE changed
     OldWindow = h2_settings:get(initial_window_size, OldSettings),
     NewWindow = h2_settings:get(initial_window_size, Settings),
     Delta = NewWindow - OldWindow,
-    Streams1 = maps:map(fun(_Id, #stream{window_size = W} = S) ->
-        S#stream{window_size = W + Delta}
-    end, Streams),
-
-    State#state{
-        peer_settings = Settings,
-        encode_context = EncCtx1,
-        streams = Streams1
-    }.
+    %% RFC 7540 §6.9.2: if the change makes any stream's flow-control window
+    %% exceed 2^31-1, treat as connection FLOW_CONTROL_ERROR.
+    Overflow = maps:fold(fun(_Id, #stream{window_size = W}, Acc) ->
+        Acc orelse (W + Delta) > ?MAX_WINDOW_SIZE
+    end, false, Streams),
+    case Overflow of
+        true ->
+            {error, flow_control_error};
+        false ->
+            Streams1 = maps:map(fun(_Id, #stream{window_size = W} = S) ->
+                S#stream{window_size = W + Delta}
+            end, Streams),
+            {ok, State#state{
+                peer_settings = Settings,
+                encode_context = EncCtx1,
+                streams = Streams1
+            }}
+    end.
 
 apply_local_settings(Settings, #state{decode_context = DecCtx, local_settings = Prev} = State) ->
     %% Update HPACK decoder table size
     NewTableSize = h2_settings:get(header_table_size, Settings),
     OldTableSize = h2_settings:get(header_table_size, Prev),
     DecCtx1 = h2_hpack:set_max_table_size(NewTableSize, DecCtx),
+    %% RFC 7541 §6.3: peer-advertised limit (= our SETTINGS_HEADER_TABLE_SIZE)
+    %% caps any size update the peer's encoder may send.
+    DecCtx1a = h2_hpack:set_peer_max_table_size(NewTableSize, DecCtx1),
     %% RFC 7541 §4.2: when we reduce HEADER_TABLE_SIZE, the peer's next
     %% header block MUST start with a size update at or below the new max.
     DecCtx2 = case NewTableSize < OldTableSize of
-        true -> h2_hpack:mark_pending_size_update(DecCtx1);
-        false -> DecCtx1
+        true -> h2_hpack:mark_pending_size_update(DecCtx1a);
+        false -> DecCtx1a
     end,
     State#state{
         local_settings = Settings,
@@ -811,18 +832,23 @@ apply_local_settings(Settings, #state{decode_context = DecCtx, local_settings = 
 handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, _Priority, #state{mode = Mode, streams = Streams} = State) ->
     %% Check if this is a response on an existing stream or a new stream
     case maps:find(StreamId, Streams) of
-        {ok, _Stream} ->
-            %% Existing stream - this is a response (client) or trailers
+        {ok, #stream{state = StreamState} = Stream}
+          when StreamState =:= open; StreamState =:= half_closed_local ->
+            %% Existing stream — response (client) or trailers
             case EndHeaders of
                 true ->
                     decode_and_process_headers(StreamId, HeaderBlock, EndStream, State);
                 false ->
-                    Stream = maps:get(StreamId, Streams),
                     Stream1 = Stream#stream{header_buffer = HeaderBlock},
                     State1 = put_stream(StreamId, Stream1, State),
                     State2 = State1#state{expecting_continuation = {StreamId, EndStream}},
                     {ok, connected, State2}
             end;
+        {ok, _Stream} ->
+            %% RFC 7540 §6.2: HEADERS MUST NOT be sent on a half-closed-remote
+            %% or closed stream → stream error STREAM_CLOSED.
+            send_rst_stream(StreamId, stream_closed, State),
+            {ok, connected, State};
         error ->
             %% New stream - validate stream ID
             case validate_stream_id(StreamId, Mode, State) of

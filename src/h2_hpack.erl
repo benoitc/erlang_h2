@@ -13,7 +13,7 @@
 -export([new_context/0, new_context/1]).
 -export([encode/2, decode/2]).
 -export([set_max_table_size/2, get_max_table_size/1]).
--export([mark_pending_size_update/1]).
+-export([mark_pending_size_update/1, set_peer_max_table_size/2]).
 -export([encode_integer/2, decode_integer/2]).
 -export([huffman_encode/1, huffman_decode/1]).
 
@@ -28,7 +28,11 @@
     %% RFC 7541 §4.2: when the peer lowers SETTINGS_HEADER_TABLE_SIZE,
     %% the next header block MUST begin with one or more dynamic-table
     %% size updates that reduce the size at or below the new limit.
-    pending_size_update = false :: boolean()
+    pending_size_update = false :: boolean(),
+    %% RFC 7541 §4.3: peer-advertised cap (SETTINGS_HEADER_TABLE_SIZE on
+    %% the wire). Decoder must reject any received size update larger
+    %% than this with a COMPRESSION_ERROR. Defaults to the spec default.
+    peer_max_table_size = ?DEFAULT_HEADER_TABLE_SIZE :: non_neg_integer()
 }).
 
 -type context() :: #hpack_context{}.
@@ -129,6 +133,17 @@ get_max_table_size(#hpack_context{max_table_size = Size}) ->
 -spec mark_pending_size_update(context()) -> context().
 mark_pending_size_update(Ctx) ->
     Ctx#hpack_context{pending_size_update = true}.
+
+%% @doc Record the peer-advertised SETTINGS_HEADER_TABLE_SIZE so the
+%% decoder can reject incoming size updates larger than this value
+%% (RFC 7541 §4.3). Also marks pending_size_update if reduced.
+-spec set_peer_max_table_size(non_neg_integer(), context()) -> context().
+set_peer_max_table_size(Max, #hpack_context{peer_max_table_size = OldMax} = Ctx) ->
+    Ctx1 = Ctx#hpack_context{peer_max_table_size = Max},
+    case Max < OldMax of
+        true -> Ctx1#hpack_context{pending_size_update = true};
+        false -> Ctx1
+    end.
 
 %% @doc Encode a list of headers.
 -spec encode(headers(), context()) -> {binary(), context()}.
@@ -264,6 +279,10 @@ decode_headers(<<2#001:3, _/bits>> = Bin, Ctx, Acc, HasOther) ->
             {error, invalid_size_update};
         false ->
             case decode_integer(Bin, 5) of
+                {ok, Size, _Rest} when Size > Ctx#hpack_context.peer_max_table_size ->
+                    %% RFC 7541 §4.3: size update larger than peer-advertised
+                    %% maximum is a COMPRESSION_ERROR.
+                    {error, size_update_exceeds_peer_max};
                 {ok, Size, Rest} ->
                     Ctx1 = set_max_table_size(Size, Ctx),
                     Ctx2 = Ctx1#hpack_context{pending_size_update = false},
@@ -636,5 +655,23 @@ dynamic_table_test() ->
     {Encoded2, _} = encode(Headers1, Ctx2),
     %% Should be shorter (indexed reference)
     ?assert(byte_size(Encoded2) < byte_size(Encoded1)).
+
+%% RFC 7541 §4.3: a size update larger than the peer-advertised maximum
+%% MUST be a decoding error (compression error in HTTP/2 terms).
+size_update_exceeds_peer_max_test() ->
+    Ctx = set_peer_max_table_size(1024, new_context()),
+    %% Size-update representation: 001 prefix + 5-bit integer.
+    SizeUpdate = encode_integer(2048, 5, 2#001),
+    ?assertEqual({error, size_update_exceeds_peer_max}, decode(SizeUpdate, Ctx)),
+    ok.
+
+%% Lower peer max should set pending_size_update; raising should not.
+peer_max_lower_marks_pending_test() ->
+    Ctx0 = new_context(),
+    Ctx1 = set_peer_max_table_size(1024, Ctx0),
+    ?assertEqual(true, Ctx1#hpack_context.pending_size_update),
+    Ctx2 = set_peer_max_table_size(8192, Ctx1#hpack_context{pending_size_update = false}),
+    ?assertEqual(false, Ctx2#hpack_context.pending_size_update),
+    ok.
 
 -endif.
