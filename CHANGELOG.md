@@ -2,6 +2,39 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `h2:start_server` now honors `transport => tcp` (cleartext h2c prior-knowledge listener with gen_tcp acceptor pool).
+- `h2:connect/3` top-level `verify` and `cacerts` options are merged into SSL options (typespec no longer lies).
+- Owner event `{h2, Conn, {informational, StreamId, Status, Headers}}` for 1xx interim responses (excluding 101).
+- Send-side header validation runs before HPACK encode on `send_request`, `send_request_headers`, `send_response`, and `send_trailers`.
+- CT `compliance_v2` group: 15 new cases covering second-look audit findings.
+
+### Changed
+- Owner event `{h2, Conn, {goaway, LastStreamId}}` is now `{goaway, LastStreamId, ErrorCode}` (was always documented as 3-tuple).
+- Per-stream events (`data`, `trailers`, `stream_reset`) routed to the registered stream handler when set; connection owner receives them only as fallback.
+- HEADERS frames whose encoded block exceeds peer `SETTINGS_MAX_FRAME_SIZE` are automatically split into HEADERS + CONTINUATION chain (RFC 9113 §4.2).
+- Body-less responses (HEAD / 204 / 304) emit a trailing `{data, Sid, <<>>, true}` event so callers waiting for end-of-stream don't hang (matches quic_h3).
+- HPACK: Huffman encode/decode tables precomputed once via `persistent_term` + `-on_load`; dynamic table caches length and uses a single `lists:reverse` on eviction.
+- CONTINUATION accumulator uses `iodata()` instead of per-frame binary concatenation.
+- Cached `peer_max_frame_size` / `peer_initial_window_size` / `peer_max_concurrent_streams` on the connection state record.
+
+### Fixed
+- `SETTINGS_ENABLE_PUSH` is now always advertised as 0 (RFC 9113 §6.5.2). Was incorrectly sending 1 while rejecting PUSH_PROMISE.
+- `:scheme` pseudo-header now follows the actual transport (`http` on TCP, `https` on TLS). Previously hardcoded to `https`.
+- `:method = CONNECT` outbound: trailers rejected with `{error, tunnel_no_trailers}`.
+- `WINDOW_UPDATE` with increment 0 on a non-zero stream is now a stream-level RST_STREAM with `PROTOCOL_ERROR` (§6.9.1). Was a connection GOAWAY.
+- `:status` parsing: malformed values trigger stream `PROTOCOL_ERROR` instead of crashing the gen_statem via `binary_to_integer`.
+- `:status = 101` rejected on both send and receive (§8.6).
+- Padding counted against receive flow control (§6.1). Decoder returns the full padded payload size; windows charged correctly.
+- Connection-level receive window consumed on DATA for closed or unknown streams (§5.1). Previously the peer could overshoot our advertised window via post-reset DATA.
+- `Content-Length` enforcement (§8.1.1): duplicate/mismatched/non-numeric/negative values → `PROTOCOL_ERROR`; DATA overshoot or END_STREAM mismatch → stream RST.
+- Body forbidden on HEAD requests (client-side), 204, and 304 — enforced via `body_forbidden` stream flag.
+- Server-side request trailers: trailing HEADERS without END_STREAM → `PROTOCOL_ERROR`.
+- Field name validation tightened to RFC 7230 `tchar` (rejects SP, HTAB, colon in regular headers, other controls, DEL, non-ASCII). Field values: leading/trailing SP/HTAB rejected in addition to NUL/CR/LF.
+- `SETTINGS_MAX_HEADER_LIST_SIZE` now enforced in both directions: outbound exceed → `{error, header_list_too_large}`; inbound exceed → stream `PROTOCOL_ERROR`.
+
 ## [0.2.0] - 2026-04-13
 
 First usable release with a full connection-layer client and server. Previous 0.1.0 shipped only frame/HPACK primitives.
