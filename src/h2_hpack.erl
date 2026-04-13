@@ -13,6 +13,7 @@
 -export([new_context/0, new_context/1]).
 -export([encode/2, decode/2]).
 -export([set_max_table_size/2, get_max_table_size/1]).
+-export([mark_pending_size_update/1]).
 -export([encode_integer/2, decode_integer/2]).
 -export([huffman_encode/1, huffman_decode/1]).
 
@@ -23,7 +24,11 @@
 -record(hpack_context, {
     max_table_size = ?DEFAULT_HEADER_TABLE_SIZE :: non_neg_integer(),
     table_size = 0 :: non_neg_integer(),
-    dynamic_table = [] :: [{binary(), binary()}]
+    dynamic_table = [] :: [{binary(), binary()}],
+    %% RFC 7541 §4.2: when the peer lowers SETTINGS_HEADER_TABLE_SIZE,
+    %% the next header block MUST begin with one or more dynamic-table
+    %% size updates that reduce the size at or below the new limit.
+    pending_size_update = false :: boolean()
 }).
 
 -type context() :: #hpack_context{}.
@@ -118,6 +123,13 @@ set_max_table_size(Size, Ctx) ->
 get_max_table_size(#hpack_context{max_table_size = Size}) ->
     Size.
 
+%% @doc Mark the decoder so that the next header block MUST start with a
+%% dynamic-table size update (RFC 7541 §4.2). Call this when the peer
+%% lowers SETTINGS_HEADER_TABLE_SIZE.
+-spec mark_pending_size_update(context()) -> context().
+mark_pending_size_update(Ctx) ->
+    Ctx#hpack_context{pending_size_update = true}.
+
 %% @doc Encode a list of headers.
 -spec encode(headers(), context()) -> {binary(), context()}.
 encode(Headers, Ctx) ->
@@ -179,58 +191,86 @@ encode_string(Str) ->
 %% @doc Decode a HPACK-encoded header block.
 -spec decode(binary(), context()) -> {ok, headers(), context()} | {error, term()}.
 decode(Bin, Ctx) ->
-    decode_headers(Bin, Ctx, []).
+    %% StateFlag: true means we've processed a non-size-update representation,
+    %% and any subsequent size update MUST fail (RFC 7541 §4.2).
+    decode_headers(Bin, Ctx, [], false).
 
-decode_headers(<<>>, Ctx, Acc) ->
+decode_headers(<<>>, #hpack_context{pending_size_update = true}, _Acc, _HasOther) ->
+    %% RFC 7541 §4.2: required size update never appeared → compression error.
+    {error, missing_size_update};
+decode_headers(<<>>, Ctx, Acc, _HasOther) ->
     {ok, lists:reverse(Acc), Ctx};
-decode_headers(<<2#1:1, _/bits>> = Bin, Ctx, Acc) ->
+decode_headers(<<2#1:1, _/bits>> = Bin, Ctx, Acc, _HasOther) ->
     %% Indexed Header Field (Section 6.1)
-    case decode_integer(Bin, 7) of
-        {ok, 0, _} ->
-            {error, invalid_index};
-        {ok, Index, Rest} ->
-            case lookup(Index, Ctx) of
-                {ok, Name, Value} ->
-                    decode_headers(Rest, Ctx, [{Name, Value}|Acc]);
-                error ->
-                    {error, {invalid_index, Index}}
-            end;
-        {error, _} = Err ->
-            Err
+    case Ctx#hpack_context.pending_size_update of
+        true -> {error, missing_size_update};
+        false ->
+            case decode_integer(Bin, 7) of
+                {ok, 0, _} ->
+                    {error, invalid_index};
+                {ok, Index, Rest} ->
+                    case lookup(Index, Ctx) of
+                        {ok, Name, Value} ->
+                            decode_headers(Rest, Ctx, [{Name, Value}|Acc], true);
+                        error ->
+                            {error, {invalid_index, Index}}
+                    end;
+                {error, _} = Err ->
+                    Err
+            end
     end;
-decode_headers(<<2#01:2, _/bits>> = Bin, Ctx, Acc) ->
+decode_headers(<<2#01:2, _/bits>> = Bin, Ctx, Acc, _HasOther) ->
     %% Literal Header with Incremental Indexing (Section 6.2.1)
-    case decode_literal(Bin, 6, Ctx) of
-        {ok, Name, Value, Rest, Ctx1} ->
-            Ctx2 = add_to_dynamic_table(Name, Value, Ctx1),
-            decode_headers(Rest, Ctx2, [{Name, Value}|Acc]);
-        {error, _} = Err ->
-            Err
+    case Ctx#hpack_context.pending_size_update of
+        true -> {error, missing_size_update};
+        false ->
+            case decode_literal(Bin, 6, Ctx) of
+                {ok, Name, Value, Rest, Ctx1} ->
+                    Ctx2 = add_to_dynamic_table(Name, Value, Ctx1),
+                    decode_headers(Rest, Ctx2, [{Name, Value}|Acc], true);
+                {error, _} = Err ->
+                    Err
+            end
     end;
-decode_headers(<<2#0000:4, _/bits>> = Bin, Ctx, Acc) ->
+decode_headers(<<2#0000:4, _/bits>> = Bin, Ctx, Acc, _HasOther) ->
     %% Literal Header without Indexing (Section 6.2.2)
-    case decode_literal(Bin, 4, Ctx) of
-        {ok, Name, Value, Rest, Ctx1} ->
-            decode_headers(Rest, Ctx1, [{Name, Value}|Acc]);
-        {error, _} = Err ->
-            Err
+    case Ctx#hpack_context.pending_size_update of
+        true -> {error, missing_size_update};
+        false ->
+            case decode_literal(Bin, 4, Ctx) of
+                {ok, Name, Value, Rest, Ctx1} ->
+                    decode_headers(Rest, Ctx1, [{Name, Value}|Acc], true);
+                {error, _} = Err ->
+                    Err
+            end
     end;
-decode_headers(<<2#0001:4, _/bits>> = Bin, Ctx, Acc) ->
+decode_headers(<<2#0001:4, _/bits>> = Bin, Ctx, Acc, _HasOther) ->
     %% Literal Header Never Indexed (Section 6.2.3)
-    case decode_literal(Bin, 4, Ctx) of
-        {ok, Name, Value, Rest, Ctx1} ->
-            decode_headers(Rest, Ctx1, [{Name, Value}|Acc]);
-        {error, _} = Err ->
-            Err
+    case Ctx#hpack_context.pending_size_update of
+        true -> {error, missing_size_update};
+        false ->
+            case decode_literal(Bin, 4, Ctx) of
+                {ok, Name, Value, Rest, Ctx1} ->
+                    decode_headers(Rest, Ctx1, [{Name, Value}|Acc], true);
+                {error, _} = Err ->
+                    Err
+            end
     end;
-decode_headers(<<2#001:3, _/bits>> = Bin, Ctx, Acc) ->
+decode_headers(<<2#001:3, _/bits>> = Bin, Ctx, Acc, HasOther) ->
     %% Dynamic Table Size Update (Section 6.3)
-    case decode_integer(Bin, 5) of
-        {ok, Size, Rest} ->
-            Ctx1 = set_max_table_size(Size, Ctx),
-            decode_headers(Rest, Ctx1, Acc);
-        {error, _} = Err ->
-            Err
+    case HasOther of
+        true ->
+            %% Size updates MUST appear at the start of the block.
+            {error, invalid_size_update};
+        false ->
+            case decode_integer(Bin, 5) of
+                {ok, Size, Rest} ->
+                    Ctx1 = set_max_table_size(Size, Ctx),
+                    Ctx2 = Ctx1#hpack_context{pending_size_update = false},
+                    decode_headers(Rest, Ctx2, Acc, false);
+                {error, _} = Err ->
+                    Err
+            end
     end.
 
 decode_literal(Bin, Prefix, Ctx) ->

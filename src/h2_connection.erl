@@ -34,6 +34,7 @@
 
 -define(SETTINGS_TIMEOUT_MS, 5000).
 -define(CLOSE_TIMEOUT_MS, 5000).
+-define(GOAWAY_DRAIN_MS, 100).
 
 %% Stream states per RFC 7540 Section 5.1
 -record(stream, {
@@ -87,7 +88,13 @@
     close_timer :: reference() | undefined,
 
     %% Callers waiting for connected state
-    waiters = [] :: [gen_statem:from()]
+    waiters = [] :: [gen_statem:from()],
+
+    %% RFC 7540 §6.10: once HEADERS/PUSH_PROMISE/CONTINUATION without
+    %% END_HEADERS arrives, the only frame we may accept until
+    %% END_HEADERS is a matching CONTINUATION on the same stream.
+    %% {StreamId, EndStream} while awaiting; undefined otherwise.
+    expecting_continuation :: {non_neg_integer(), boolean()} | undefined
 }).
 
 %% ============================================================================
@@ -418,8 +425,11 @@ connected(EventType, Event, State) ->
 %% State: goaway_sent
 %% ============================================================================
 
+goaway_sent(enter, _OldState, #state{close_timer = Timer} = State) when Timer =/= undefined ->
+    %% Drain timer already armed by handle_send_goaway.
+    {keep_state, State};
 goaway_sent(enter, _OldState, State) ->
-    %% Start close timer
+    %% No drain timer (e.g. internally-triggered error GOAWAY) — close soon.
     Timer = erlang:start_timer(?CLOSE_TIMEOUT_MS, self(), close_timeout),
     {keep_state, State#state{close_timer = Timer}};
 
@@ -433,12 +443,25 @@ goaway_sent(info, {tcp_closed, Socket}, #state{socket = Socket} = State) ->
 goaway_sent(info, {ssl_closed, Socket}, #state{socket = Socket} = State) ->
     {stop, {shutdown, ssl_closed}, State};
 
+goaway_sent(info, {timeout, Timer, goaway_drain},
+            #state{close_timer = Timer, last_peer_stream_id = LastId,
+                   goaway_error = ErrorCode} = State) ->
+    %% Drain window elapsed — send the real GOAWAY with the actual last
+    %% peer-initiated stream id and close.
+    State1 = send_goaway_frame(LastId, ErrorCode, State#state{close_timer = undefined}),
+    {stop, {shutdown, goaway_drained}, State1};
+
 goaway_sent(info, {timeout, Timer, close_timeout}, #state{close_timer = Timer} = State) ->
     {stop, {shutdown, close_timeout}, State};
 
 goaway_sent({call, From}, {send_data, StreamId, Data, EndStream}, State) ->
     %% Allow completing existing streams
     handle_send_data(From, StreamId, Data, EndStream, State);
+
+goaway_sent({call, From}, {send_request, _, _, _, _}, State) ->
+    {keep_state, State, [{reply, From, {error, goaway_sent}}]};
+goaway_sent({call, From}, {send_request_headers, _, _}, State) ->
+    {keep_state, State, [{reply, From, {error, goaway_sent}}]};
 
 goaway_sent({call, From}, Request, State) ->
     handle_call_common(From, Request, goaway_sent, State);
@@ -540,8 +563,9 @@ check_preface(Buffer) ->
             {error, invalid_preface}
     end.
 
-process_frames(StateName, #state{buffer = Buffer} = State) ->
-    case h2_frame:decode(Buffer) of
+process_frames(StateName, #state{buffer = Buffer, local_settings = Local} = State) ->
+    MaxFrameSize = h2_settings:get(max_frame_size, Local),
+    case h2_frame:decode(Buffer, MaxFrameSize) of
         {ok, Frame, Rest} ->
             case handle_frame(StateName, Frame, State#state{buffer = Rest}) of
                 {ok, NewStateName, NewState} ->
@@ -584,6 +608,16 @@ determine_state_transition(#state{mode = Mode, preface_received = PrefaceReceive
 %% ============================================================================
 %% Internal: Frame Handling
 %% ============================================================================
+
+%% RFC 7540 §6.10: while awaiting CONTINUATION, only a CONTINUATION on the
+%% same stream is allowed. Anything else is a connection PROTOCOL_ERROR.
+handle_frame(_StateName, Frame, #state{expecting_continuation = {StreamId, _}} = State)
+  when element(1, Frame) =/= continuation ->
+    _ = StreamId,
+    {error, protocol_error, State};
+handle_frame(_StateName, {continuation, StreamId, _, _}, #state{expecting_continuation = {Expected, _}} = State)
+  when StreamId =/= Expected ->
+    {error, protocol_error, State};
 
 handle_frame(_StateName, {settings, Settings}, State) ->
     handle_settings(Settings, State);
@@ -732,13 +766,20 @@ apply_peer_settings(Settings, #state{encode_context = EncCtx, streams = Streams,
         streams = Streams1
     }.
 
-apply_local_settings(Settings, #state{decode_context = DecCtx} = State) ->
+apply_local_settings(Settings, #state{decode_context = DecCtx, local_settings = Prev} = State) ->
     %% Update HPACK decoder table size
     NewTableSize = h2_settings:get(header_table_size, Settings),
+    OldTableSize = h2_settings:get(header_table_size, Prev),
     DecCtx1 = h2_hpack:set_max_table_size(NewTableSize, DecCtx),
+    %% RFC 7541 §4.2: when we reduce HEADER_TABLE_SIZE, the peer's next
+    %% header block MUST start with a size update at or below the new max.
+    DecCtx2 = case NewTableSize < OldTableSize of
+        true -> h2_hpack:mark_pending_size_update(DecCtx1);
+        false -> DecCtx1
+    end,
     State#state{
         local_settings = Settings,
-        decode_context = DecCtx1
+        decode_context = DecCtx2
     }.
 
 %% ============================================================================
@@ -757,7 +798,8 @@ handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, _Priority, #state{m
                     Stream = maps:get(StreamId, Streams),
                     Stream1 = Stream#stream{header_buffer = HeaderBlock},
                     State1 = put_stream(StreamId, Stream1, State),
-                    {ok, connected, State1}
+                    State2 = State1#state{expecting_continuation = {StreamId, EndStream}},
+                    {ok, connected, State2}
             end;
         error ->
             %% New stream - validate stream ID
@@ -770,14 +812,17 @@ handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, _Priority, #state{m
                             Stream = get_or_create_stream(StreamId, State),
                             Stream1 = Stream#stream{header_buffer = HeaderBlock},
                             State1 = put_stream(StreamId, Stream1, State),
-                            {ok, connected, State1}
+                            State2 = State1#state{expecting_continuation = {StreamId, EndStream}},
+                            {ok, connected, State2}
                     end;
                 {error, ErrorCode} ->
                     {error, ErrorCode, State}
             end
     end.
 
-handle_continuation(StreamId, HeaderBlock, EndHeaders, #state{streams = Streams} = State) ->
+handle_continuation(StreamId, HeaderBlock, EndHeaders,
+                    #state{streams = Streams,
+                           expecting_continuation = Expecting} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, #stream{header_buffer = Buffer} = Stream} ->
             NewBuffer = <<Buffer/binary, HeaderBlock/binary>>,
@@ -785,7 +830,14 @@ handle_continuation(StreamId, HeaderBlock, EndHeaders, #state{streams = Streams}
                 true ->
                     Stream1 = Stream#stream{header_buffer = <<>>},
                     State1 = put_stream(StreamId, Stream1, State),
-                    decode_and_process_headers(StreamId, NewBuffer, false, State1);
+                    %% Restore the original END_STREAM flag captured when
+                    %% HEADERS arrived; clear expecting_continuation.
+                    EndStream = case Expecting of
+                        {_, E} -> E;
+                        _ -> false
+                    end,
+                    State2 = State1#state{expecting_continuation = undefined},
+                    decode_and_process_headers(StreamId, NewBuffer, EndStream, State2);
                 false ->
                     Stream1 = Stream#stream{header_buffer = NewBuffer},
                     State1 = put_stream(StreamId, Stream1, State),
@@ -800,8 +852,9 @@ decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_conte
         {ok, Headers, DecCtx1} ->
             State1 = State#state{decode_context = DecCtx1},
             %% Determine whether this is an initial HEADERS (request/response)
-            %% or a trailing HEADERS. Only initial HEADERS are subject to
-            %% pseudo-header validation (RFC 7540 §8.1.2.3 / §8.1.2.1).
+            %% or a trailing HEADERS. Only initial HEADERS carry pseudo-headers
+            %% (RFC 7540 §8.1.2.3 / §8.1.2.4). Trailers have their own rules
+            %% (§8.1: MUST have END_STREAM, MUST NOT carry pseudo-headers).
             IsInitialHeaders = case Mode of
                 server -> true;
                 client ->
@@ -811,9 +864,11 @@ decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_conte
                         _ -> false
                     end
             end,
-            case IsInitialHeaders andalso validate_pseudo_headers(Mode, Headers) of
-                false ->
-                    decode_and_process_headers_cont(StreamId, Headers, EndStream, State1);
+            Validation = case IsInitialHeaders of
+                true -> validate_initial_headers(Mode, Headers);
+                false -> validate_trailers(Headers, EndStream)
+            end,
+            case Validation of
                 ok ->
                     decode_and_process_headers_cont(StreamId, Headers, EndStream, State1);
                 {error, ValidErr} ->
@@ -887,16 +942,123 @@ decode_and_process_headers_cont(StreamId, Headers, EndStream, #state{mode = Mode
                     end
             end.
 
-%% Validate pseudo-headers per RFC 7540 §8.1.2.3 (requests) and §8.1.2.4 (responses):
-%% - pseudo-headers must precede regular headers
-%% - unknown pseudo-headers MUST be rejected
-%% - requests MUST contain :method, :scheme, :path (except CONNECT); :authority optional
-%% - responses MUST contain :status
-%% - no duplicate pseudo-headers
-validate_pseudo_headers(Mode, Headers) ->
-    case check_pseudo_order(Headers) of
-        ok -> check_pseudo_set(Mode, Headers);
+%% Validate an initial request/response HEADERS block per RFC 7540 §8.1.2.
+%% Checks: pseudo-header order/set/duplicates, lowercase header names,
+%% connection-specific headers, TE header restriction, :path syntax
+%% (requests), :authority vs Host consistency (requests).
+validate_initial_headers(Mode, Headers) ->
+    Checks = [
+        fun() -> check_pseudo_order(Headers) end,
+        fun() -> check_pseudo_set(Mode, Headers) end,
+        fun() -> check_lowercase_names(Headers) end,
+        fun() -> check_connection_headers(Headers) end,
+        fun() -> check_request_specific(Mode, Headers) end
+    ],
+    run_checks(Checks).
+
+%% Validate a trailing HEADERS block per RFC 7540 §8.1:
+%% MUST have END_STREAM and MUST NOT contain any pseudo-header.
+validate_trailers(Headers, true) ->
+    Checks = [
+        fun() -> check_no_pseudo_in_trailers(Headers) end,
+        fun() -> check_lowercase_names(Headers) end,
+        fun() -> check_connection_headers(Headers) end
+    ],
+    run_checks(Checks);
+validate_trailers(_Headers, false) ->
+    {error, protocol_error}.
+
+run_checks([]) -> ok;
+run_checks([F | Rest]) ->
+    case F() of
+        ok -> run_checks(Rest);
         Err -> Err
+    end.
+
+check_no_pseudo_in_trailers(Headers) ->
+    case [N || {<<$:, _/binary>> = N, _} <- Headers] of
+        [] -> ok;
+        _ -> {error, protocol_error}
+    end.
+
+check_lowercase_names(Headers) ->
+    %% Pseudo-header names already start with ':' and by convention are
+    %% lowercase; we only need to verify the ASCII letters in each name byte.
+    HasUpper = lists:any(fun({Name, _}) -> has_upper(Name) end, Headers),
+    case HasUpper of
+        true -> {error, protocol_error};
+        false -> ok
+    end.
+
+has_upper(<<>>) -> false;
+has_upper(<<C, _/binary>>) when C >= $A, C =< $Z -> true;
+has_upper(<<_, Rest/binary>>) -> has_upper(Rest).
+
+%% RFC 7540 §8.1.2.2: reject connection-specific headers; TE only allowed with
+%% the exact value "trailers".
+check_connection_headers(Headers) ->
+    Banned = [<<"connection">>, <<"proxy-connection">>, <<"keep-alive">>,
+              <<"transfer-encoding">>, <<"upgrade">>, <<"host">>],
+    %% We only ban Host as duplicate-check target, not here — Host handled in check_authority_host.
+    BannedStrict = Banned -- [<<"host">>],
+    Bad = lists:any(
+        fun({Name, _}) -> lists:member(Name, BannedStrict) end, Headers),
+    case Bad of
+        true -> {error, protocol_error};
+        false -> check_te_header(Headers)
+    end.
+
+check_te_header(Headers) ->
+    case [V || {<<"te">>, V} <- Headers] of
+        [] -> ok;
+        [<<"trailers">>] -> ok;
+        _ -> {error, protocol_error}
+    end.
+
+check_request_specific(server, Headers) ->
+    Method = proplists:get_value(<<":method">>, Headers),
+    case Method of
+        undefined -> ok;  %% already caught in check_pseudo_set
+        <<"CONNECT">> -> ok;  %% CONNECT has no :path/:scheme
+        _ ->
+            case check_path(Headers) of
+                ok -> check_authority_host(Headers);
+                Err -> Err
+            end
+    end;
+check_request_specific(client, _Headers) ->
+    ok.
+
+check_path(Headers) ->
+    case proplists:get_value(<<":path">>, Headers) of
+        undefined -> ok;  %% already caught
+        <<>> -> {error, protocol_error};
+        Path ->
+            case proplists:get_value(<<":scheme">>, Headers) of
+                undefined -> ok;
+                Scheme when Scheme =:= <<"http">>; Scheme =:= <<"https">> ->
+                    Method = proplists:get_value(<<":method">>, Headers),
+                    case {binary_part(Path, 0, 1), Method, Path} of
+                        {<<"/">>, _, _} -> ok;
+                        {<<"*">>, <<"OPTIONS">>, <<"*">>} -> ok;
+                        _ -> {error, protocol_error}
+                    end;
+                _ -> ok
+            end
+    end.
+
+check_authority_host(Headers) ->
+    case proplists:get_value(<<":authority">>, Headers) of
+        undefined -> ok;
+        Authority ->
+            case proplists:get_value(<<"host">>, Headers) of
+                undefined -> ok;
+                Host ->
+                    case string:equal(Authority, Host, true) of
+                        true -> ok;
+                        false -> {error, protocol_error}
+                    end
+            end
     end.
 
 check_pseudo_order(Headers) ->
@@ -1031,9 +1193,32 @@ handle_data_frame(StreamId, Data, EndStream, #state{streams = Streams, recv_conn
                     send_rst_stream(StreamId, stream_closed, State),
                     {ok, connected, State};
                 error ->
-                    %% Unknown stream
-                    {error, protocol_error, State}
+                    %% Unknown stream. If the id falls within the range of
+                    %% peer-initiated streams we've already seen, it was
+                    %% closed/reset — reply STREAM_CLOSED (RFC 7540 §5.1).
+                    %% Otherwise this is an invalid stream id → connection
+                    %% PROTOCOL_ERROR.
+                    case in_closed_stream_range(StreamId, State) of
+                        true ->
+                            send_rst_stream(StreamId, stream_closed, State),
+                            {ok, connected, State};
+                        false ->
+                            {error, protocol_error, State}
+                    end
             end
+    end.
+
+in_closed_stream_range(StreamId, #state{mode = Mode, last_peer_stream_id = LastPeer,
+                                         next_stream_id = NextLocal}) ->
+    case Mode of
+        client ->
+            %% Peer-initiated (server) streams are even.
+            StreamId rem 2 =:= 0 andalso StreamId =< LastPeer;
+        server ->
+            %% Peer-initiated (client) streams are odd; also allow our own
+            %% (even) ids strictly below NextLocal as recently-closed.
+            (StreamId rem 2 =:= 1 andalso StreamId =< LastPeer)
+            orelse (StreamId rem 2 =:= 0 andalso StreamId < NextLocal)
     end.
 
 maybe_send_window_update(StreamId, _DataSize, #state{recv_conn_window_size = ConnWindow,
@@ -1300,12 +1485,21 @@ handle_cancel_stream(From, StreamId, ErrorCode, #state{streams = Streams} = Stat
     end.
 
 handle_send_goaway(From, ErrorCode, CurrentState, State) ->
-    State1 = send_goaway_frame(State#state.last_peer_stream_id, ErrorCode, State),
+    %% RFC 7540 §6.8: two-phase GOAWAY. Send a "shutdown warning" first with
+    %% LastStreamID = 2^31-1 and NO_ERROR so the peer can finish in-flight
+    %% streams; after a brief drain, send the real GOAWAY with the actual
+    %% last_peer_stream_id and close.
+    State1 = send_goaway_frame(?MAX_STREAM_ID, no_error, State),
+    DrainTimer = erlang:start_timer(?GOAWAY_DRAIN_MS, self(), goaway_drain),
+    State2 = State1#state{
+        goaway_error = ErrorCode,
+        close_timer = DrainTimer
+    },
     NextState = case CurrentState of
         goaway_received -> closing;
         _ -> goaway_sent
     end,
-    {next_state, NextState, State1, [{reply, From, ok}]}.
+    {next_state, NextState, State2, [{reply, From, ok}]}.
 
 %% ============================================================================
 %% Internal: Common Call Handling

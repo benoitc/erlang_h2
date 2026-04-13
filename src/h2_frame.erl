@@ -15,7 +15,7 @@
 %%
 -module(h2_frame).
 
--export([encode/1, decode/1, decode_header/1]).
+-export([encode/1, decode/1, decode/2, decode_header/1]).
 -export([data/3, data/4]).
 -export([headers/3, headers/4, headers/5]).
 -export([priority/4]).
@@ -242,11 +242,22 @@ flags(Flags) ->
 %% @doc Decode binary to frame.
 %% Returns {ok, Frame, Rest} | {more, N} | {error, Reason}
 -spec decode(binary()) -> {ok, frame_data(), binary()} | {more, non_neg_integer()} | {error, term()}.
-decode(Bin) when byte_size(Bin) < ?FRAME_HEADER_SIZE ->
+decode(Bin) ->
+    decode(Bin, infinity).
+
+%% @doc Decode binary to frame, rejecting frames larger than MaxFrameSize
+%% with frame_size_error (RFC 7540 §4.2).
+-spec decode(binary(), pos_integer() | infinity) ->
+    {ok, frame_data(), binary()} | {more, non_neg_integer()} | {error, term()}.
+decode(Bin, _MaxFrameSize) when byte_size(Bin) < ?FRAME_HEADER_SIZE ->
     {more, ?FRAME_HEADER_SIZE - byte_size(Bin)};
-decode(<<Length:24, _Type:8, _Flags:8, _:1, _StreamId:31, Rest/binary>> = Bin) when byte_size(Rest) < Length ->
+decode(<<Length:24, _Type:8, _Flags:8, _:1, _StreamId:31, _/binary>>, MaxFrameSize)
+  when is_integer(MaxFrameSize), Length > MaxFrameSize ->
+    {error, frame_size_error};
+decode(<<Length:24, _Type:8, _Flags:8, _:1, _StreamId:31, Rest/binary>> = Bin, _MaxFrameSize)
+  when byte_size(Rest) < Length ->
     {more, ?FRAME_HEADER_SIZE + Length - byte_size(Bin)};
-decode(<<Length:24, Type:8, Flags:8, _:1, StreamId:31, Payload:Length/binary, Rest/binary>>) ->
+decode(<<Length:24, Type:8, Flags:8, _:1, StreamId:31, Payload:Length/binary, Rest/binary>>, _MaxFrameSize) ->
     case decode_frame(Type, Flags, StreamId, Payload) of
         {ok, Frame} -> {ok, Frame, Rest};
         {error, _} = Err -> Err
@@ -259,6 +270,8 @@ decode_header(Bin) when byte_size(Bin) < ?FRAME_HEADER_SIZE ->
 decode_header(<<Length:24, Type:8, Flags:8, _:1, StreamId:31, Rest/binary>>) ->
     {ok, {Length, type_name(Type), Flags, StreamId}, Rest}.
 
+decode_frame(?DATA, _Flags, 0, _Payload) ->
+    {error, protocol_error};  %% DATA MUST have non-zero stream ID
 decode_frame(?DATA, Flags, StreamId, Payload) ->
     EndStream = (Flags band ?FLAG_END_STREAM) =/= 0,
     Padded = (Flags band ?FLAG_PADDED) =/= 0,
@@ -267,6 +280,8 @@ decode_frame(?DATA, Flags, StreamId, Payload) ->
         {error, _} = Err -> Err
     end;
 
+decode_frame(?HEADERS, _Flags, 0, _Payload) ->
+    {error, protocol_error};  %% HEADERS MUST have non-zero stream ID
 decode_frame(?HEADERS, Flags, StreamId, Payload) ->
     EndStream = (Flags band ?FLAG_END_STREAM) =/= 0,
     EndHeaders = (Flags band ?FLAG_END_HEADERS) =/= 0,
@@ -286,11 +301,15 @@ decode_frame(?HEADERS, Flags, StreamId, Payload) ->
             Err
     end;
 
+decode_frame(?PRIORITY, _Flags, 0, _Payload) ->
+    {error, protocol_error};  %% PRIORITY MUST have non-zero stream ID
 decode_frame(?PRIORITY, _Flags, StreamId, <<E:1, DependsOn:31, Weight:8>>) ->
     {ok, {priority, StreamId, E =:= 1, DependsOn, Weight + 1}};
 decode_frame(?PRIORITY, _Flags, _StreamId, _Payload) ->
     {error, frame_size_error};
 
+decode_frame(?RST_STREAM, _Flags, 0, _Payload) ->
+    {error, protocol_error};  %% RST_STREAM MUST have non-zero stream ID
 decode_frame(?RST_STREAM, _Flags, StreamId, <<ErrorCode:32>>) ->
     {ok, {rst_stream, StreamId, ErrorCode}};
 decode_frame(?RST_STREAM, _Flags, _StreamId, _Payload) ->
@@ -312,6 +331,8 @@ decode_frame(?SETTINGS, Flags, 0, Payload) ->
 decode_frame(?SETTINGS, _Flags, _StreamId, _Payload) ->
     {error, protocol_error}; %% SETTINGS must be on stream 0
 
+decode_frame(?PUSH_PROMISE, _Flags, 0, _Payload) ->
+    {error, protocol_error};  %% PUSH_PROMISE MUST have non-zero stream ID
 decode_frame(?PUSH_PROMISE, Flags, StreamId, Payload) ->
     EndHeaders = (Flags band ?FLAG_END_HEADERS) =/= 0,
     Padded = (Flags band ?FLAG_PADDED) =/= 0,
@@ -349,6 +370,8 @@ decode_frame(?WINDOW_UPDATE, _Flags, _StreamId, <<_:1, 0:31>>) ->
 decode_frame(?WINDOW_UPDATE, _Flags, _StreamId, _Payload) ->
     {error, frame_size_error};
 
+decode_frame(?CONTINUATION, _Flags, 0, _Payload) ->
+    {error, protocol_error};  %% CONTINUATION MUST have non-zero stream ID
 decode_frame(?CONTINUATION, Flags, StreamId, HeaderBlock) ->
     EndHeaders = (Flags band ?FLAG_END_HEADERS) =/= 0,
     {ok, {continuation, StreamId, HeaderBlock, EndHeaders}};
@@ -359,7 +382,10 @@ decode_frame(Type, Flags, StreamId, Payload) ->
 
 strip_padding(false, Data) ->
     {ok, Data};
-strip_padding(true, <<PadLength, Rest/binary>>) when PadLength < byte_size(Rest) ->
+strip_padding(true, <<PadLength, Rest/binary>>) when PadLength =< byte_size(Rest) ->
+    %% RFC 7540 §6.1: pad_length's value MUST be less than the frame payload
+    %% length (which is 1 + byte_size(Rest) here since payload includes the
+    %% pad-length byte). So PadLength =< byte_size(Rest) is the valid bound.
     DataLen = byte_size(Rest) - PadLength,
     <<Data:DataLen/binary, _Padding:PadLength/binary>> = Rest,
     {ok, Data};
@@ -504,5 +530,78 @@ multiple_frames_test() ->
     ?assertEqual({data, 1, <<"hello">>, false}, D1),
     {ok, D2, <<>>} = decode(Rest),
     ?assertEqual({data, 1, <<"world">>, true}, D2).
+
+%% ---- Spec-compliance: frame validation ----
+
+max_frame_size_receive_test() ->
+    Big = binary:copy(<<"x">>, 20000),
+    Bin = encode(data(1, Big, true)),
+    ?assertEqual({error, frame_size_error}, decode(Bin, 16384)),
+    %% At the default settings-max, it decodes cleanly
+    {ok, _, <<>>} = decode(Bin, 16#FFFFFF).
+
+data_on_stream_zero_rejected_test() ->
+    Bin = encode(data(0, <<"oops">>, true)),
+    ?assertEqual({error, protocol_error}, decode(Bin)).
+
+headers_on_stream_zero_rejected_test() ->
+    Bin = encode(headers(0, <<"hdr">>, true)),
+    ?assertEqual({error, protocol_error}, decode(Bin)).
+
+priority_on_stream_zero_rejected_test() ->
+    Bin = encode(priority(0, false, 0, 16)),
+    ?assertEqual({error, protocol_error}, decode(Bin)).
+
+rst_stream_on_stream_zero_rejected_test() ->
+    Bin = encode(rst_stream(0, 0)),
+    ?assertEqual({error, protocol_error}, decode(Bin)).
+
+push_promise_on_stream_zero_rejected_test() ->
+    Bin = encode(push_promise(0, 2, <<"hdr">>, true)),
+    ?assertEqual({error, protocol_error}, decode(Bin)).
+
+continuation_on_stream_zero_rejected_test() ->
+    Bin = encode(continuation(0, <<"hdr">>, true)),
+    ?assertEqual({error, protocol_error}, decode(Bin)).
+
+settings_on_stream_nonzero_rejected_test() ->
+    %% Craft a SETTINGS frame on stream 1 manually
+    Bin = <<0:24, ?SETTINGS:8, 0:8, 0:1, 1:31>>,
+    ?assertEqual({error, protocol_error}, decode(Bin)).
+
+ping_on_stream_nonzero_rejected_test() ->
+    Bin = <<8:24, ?PING:8, 0:8, 0:1, 1:31, 0,0,0,0,0,0,0,0>>,
+    ?assertEqual({error, protocol_error}, decode(Bin)).
+
+goaway_on_stream_nonzero_rejected_test() ->
+    Bin = <<8:24, ?GOAWAY:8, 0:8, 0:1, 1:31, 0:1, 0:31, 0:32>>,
+    ?assertEqual({error, protocol_error}, decode(Bin)).
+
+padding_equal_payload_accepted_test() ->
+    %% PadLength=5 with 0 data bytes and 5 padding bytes: payload size = 1+0+5 = 6
+    %% This is legal per RFC 7540 §6.1 since pad value (5) < payload length (6).
+    Frame = data(1, <<>>, true, <<1,2,3,4,5>>),
+    Bin = encode(Frame),
+    {ok, {data, 1, <<>>, true}, <<>>} = decode(Bin).
+
+padding_over_payload_rejected_test() ->
+    %% Manually craft a DATA frame where PadLength claims more bytes than follow.
+    %% Payload = <<5, 1,2>> (PadLength=5 but only 2 bytes of data+padding).
+    Payload = <<5, 1, 2>>,
+    Bin = <<(byte_size(Payload)):24, ?DATA:8, ?FLAG_PADDED:8, 0:1, 1:31, Payload/binary>>,
+    ?assertEqual({error, protocol_error}, decode(Bin)).
+
+settings_ack_with_payload_rejected_test() ->
+    %% SETTINGS frame with ACK flag set MUST NOT have a payload (RFC 7540 §6.5).
+    Payload = <<0,1, 0:32>>,
+    Bin = <<(byte_size(Payload)):24, ?SETTINGS:8, ?FLAG_ACK:8, 0:1, 0:31, Payload/binary>>,
+    ?assertEqual({error, frame_size_error}, decode(Bin)).
+
+unknown_frame_ignored_test() ->
+    %% Type 0xFA is not defined; decode returns unknown_frame for upper layer
+    %% to ignore (RFC 7540 §4.1).
+    Payload = <<"anything">>,
+    Bin = <<(byte_size(Payload)):24, 16#FA:8, 0:8, 0:1, 1:31, Payload/binary>>,
+    {ok, {unknown_frame, 16#FA, 0, 1, Payload}, <<>>} = decode(Bin).
 
 -endif.
