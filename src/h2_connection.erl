@@ -1022,125 +1022,142 @@ classify_headers(client, StreamId, Headers, State) ->
         error -> initial
     end.
 
-decode_and_process_headers_cont(Kind, StreamId, Headers, EndStream, #state{mode = Mode} = State1) ->
-    Stream = get_or_create_stream(StreamId, State1),
-    case {Mode, Kind} of
-        {server, initial} ->
-            {Method, Path, OtherHeaders} = extract_request_headers(Headers),
-            Protocol = proplists:get_value(<<":protocol">>, Headers),
-            IsTunnel = Method =:= <<"CONNECT">>,
-            %% RFC 8441 §4: server MUST treat Extended CONNECT as malformed
-            %% when it has not advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1.
-            ExtendedConnectAllowed = Protocol =:= undefined
-                                     orelse State1#state.enable_connect_protocol,
-            case ExtendedConnectAllowed of
-                false ->
-                    send_rst_stream(StreamId, protocol_error, State1),
-                    {ok, connected, State1};
+decode_and_process_headers_cont(Kind, StreamId, Headers, EndStream, #state{mode = Mode} = State) ->
+    Stream = get_or_create_stream(StreamId, State),
+    dispatch_headers(Mode, Kind, StreamId, Stream, Headers, EndStream, State).
+
+%% Server receives the initial request HEADERS on a new stream.
+dispatch_headers(server, initial, StreamId, Stream, Headers, EndStream, State) ->
+    Protocol = proplists:get_value(<<":protocol">>, Headers),
+    case extended_connect_allowed(Protocol, State) of
+        false -> stream_reject(StreamId, protocol_error, State);
+        true  -> handle_server_initial(StreamId, Stream, Headers, Protocol, EndStream, State)
+    end;
+
+%% Server receives trailing HEADERS closing a request body.
+dispatch_headers(server, trailers, StreamId, _Stream, _Headers, false, State) ->
+    %% RFC 9113 §8.1: trailers MUST carry END_STREAM.
+    stream_reject(StreamId, protocol_error, State);
+dispatch_headers(server, trailers, StreamId, Stream, Headers, true, State) ->
+    deliver_trailers(StreamId, Stream, Headers, State, fun notify_stream/3);
+
+%% Client receives a 1xx informational response. Stream stays open.
+dispatch_headers(client, interim, StreamId, _Stream, Headers, _EndStream, State) ->
+    {ok, Status} = parse_status(Headers),
+    notify_owner({h2, self(), {informational, StreamId, Status, strip_pseudo(Headers)}}, State),
+    {ok, connected, State};
+
+%% Client receives the final response HEADERS.
+dispatch_headers(client, initial, StreamId, Stream, Headers, EndStream, State) ->
+    case parse_status(Headers) of
+        malformed    -> stream_reject_and_close(StreamId, protocol_error, State);
+        {ok, Status} -> handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State)
+    end;
+
+%% Client receives trailing HEADERS closing a response body.
+dispatch_headers(client, trailers, StreamId, Stream, Headers, _EndStream, State) ->
+    deliver_trailers(StreamId, Stream, Headers, State, fun notify_owner_stream/3).
+
+%% ---- Initial-HEADERS handlers ------------------------------------------------
+
+handle_server_initial(StreamId, Stream, Headers, Protocol, EndStream, State) ->
+    case parse_content_length(Headers) of
+        {error, Err} ->
+            stream_reject(StreamId, Err, State);
+        {ok, ExpectedCL} ->
+            case end_stream_body_mismatch(ExpectedCL, EndStream) of
                 true ->
-            case parse_content_length(Headers) of
-                {error, Err} ->
-                    send_rst_stream(StreamId, Err, State1),
-                    {ok, connected, State1};
-                {ok, ExpectedCL} ->
-                    BodyForbidden = Method =:= <<"HEAD">>,
-                    Stream1 = Stream#stream{
-                        state = case EndStream of true -> half_closed_remote; false -> open end,
-                        request_headers = Headers,
-                        request_method = Method,
-                        tunnel = IsTunnel,
-                        protocol = Protocol,
-                        expected_body_length = ExpectedCL,
-                        body_forbidden = BodyForbidden
-                    },
-                    %% §8.1: END_STREAM + CL>0 is malformed.
-                    case ExpectedCL =/= undefined andalso EndStream andalso ExpectedCL > 0 of
-                        true ->
-                            send_rst_stream(StreamId, protocol_error, State1),
-                            {ok, connected, State1};
-                        false ->
-                            State2 = put_stream(StreamId, Stream1, State1),
-                            State3 = State2#state{last_peer_stream_id = max(StreamId, State2#state.last_peer_stream_id)},
-                            notify_owner({h2, self(), {request, StreamId, Method, Path, OtherHeaders}}, State3),
-                            {ok, connected, State3}
-                    end
+                    %% RFC 9113 §8.1: END_STREAM + CL>0 is malformed.
+                    stream_reject(StreamId, protocol_error, State);
+                false ->
+                    commit_server_initial(StreamId, Stream, Headers, Protocol,
+                                          ExpectedCL, EndStream, State)
             end
-            end;
-        {server, trailers} ->
-            case EndStream of
-                false ->
-                    send_rst_stream(StreamId, protocol_error, State1),
-                    {ok, connected, State1};
-                true ->
-                    Stream1 = Stream#stream{state = closed},
-                    State2 = put_stream(StreamId, Stream1, State1),
-                    notify_stream(StreamId, {trailers, StreamId, Headers}, State2),
-                    State3 = close_stream(StreamId, State2),
-                    {ok, connected, State3}
-            end;
-        {client, interim} ->
-            %% 1xx informational response: deliver and keep stream open.
-            {ok, Status} = parse_status(Headers),
-            OtherHeaders = lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers),
-            notify_owner({h2, self(), {informational, StreamId, Status, OtherHeaders}}, State1),
-            {ok, connected, State1};
-        {client, initial} ->
-            case parse_status(Headers) of
-                {ok, Status} ->
-                    IsHeadRequest = Stream#stream.request_method =:= <<"HEAD">>,
-                    BodyForbidden = IsHeadRequest
-                                    orelse Status =:= 204 orelse Status =:= 304,
-                    case parse_content_length(Headers) of
-                        {error, Err} ->
-                            send_rst_stream(StreamId, Err, State1),
-                            {ok, connected, State1};
-                        {ok, ExpectedCL} ->
-                            Stream1 = Stream#stream{
-                                state = case EndStream of true -> half_closed_remote; false -> open end,
-                                response_headers = Headers,
-                                response_seen_final = true,
-                                expected_body_length = ExpectedCL,
-                                body_forbidden = BodyForbidden
-                            },
-                            State2 = put_stream(StreamId, Stream1, State1),
-                            OtherHeaders = lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers),
-                            notify_owner({h2, self(), {response, StreamId, Status, OtherHeaders}}, State2),
-                            case EndStream of
-                                true ->
-                                    %% §8.1: END_STREAM with CL>0 is malformed.
-                                    case ExpectedCL =/= undefined andalso ExpectedCL > 0 of
-                                        true ->
-                                            send_rst_stream(StreamId, protocol_error, State2),
-                                            State3 = close_stream(StreamId, State2),
-                                            {ok, connected, State3};
-                                        false ->
-                                            %% Body-less response (HEAD / 204 /
-                                            %% 304 / empty): emit a trailing
-                                            %% empty DATA event so clients that
-                                            %% wait for end-of-stream don't
-                                            %% hang. Matches quic_h3.
-                                            notify_stream(StreamId,
-                                                {data, StreamId, <<>>, true},
-                                                State2),
-                                            State3 = close_stream(StreamId, State2),
-                                            {ok, connected, State3}
-                                    end;
-                                false ->
-                                    {ok, connected, State2}
-                            end
-                    end;
-                malformed ->
-                    send_rst_stream(StreamId, protocol_error, State1),
-                    State2 = close_stream(StreamId, State1),
-                    {ok, connected, State2}
-            end;
-        {client, trailers} ->
-            Stream1 = Stream#stream{state = closed},
-            State2 = put_stream(StreamId, Stream1, State1),
-            notify_owner({h2, self(), {trailers, StreamId, Headers}}, State2),
-            State3 = close_stream(StreamId, State2),
-            {ok, connected, State3}
     end.
+
+commit_server_initial(StreamId, Stream, Headers, Protocol, ExpectedCL, EndStream, State) ->
+    {Method, Path, OtherHeaders} = extract_request_headers(Headers),
+    Stream1 = Stream#stream{
+        state = stream_state_after_end(EndStream),
+        request_headers = Headers,
+        request_method = Method,
+        tunnel = Method =:= <<"CONNECT">>,
+        protocol = Protocol,
+        expected_body_length = ExpectedCL,
+        body_forbidden = Method =:= <<"HEAD">>
+    },
+    State1 = put_stream(StreamId, Stream1, State),
+    State2 = State1#state{last_peer_stream_id =
+                            max(StreamId, State1#state.last_peer_stream_id)},
+    notify_owner({h2, self(), {request, StreamId, Method, Path, OtherHeaders}}, State2),
+    {ok, connected, State2}.
+
+handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State) ->
+    case parse_content_length(Headers) of
+        {error, Err} ->
+            stream_reject(StreamId, Err, State);
+        {ok, ExpectedCL} ->
+            BodyForbidden = Stream#stream.request_method =:= <<"HEAD">>
+                            orelse Status =:= 204 orelse Status =:= 304,
+            Stream1 = Stream#stream{
+                state = stream_state_after_end(EndStream),
+                response_headers = Headers,
+                response_seen_final = true,
+                expected_body_length = ExpectedCL,
+                body_forbidden = BodyForbidden
+            },
+            State1 = put_stream(StreamId, Stream1, State),
+            notify_owner({h2, self(), {response, StreamId, Status, strip_pseudo(Headers)}}, State1),
+            finalize_client_initial(StreamId, EndStream, ExpectedCL, State1)
+    end.
+
+%% Body continues arriving as DATA frames.
+finalize_client_initial(_StreamId, false, _ExpectedCL, State) ->
+    {ok, connected, State};
+%% END_STREAM with CL>0 is a malformed response.
+finalize_client_initial(StreamId, true, ExpectedCL, State)
+  when ExpectedCL =/= undefined, ExpectedCL > 0 ->
+    stream_reject_and_close(StreamId, protocol_error, State);
+%% Body-less response (HEAD / 204 / 304 / empty): emit a trailing empty
+%% DATA event so clients waiting on end-of-stream don't hang. Matches quic_h3.
+finalize_client_initial(StreamId, true, _ExpectedCL, State) ->
+    notify_stream(StreamId, {data, StreamId, <<>>, true}, State),
+    {ok, connected, close_stream(StreamId, State)}.
+
+%% ---- Shared helpers ---------------------------------------------------------
+
+deliver_trailers(StreamId, Stream, Headers, State, NotifyFun) ->
+    Stream1 = Stream#stream{state = closed},
+    State1  = put_stream(StreamId, Stream1, State),
+    NotifyFun(StreamId, {trailers, StreamId, Headers}, State1),
+    {ok, connected, close_stream(StreamId, State1)}.
+
+%% Uniform 3-arity shim so `deliver_trailers` can dispatch either fan-out style.
+notify_owner_stream(_StreamId, Event, State) ->
+    notify_owner({h2, self(), Event}, State).
+
+%% RFC 8441 §4: a server that has not advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1
+%% MUST treat a request carrying `:protocol` as malformed.
+extended_connect_allowed(undefined, _State) -> true;
+extended_connect_allowed(_Proto, #state{enable_connect_protocol = Flag}) -> Flag.
+
+end_stream_body_mismatch(undefined, _EndStream) -> false;
+end_stream_body_mismatch(CL, true) when CL > 0  -> true;
+end_stream_body_mismatch(_, _)                  -> false.
+
+stream_state_after_end(true)  -> half_closed_remote;
+stream_state_after_end(false) -> open.
+
+strip_pseudo(Headers) ->
+    lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers).
+
+stream_reject(StreamId, ErrorCode, State) ->
+    send_rst_stream(StreamId, ErrorCode, State),
+    {ok, connected, State}.
+
+stream_reject_and_close(StreamId, ErrorCode, State) ->
+    send_rst_stream(StreamId, ErrorCode, State),
+    {ok, connected, close_stream(StreamId, State)}.
 
 %% RFC 9113 §8.1.1: Content-Length parser. Multiple headers with the same
 %% value collapse into one; mismatched values are malformed. Non-numeric or
