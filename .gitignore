@@ -12,4 +12,5 @@ log/
 logs/
 .DS_Store
 *.crashdump
+doc/
 

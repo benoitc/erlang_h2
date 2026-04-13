@@ -130,12 +130,8 @@ parse_args([[$-|_] = Unknown|_], _Opts) ->
     {error, io_lib:format("Unknown option: ~s", [Unknown])};
 
 parse_args([URL|Rest], Opts) ->
-    case parse_url(URL) of
-        {ok, ParsedURL} ->
-            parse_args(Rest, maps:merge(Opts, ParsedURL));
-        {error, Reason} ->
-            {error, Reason}
-    end.
+    {ok, ParsedURL} = parse_url(URL),
+    parse_args(Rest, maps:merge(Opts, ParsedURL)).
 
 parse_url(URL) ->
     %% Simple URL parser for https://host:port/path

@@ -401,7 +401,7 @@ connected(enter, _OldState, #state{settings_timer = Timer, waiters = Waiters} = 
     %% Cancel settings timer if still running
     case Timer of
         undefined -> ok;
-        _ -> erlang:cancel_timer(Timer)
+        _ -> _ = erlang:cancel_timer(Timer), ok
     end,
     %% Notify owner that connection is ready
     notify_owner({h2, self(), connected}, State),
@@ -750,11 +750,7 @@ handle_frame(_StateName, {priority, _StreamId, _Exclusive, _DependsOn, _Weight},
 
 handle_frame(_StateName, {push_promise, _StreamId, _PromisedId, _HeaderBlock, _EndHeaders}, State) ->
     %% We don't support server push, send GOAWAY
-    {error, protocol_error, State};
-
-handle_frame(_StateName, {unknown_frame, _Type, _Flags, _StreamId, _Payload}, State) ->
-    %% Ignore unknown frame types per RFC 7540
-    {ok, connected, State}.
+    {error, protocol_error, State}.
 
 %% ============================================================================
 %% Internal: Settings Handling
@@ -1578,7 +1574,8 @@ handle_set_stream_handler(From, StreamId, Pid, Opts, #state{streams = Streams} =
                 {false, _} ->
                     %% Re-send buffered data as messages to the handler.
                     lists:foreach(fun({D, Fin}) ->
-                        Pid ! {h2, self(), {data, StreamId, D, Fin}}
+                        Pid ! {h2, self(), {data, StreamId, D, Fin}},
+                        ok
                     end, lists:reverse(Buf)),
                     ok
             end,
@@ -1601,7 +1598,7 @@ handle_unset_stream_handler(From, StreamId, #state{streams = Streams} = State) -
 %% mode default (client→owner, server→buffer for later handler).
 %% Matches quic_h3:notify_stream_data/4 semantics.
 dispatch_data(StreamId, #stream{handler = Pid} = Stream, Data, Fin, State) when is_pid(Pid) ->
-    Pid ! {h2, self(), {data, StreamId, Data, Fin}},
+    _ = Pid ! {h2, self(), {data, StreamId, Data, Fin}},
     {Stream, State};
 dispatch_data(StreamId, #stream{} = Stream, Data, Fin, #state{mode = client} = State) ->
     notify_owner({h2, self(), {data, StreamId, Data, Fin}}, State),
@@ -1609,7 +1606,7 @@ dispatch_data(StreamId, #stream{} = Stream, Data, Fin, #state{mode = client} = S
 dispatch_data(_StreamId, #stream{recv_buffer = Buf} = Stream, Data, Fin, State) ->
     {Stream#stream{recv_buffer = [{Data, Fin} | Buf]}, State}.
 
-handle_send_goaway(From, ErrorCode, CurrentState, State) ->
+handle_send_goaway(From, ErrorCode, _CurrentState, State) ->
     %% RFC 7540 §6.8: two-phase GOAWAY. Send a "shutdown warning" first with
     %% LastStreamID = 2^31-1 and NO_ERROR so the peer can finish in-flight
     %% streams; after a brief drain, send the real GOAWAY with the actual
@@ -1621,11 +1618,7 @@ handle_send_goaway(From, ErrorCode, CurrentState, State) ->
         goaway_error = ErrorCode,
         close_timer = DrainTimer
     },
-    NextState = case CurrentState of
-        goaway_received -> closing;
-        _ -> goaway_sent
-    end,
-    {next_state, NextState, State2, [{reply, From, ok}]}.
+    {next_state, goaway_sent, State2, [{reply, From, ok}]}.
 
 %% ============================================================================
 %% Internal: Common Call Handling
@@ -1847,7 +1840,8 @@ is_ssl_socket(_) ->
     false.
 
 notify_owner(Msg, #state{owner = Owner}) ->
-    Owner ! Msg.
+    Owner ! Msg,
+    ok.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

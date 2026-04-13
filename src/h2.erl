@@ -156,13 +156,13 @@ connect_ssl(Host, Port, Opts, Timeout) ->
                 {ok, <<"h2">>} ->
                     start_connection(client, Socket, Opts);
                 {ok, Other} ->
-                    ssl:close(Socket),
+                    _ = ssl:close(Socket),
                     {error, {alpn_mismatch, Other}};
                 {error, protocol_not_negotiated} ->
                     %% Continue anyway, assume h2
                     start_connection(client, Socket, Opts);
                 {error, Reason} ->
-                    ssl:close(Socket),
+                    _ = ssl:close(Socket),
                     {error, {alpn_error, Reason}}
             end;
         {error, Reason} ->
@@ -198,7 +198,7 @@ start_connection(Mode, Socket, Opts) ->
             end,
             case TransferResult of
                 ok ->
-                    h2_connection:activate(Pid),
+                    _ = h2_connection:activate(Pid),
                     case h2_connection:wait_connected(Pid, Timeout) of
                         ok ->
                             {ok, Pid};
@@ -368,7 +368,7 @@ server_manager_loop_inner(ListenSocket, AcceptorPids, Ref) ->
         {stop, Ref} ->
             %% Stop all acceptors
             lists:foreach(fun(Pid) -> exit(Pid, shutdown) end, AcceptorPids),
-            ssl:close(ListenSocket),
+            _ = ssl:close(ListenSocket),
             ok;
         {'EXIT', Pid, _Reason} ->
             %% Acceptor died, remove from list
@@ -391,7 +391,7 @@ acceptor_loop_inner(Owner, #{listen_socket := ListenSocket, handler := Handler, 
                     case ssl:negotiated_protocol(SSLSocket) of
                         {ok, <<"h2">>} ->
                             %% Ensure socket is in passive mode before transfer
-                            ssl:setopts(SSLSocket, [{active, false}]),
+                            _ = ssl:setopts(SSLSocket, [{active, false}]),
                             Pid = spawn_link(fun() ->
                                 receive
                                     {socket_ready, Sock} ->
@@ -402,13 +402,16 @@ acceptor_loop_inner(Owner, #{listen_socket := ListenSocket, handler := Handler, 
                             end),
                             case ssl:controlling_process(SSLSocket, Pid) of
                                 ok ->
-                                    Pid ! {socket_ready, SSLSocket};
+                                    Pid ! {socket_ready, SSLSocket},
+                                    ok;
                                 {error, TransferReason} ->
                                     Pid ! {socket_transfer_failed, TransferReason},
-                                    ssl:close(SSLSocket)
+                                    _ = ssl:close(SSLSocket),
+                                    ok
                             end;
                         _ ->
-                            ssl:close(SSLSocket)
+                            _ = ssl:close(SSLSocket),
+                            ok
                     end;
                 {error, _} ->
                     ok
@@ -429,7 +432,7 @@ handle_server_connection(Socket, Handler, Settings) ->
         {ok, Conn} ->
             case ssl:controlling_process(Socket, Conn) of
                 ok ->
-                    h2_connection:activate(Conn),
+                    _ = h2_connection:activate(Conn),
                     server_connection_loop(Conn, Handler);
                 {error, _} ->
                     catch h2_connection:close(Conn),
