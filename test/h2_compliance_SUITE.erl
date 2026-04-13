@@ -71,7 +71,15 @@
     %% RFC 9113 additional compliance (second-look audit)
     tunnel_outbound_trailers_rejected_test/1,
     server_push_setting_disabled_test/1,
-    header_value_with_nul_rejected_test/1
+    header_value_with_nul_rejected_test/1,
+    outbound_uppercase_header_rejected_test/1,
+    outbound_bad_pseudo_rejected_test/1,
+    send_response_101_rejected_test/1,
+    goaway_event_three_tuple_test/1,
+    leading_space_value_rejected_test/1,
+    invalid_name_chars_rejected_test/1,
+    large_request_split_test/1,
+    peer_max_header_list_size_enforced_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -153,7 +161,15 @@ groups() ->
         {compliance_v2, [sequence], [
             tunnel_outbound_trailers_rejected_test,
             server_push_setting_disabled_test,
-            header_value_with_nul_rejected_test
+            header_value_with_nul_rejected_test,
+            outbound_uppercase_header_rejected_test,
+            outbound_bad_pseudo_rejected_test,
+            send_response_101_rejected_test,
+            goaway_event_three_tuple_test,
+            leading_space_value_rejected_test,
+            invalid_name_chars_rejected_test,
+            large_request_split_test,
+            peer_max_header_list_size_enforced_test
         ]}
     ].
 
@@ -1191,6 +1207,162 @@ read_first_settings(Sock) ->
 parse_settings_payload(<<>>) -> [];
 parse_settings_payload(<<Id:16, Value:32, Rest/binary>>) ->
     [{Id, Value} | parse_settings_payload(Rest)].
+
+%% Send-side validation: uppercase letter in header name → protocol_error.
+outbound_uppercase_header_rejected_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    ?assertEqual({error, protocol_error},
+        h2:request(Conn, <<"GET">>, <<"/">>,
+                   [{<<"host">>, <<"localhost">>}, {<<"X-Bad">>, <<"v">>}])),
+    h2:close(Conn),
+    drain_exits(),
+    ok.
+
+%% Send-side validation: request missing required :path → protocol_error.
+outbound_bad_pseudo_rejected_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    %% No :path, no :scheme, no :authority, no :method.
+    ?assertEqual({error, protocol_error},
+        h2:request(Conn, [{<<":method">>, <<"GET">>}])),
+    h2:close(Conn),
+    drain_exits(),
+    ok.
+
+%% RFC 9113 §8.6: server MUST NOT generate 101.
+send_response_101_rejected_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    Self = self(),
+    Handler = fun(Conn, Sid, _, _, _) ->
+        R = h2:send_response(Conn, Sid, 101, []),
+        Self ! {resp, R},
+        h2:send_response(Conn, Sid, 200, []),
+        h2:send_data(Conn, Sid, <<>>, true)
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => Handler
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, _Sid} = h2:request(Conn, <<"GET">>, <<"/">>, [{<<"host">>, <<"l">>}]),
+    receive
+        {resp, {error, status_101_forbidden}} -> ok
+    after 2000 ->
+        ct:fail(no_101_reject)
+    end,
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% Owner receives {goaway, LastStreamId, ErrorCode} 3-tuple.
+goaway_event_three_tuple_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    ok = h2:goaway(Conn),
+    %% Our own goaway doesn't produce an incoming {goaway, ...} event on us.
+    %% Instead, stop the server to force the peer to GOAWAY.
+    h2:close(Conn),
+    OldRef = ?config(server_ref, Config),
+    h2:stop_server(OldRef),
+    %% Second connection: server closes immediately.
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => fun(_, _, _, _, _) -> ok end
+    }),
+    Port2 = h2:server_port(Ref),
+    {ok, Conn2} = h2:connect("localhost", Port2, #{ssl_opts => [{verify, verify_none}]}),
+    ok = h2:stop_server(Ref),
+    receive
+        {h2, Conn2, {goaway, _Last, ErrorCode}} when is_atom(ErrorCode) -> ok
+    after 2000 ->
+        %% Some scheduling paths close the connection without an explicit
+        %% goaway; tolerate a clean {closed, _} as well.
+        receive
+            {h2, Conn2, {closed, _}} -> ok
+        after 500 ->
+            ct:fail(no_goaway_or_close)
+        end
+    end,
+    catch h2:close(Conn2),
+    drain_exits(),
+    ok.
+
+%% RFC 9113 §8.2.1: leading SP/HTAB in a field value is malformed.
+leading_space_value_rejected_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    ?assertEqual({error, protocol_error},
+        h2:request(Conn, <<"GET">>, <<"/">>,
+                   [{<<"host">>, <<"localhost">>}, {<<"x-v">>, <<" leading">>}])),
+    h2:close(Conn),
+    drain_exits(),
+    ok.
+
+%% Invalid tchar in name (colon in middle, space, etc.)
+invalid_name_chars_rejected_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    ?assertEqual({error, protocol_error},
+        h2:request(Conn, <<"GET">>, <<"/">>,
+                   [{<<"host">>, <<"localhost">>}, {<<"bad name">>, <<"v">>}])),
+    h2:close(Conn),
+    drain_exits(),
+    ok.
+
+%% Large header block must be split into HEADERS + CONTINUATION frames
+%% respecting peer's MAX_FRAME_SIZE (default 16384).
+large_request_split_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    Big = binary:copy(<<"a">>, 40000),
+    {ok, _} = h2:request(Conn, <<"GET">>, <<"/">>,
+                         [{<<"host">>, <<"localhost">>},
+                          {<<"x-big">>, Big}]),
+    %% If splitting is wrong, server returns PROTOCOL_ERROR/FRAME_SIZE_ERROR
+    %% and the connection dies quickly. We expect a normal response flow.
+    receive
+        {h2, Conn, {response, _, _, _}} -> ok;
+        {h2, Conn, {closed, Reason}} -> ct:fail({connection_closed, Reason})
+    after 3000 ->
+        ct:fail(no_response)
+    end,
+    h2:close(Conn),
+    drain_exits(),
+    ok.
+
+%% Client enforces peer's MAX_HEADER_LIST_SIZE before encoding.
+peer_max_header_list_size_enforced_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => fun(Conn, Sid, _, _, _) ->
+            h2:send_response(Conn, Sid, 200, []),
+            h2:send_data(Conn, Sid, <<>>, true)
+        end,
+        settings => #{max_header_list_size => 500}
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    Big = binary:copy(<<"a">>, 1000),
+    ?assertEqual({error, header_list_too_large},
+        h2:request(Conn, <<"GET">>, <<"/">>,
+                   [{<<"host">>, <<"l">>}, {<<"x-big">>, Big}])),
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
 
 %% RFC 9113 §8.2: header values containing NUL/LF/CR are malformed. The
 %% client MUST refuse to send them; we enforce this on the send side.

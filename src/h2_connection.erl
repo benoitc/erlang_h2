@@ -944,6 +944,24 @@ decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_conte
     case h2_hpack:decode(HeaderBlock, DecCtx) of
         {ok, Headers, DecCtx1} ->
             State1 = State#state{decode_context = DecCtx1},
+            %% RFC 9113 §6.5.2: enforce our advertised MAX_HEADER_LIST_SIZE.
+            case check_local_max_header_list_size(Headers, State1) of
+                {error, _} ->
+                    send_rst_stream(StreamId, protocol_error, State1),
+                    State2 = case maps:is_key(StreamId, State1#state.streams) of
+                        true -> close_stream(StreamId, State1);
+                        false -> State1
+                    end,
+                    {ok, connected, State2};
+                ok ->
+                    decode_and_process_headers_validated(Mode, StreamId, Headers, EndStream, State1)
+            end;
+        {error, Reason} ->
+            error_logger:error_msg("HPACK decode error: ~p~n", [Reason]),
+            {error, compression_error, State}
+    end.
+
+decode_and_process_headers_validated(Mode, StreamId, Headers, EndStream, State1) ->
             %% Determine role of this HEADERS block:
             %%   initial  — first HEADERS on the stream (request or response).
             %%   interim  — 1xx response (client only), more HEADERS to follow.
@@ -968,11 +986,7 @@ decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_conte
                         false -> State1
                     end,
                     {ok, connected, State2}
-            end;
-        {error, Reason} ->
-            error_logger:error_msg("HPACK decode error: ~p~n", [Reason]),
-            {error, compression_error, State}
-    end.
+            end.
 
 classify_headers(server, StreamId, _Headers, State) ->
     case maps:find(StreamId, State#state.streams) of
@@ -1343,6 +1357,35 @@ parse_status(Headers) ->
             malformed
     end.
 
+%% RFC 9113 §6.5.2 / RFC 7541 §4.1: per-header overhead is 32 bytes plus the
+%% name and value octets. Returns the advisory "header list size" sum.
+header_list_size(Headers) ->
+    lists:foldl(fun({N, V}, Acc) ->
+        Acc + 32 + byte_size(N) + byte_size(V)
+    end, 0, Headers).
+
+%% Enforce peer-advertised SETTINGS_MAX_HEADER_LIST_SIZE before encoding.
+check_peer_max_header_list_size(Headers, #state{peer_settings = PS}) ->
+    case h2_settings:get(max_header_list_size, PS) of
+        unlimited -> ok;
+        Max when is_integer(Max) ->
+            case header_list_size(Headers) > Max of
+                true  -> {error, header_list_too_large};
+                false -> ok
+            end
+    end.
+
+%% Enforce our SETTINGS_MAX_HEADER_LIST_SIZE on received decoded headers.
+check_local_max_header_list_size(Headers, #state{local_settings = LS}) ->
+    case h2_settings:get(max_header_list_size, LS) of
+        unlimited -> ok;
+        Max when is_integer(Max) ->
+            case header_list_size(Headers) > Max of
+                true  -> {error, protocol_error};
+                false -> ok
+            end
+    end.
+
 %% RFC 9113 §8.1.1, §8.2: validate every outbound header block.
 %% The existing Mode parameter of validate_initial_headers refers to the
 %% *receiver*'s role (server validates requests, client validates responses),
@@ -1523,6 +1566,10 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
                 {error, _} = Err ->
                     {keep_state, State, [{reply, From, Err}]};
                 ok ->
+                    case check_peer_max_header_list_size(AllHeaders, State) of
+                        {error, _} = SErr ->
+                            {keep_state, State, [{reply, From, SErr}]};
+                        ok ->
                     {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
 
                     RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
@@ -1539,8 +1586,7 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
                         request_method = Method
                     },
 
-                    Frame = h2_frame:headers(StreamId, HeaderBlock, EndStream),
-                    send_frame(Frame, State),
+                    send_header_block(StreamId, HeaderBlock, EndStream, State),
 
                     State1 = State#state{
                         encode_context = EncCtx1,
@@ -1549,6 +1595,7 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
                     },
 
                     {keep_state, State1, [{reply, From, {ok, StreamId}}]}
+                    end
             end
     end;
 
@@ -1570,6 +1617,10 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
                 {error, _} = Err ->
                     {keep_state, State, [{reply, From, Err}]};
                 ok ->
+            case check_peer_max_header_list_size(Headers, State) of
+                {error, _} = SErr ->
+                    {keep_state, State, [{reply, From, SErr}]};
+                ok ->
             {HeaderBlock, EncCtx1} = h2_hpack:encode(Headers, EncCtx),
             RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
             StreamState = case EndStream of true -> half_closed_local; false -> open end,
@@ -1581,14 +1632,14 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
                 tunnel = IsConnect,
                 request_method = Method
             },
-            Frame = h2_frame:headers(StreamId, HeaderBlock, EndStream),
-            send_frame(Frame, State),
+            send_header_block(StreamId, HeaderBlock, EndStream, State),
             State1 = State#state{
                 encode_context = EncCtx1,
                 streams = maps:put(StreamId, Stream, State#state.streams),
                 next_stream_id = StreamId + 2
             },
             {keep_state, State1, [{reply, From, {ok, StreamId}}]}
+            end
             end
     end;
 handle_send_request_headers(From, _Headers, _EndStream, State) ->
@@ -1616,9 +1667,12 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
                         {error, _} = Err ->
                             {keep_state, State, [{reply, From, Err}]};
                         ok ->
+                    case check_peer_max_header_list_size(AllHeaders, State) of
+                        {error, _} = SErr ->
+                            {keep_state, State, [{reply, From, SErr}]};
+                        ok ->
                     {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
-                    Frame = h2_frame:headers(StreamId, HeaderBlock, false),
-                    send_frame(Frame, State),
+                    send_header_block(StreamId, HeaderBlock, false, State),
                     %% Tunnel is "established" once a 2xx response goes out;
                     %% non-2xx responses keep tunnel=false (and the stream
                     %% behaves like a normal short response).
@@ -1630,6 +1684,7 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
                     },
                     {keep_state, State1, [{reply, From, ok}]}
                     end
+                    end
             end;
         {ok, _} ->
             {keep_state, State, [{reply, From, {error, invalid_stream_state}}]};
@@ -1639,6 +1694,27 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
 
 handle_send_response(From, _StreamId, _Status, _Headers, State) ->
     {keep_state, State, [{reply, From, {error, not_server}}]}.
+
+%% RFC 9113 §4.2: a HEADERS frame's payload must not exceed
+%% SETTINGS_MAX_FRAME_SIZE advertised by the peer. If our encoded block is
+%% larger, split it across one HEADERS frame + one or more CONTINUATION
+%% frames. No other frames on this stream may interleave.
+send_header_block(StreamId, HeaderBlock, EndStream, #state{peer_max_frame_size = MaxFrameSize} = State) ->
+    case byte_size(HeaderBlock) =< MaxFrameSize of
+        true ->
+            send_frame(h2_frame:headers(StreamId, HeaderBlock, EndStream), State);
+        false ->
+            <<First:MaxFrameSize/binary, Rest/binary>> = HeaderBlock,
+            send_frame(h2_frame:headers(StreamId, First, EndStream, false), State),
+            send_continuations(StreamId, Rest, MaxFrameSize, State)
+    end.
+
+send_continuations(StreamId, Rest, MaxFrameSize, State) when byte_size(Rest) =< MaxFrameSize ->
+    send_frame(h2_frame:continuation(StreamId, Rest, true), State);
+send_continuations(StreamId, Rest, MaxFrameSize, State) ->
+    <<Chunk:MaxFrameSize/binary, More/binary>> = Rest,
+    send_frame(h2_frame:continuation(StreamId, Chunk, false), State),
+    send_continuations(StreamId, More, MaxFrameSize, State).
 
 %% RFC 7540 §8.3: forbidden on a 2xx CONNECT response.
 has_banned_tunnel_header(Headers) ->
@@ -1722,12 +1798,15 @@ handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams, encode_
                 {error, _} = Err ->
                     {keep_state, State, [{reply, From, Err}]};
                 ok ->
+            case check_peer_max_header_list_size(Trailers, State) of
+                {error, _} = SErr ->
+                    {keep_state, State, [{reply, From, SErr}]};
+                ok ->
             %% Encode trailers
             {HeaderBlock, EncCtx1} = h2_hpack:encode(Trailers, EncCtx),
 
             %% Send HEADERS frame with END_STREAM
-            Frame = h2_frame:headers(StreamId, HeaderBlock, true),
-            send_frame(Frame, State),
+            send_header_block(StreamId, HeaderBlock, true, State),
 
             %% Update stream state
             Stream1 = Stream#stream{
@@ -1748,6 +1827,7 @@ handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams, encode_
                     {keep_state, State2, [{reply, From, ok}]};
                 _ ->
                     {keep_state, State1, [{reply, From, ok}]}
+            end
             end
             end;
         {ok, _} ->
