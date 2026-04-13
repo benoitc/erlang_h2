@@ -103,6 +103,17 @@ Options to `h2:start_server/2,3`:
 
 A module handler (`handler => {Mod, Args}`) is also supported; `Mod:handle_request/5` receives the same arguments.
 
+### Scaling the acceptor pool
+
+Each accepted socket runs its own `h2_connection` gen_statem, so concurrency on established connections scales with BEAM schedulers. The `acceptors` opt only sizes the pool of processes blocked in `ssl:transport_accept` / `gen_tcp:accept` on the shared listen socket — raise it when the incoming connection rate (not in-flight traffic) is the bottleneck:
+
+```erlang
+h2:start_server(8443, #{cert => ..., key => ..., handler => ...,
+                        acceptors => 100}).
+```
+
+Default is `erlang:system_info(schedulers)` (one per core). 100 is a good ceiling for high connection-rate workloads; going higher rarely helps. Complementary knobs: kernel `somaxconn` / `tcp_max_syn_backlog`, OS-level SSL session cache, and a `handler` that spawns per request (the built-in server loop already does).
+
 ## CONNECT tunnels (RFC 7540 §8.3)
 
 Open a bidirectional byte tunnel through an h2 proxy:
