@@ -45,7 +45,7 @@
     recv_window_size :: integer(),
     send_buffer = <<>> :: binary(),
     pending_end_stream = false :: boolean(),
-    header_buffer = <<>> :: binary(),
+    header_buffer = [] :: iodata(),
     request_headers = [] :: [{binary(), binary()}],
     response_headers = [] :: [{binary(), binary()}],
     %% Optional pid to receive body data for this stream (set_stream_handler).
@@ -69,6 +69,12 @@
     local_settings :: h2_settings:settings(),
     peer_settings :: h2_settings:settings(),
     pending_settings = [] :: [h2_settings:settings()],
+
+    %% Cached peer settings values accessed on every frame / new stream.
+    %% Refreshed whenever peer_settings changes (apply_peer_settings/2).
+    peer_max_frame_size = ?DEFAULT_MAX_FRAME_SIZE :: non_neg_integer(),
+    peer_initial_window_size = ?DEFAULT_INITIAL_WINDOW_SIZE :: integer(),
+    peer_max_concurrent_streams = ?DEFAULT_MAX_CONCURRENT_STREAMS :: non_neg_integer() | unlimited,
 
     %% HPACK contexts
     encode_context :: h2_hpack:context(),
@@ -271,6 +277,9 @@ init({Mode, Socket, Owner, Opts}) ->
         owner = Owner,
         local_settings = LocalSettings,
         peer_settings = PeerSettings,
+        peer_max_frame_size = h2_settings:get(max_frame_size, PeerSettings),
+        peer_initial_window_size = h2_settings:get(initial_window_size, PeerSettings),
+        peer_max_concurrent_streams = h2_settings:get(max_concurrent_streams, PeerSettings),
         encode_context = EncodeCtx,
         decode_context = DecodeCtx,
         next_stream_id = case Mode of client -> 1; server -> 2 end,
@@ -804,6 +813,9 @@ apply_peer_settings(Settings, #state{encode_context = EncCtx, streams = Streams,
             end, Streams),
             {ok, State#state{
                 peer_settings = Settings,
+                peer_max_frame_size = h2_settings:get(max_frame_size, Settings),
+                peer_initial_window_size = NewWindow,
+                peer_max_concurrent_streams = h2_settings:get(max_concurrent_streams, Settings),
                 encode_context = EncCtx1,
                 streams = Streams1
             }}
@@ -876,10 +888,10 @@ handle_continuation(StreamId, HeaderBlock, EndHeaders,
                            expecting_continuation = Expecting} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, #stream{header_buffer = Buffer} = Stream} ->
-            NewBuffer = <<Buffer/binary, HeaderBlock/binary>>,
+            NewBuffer = [Buffer, HeaderBlock],
             case EndHeaders of
                 true ->
-                    Stream1 = Stream#stream{header_buffer = <<>>},
+                    Stream1 = Stream#stream{header_buffer = []},
                     State1 = put_stream(StreamId, Stream1, State),
                     %% Restore the original END_STREAM flag captured when
                     %% HEADERS arrived; clear expecting_continuation.
@@ -888,7 +900,7 @@ handle_continuation(StreamId, HeaderBlock, EndHeaders,
                         _ -> false
                     end,
                     State2 = State1#state{expecting_continuation = undefined},
-                    decode_and_process_headers(StreamId, NewBuffer, EndStream, State2);
+                    decode_and_process_headers(StreamId, iolist_to_binary(NewBuffer), EndStream, State2);
                 false ->
                     Stream1 = Stream#stream{header_buffer = NewBuffer},
                     State1 = put_stream(StreamId, Stream1, State),
@@ -1309,10 +1321,9 @@ maybe_send_window_update(StreamId, _DataSize, #state{recv_conn_window_size = Con
 %% ============================================================================
 
 handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client, next_stream_id = StreamId,
-                                                        peer_settings = PeerSettings,
+                                                        peer_max_concurrent_streams = MaxStreams,
+                                                        peer_initial_window_size = InitialWindow,
                                                         encode_context = EncCtx} = State) ->
-    %% Check max concurrent streams
-    MaxStreams = h2_settings:get(max_concurrent_streams, PeerSettings),
     ActiveStreams = count_active_streams(State),
 
     case MaxStreams of
@@ -1337,7 +1348,6 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
 
             {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
 
-            InitialWindow = h2_settings:get(initial_window_size, PeerSettings),
             RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
             StreamState = case EndStream of
                 true -> half_closed_local;
@@ -1367,9 +1377,9 @@ handle_send_request(From, _Method, _Path, _Headers, _EndStream, State) ->
     {keep_state, State, [{reply, From, {error, not_client}}]}.
 
 handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next_stream_id = StreamId,
-                                                              peer_settings = PeerSettings,
+                                                              peer_max_concurrent_streams = MaxStreams,
+                                                              peer_initial_window_size = InitialWindow,
                                                               encode_context = EncCtx} = State) ->
-    MaxStreams = h2_settings:get(max_concurrent_streams, PeerSettings),
     ActiveStreams = count_active_streams(State),
     case MaxStreams of
         N when is_integer(N), ActiveStreams >= N ->
@@ -1377,7 +1387,6 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
         _ ->
             IsConnect = proplists:get_value(<<":method">>, Headers) =:= <<"CONNECT">>,
             {HeaderBlock, EncCtx1} = h2_hpack:encode(Headers, EncCtx),
-            InitialWindow = h2_settings:get(initial_window_size, PeerSettings),
             RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
             StreamState = case EndStream of true -> half_closed_local; false -> open end,
             Stream = #stream{
@@ -1444,11 +1453,10 @@ has_banned_tunnel_header(Headers) ->
     end, Headers).
 
 handle_send_data(From, StreamId, Data, EndStream, #state{streams = Streams, conn_window_size = ConnWindow,
-                                                          peer_settings = PeerSettings} = State) ->
+                                                          peer_max_frame_size = MaxFrameSize} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, #stream{state = StreamState, window_size = StreamWindow, send_buffer = Buffer} = Stream}
           when StreamState == open; StreamState == half_closed_remote ->
-            MaxFrameSize = h2_settings:get(max_frame_size, PeerSettings),
 
             %% Calculate how much we can send
             Available = min(ConnWindow, StreamWindow),
@@ -1678,13 +1686,13 @@ validate_stream_id(StreamId, server, #state{last_peer_stream_id = LastPeer}) ->
         true -> ok
     end.
 
-get_or_create_stream(StreamId, #state{streams = Streams, peer_settings = PeerSettings,
+get_or_create_stream(StreamId, #state{streams = Streams,
+                                       peer_initial_window_size = InitialWindow,
                                        local_settings = LocalSettings} = _State) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
             Stream;
         error ->
-            InitialWindow = h2_settings:get(initial_window_size, PeerSettings),
             RecvWindow = h2_settings:get(initial_window_size, LocalSettings),
             #stream{
                 id = StreamId,
@@ -1714,13 +1722,12 @@ flush_send_buffers(#state{streams = Streams} = State) ->
     end, State, Streams).
 
 flush_stream_buffer(StreamId, #state{streams = Streams, conn_window_size = ConnWindow,
-                                      peer_settings = PeerSettings} = State) ->
+                                      peer_max_frame_size = MaxFrameSize} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, #stream{send_buffer = <<>>}} ->
             State;
         {ok, #stream{send_buffer = Buffer, window_size = StreamWindow,
                      pending_end_stream = PendingEnd, state = StreamState} = Stream} ->
-            MaxFrameSize = h2_settings:get(max_frame_size, PeerSettings),
             Available = min(ConnWindow, StreamWindow),
             ToSend = min(Available, byte_size(Buffer)),
             ToSend1 = min(ToSend, MaxFrameSize),
