@@ -54,7 +54,20 @@
     recv_buffer = [] :: [{binary(), boolean()}],
     %% RFC 7540 §8.3: stream is a CONNECT tunnel — DATA frames carry raw
     %% bytes, END_STREAM is half-close, no trailers, no CL/TE on response.
-    tunnel = false :: boolean()
+    tunnel = false :: boolean(),
+    %% RFC 9113 §8.1.1 body-length tracking:
+    %% expected = parsed Content-Length (undefined if header absent).
+    %% received = cumulative DATA payload size (flow-controlled).
+    %% body_forbidden = HEAD request / 1xx / 204 / 304 response → no DATA allowed.
+    %% Set once on initial HEADERS, used in handle_data_frame/5.
+    expected_body_length :: undefined | non_neg_integer(),
+    received_body_length = 0 :: non_neg_integer(),
+    body_forbidden = false :: boolean(),
+    %% Set once the client's initial (2xx+) response HEADERS has been dispatched.
+    %% Interim 1xx responses do NOT set this; subsequent HEADERS after it are trailers.
+    response_seen_final = false :: boolean(),
+    %% Request method, captured server-side to decide body-forbidden and tunnel rules.
+    request_method :: undefined | binary()
 }).
 
 %% Connection state
@@ -930,33 +943,23 @@ decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_conte
     case h2_hpack:decode(HeaderBlock, DecCtx) of
         {ok, Headers, DecCtx1} ->
             State1 = State#state{decode_context = DecCtx1},
-            %% Determine whether this is an initial HEADERS (request/response)
-            %% or a trailing HEADERS. Only initial HEADERS carry pseudo-headers
-            %% (RFC 7540 §8.1.2.3 / §8.1.2.4). Trailers have their own rules
-            %% (§8.1: MUST have END_STREAM, MUST NOT carry pseudo-headers).
-            IsInitialHeaders = case Mode of
-                server -> true;
-                client ->
-                    case maps:find(StreamId, State1#state.streams) of
-                        {ok, #stream{response_headers = []}} -> true;
-                        error -> true;
-                        _ -> false
-                    end
-            end,
-            %% RFC 7540 §8.3: HEADERS (trailers) are not allowed on a CONNECT
-            %% tunnel — reject as stream PROTOCOL_ERROR.
+            %% Determine role of this HEADERS block:
+            %%   initial  — first HEADERS on the stream (request or response).
+            %%   interim  — 1xx response (client only), more HEADERS to follow.
+            %%   trailers — after initial request body or after final response.
+            Kind = classify_headers(Mode, StreamId, Headers, State1),
             IsTunnel = case maps:find(StreamId, State1#state.streams) of
                 {ok, #stream{tunnel = T}} -> T;
                 _ -> false
             end,
-            Validation = case {IsInitialHeaders, IsTunnel} of
-                {true, _}     -> validate_initial_headers(Mode, Headers);
-                {false, true} -> {error, protocol_error};
-                {false, false} -> validate_trailers(Headers, EndStream)
+            Validation = case {Kind, IsTunnel} of
+                {trailers, true} -> {error, protocol_error};  %% §8.3
+                {trailers, false} -> validate_trailers(Headers, EndStream);
+                {_, _} -> validate_initial_headers(Mode, Headers)
             end,
             case Validation of
                 ok ->
-                    decode_and_process_headers_cont(StreamId, Headers, EndStream, State1);
+                    decode_and_process_headers_cont(Kind, StreamId, Headers, EndStream, State1);
                 {error, ValidErr} ->
                     send_rst_stream(StreamId, ValidErr, State1),
                     State2 = case maps:is_key(StreamId, State1#state.streams) of
@@ -970,68 +973,147 @@ decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_conte
             {error, compression_error, State}
     end.
 
-decode_and_process_headers_cont(StreamId, Headers, EndStream, #state{mode = Mode} = State1) ->
+classify_headers(server, StreamId, _Headers, State) ->
+    case maps:find(StreamId, State#state.streams) of
+        {ok, #stream{request_method = undefined}} -> initial;
+        error -> initial;
+        {ok, _} -> trailers
+    end;
+classify_headers(client, StreamId, Headers, State) ->
+    case maps:find(StreamId, State#state.streams) of
+        {ok, #stream{response_seen_final = true}} -> trailers;
+        {ok, _} ->
+            case parse_status(Headers) of
+                {ok, S} when S >= 100, S =< 199 -> interim;
+                _ -> initial
+            end;
+        error -> initial
+    end.
+
+decode_and_process_headers_cont(Kind, StreamId, Headers, EndStream, #state{mode = Mode} = State1) ->
     Stream = get_or_create_stream(StreamId, State1),
-    case Mode of
-        server ->
-                    %% This is a request
-                    {Method, Path, OtherHeaders} = extract_request_headers(Headers),
-                    IsTunnel = Method =:= <<"CONNECT">>,
-                    %% RFC 7540 §8.3: CONNECT streams stay "open" even when
-                    %% the client never sends END_STREAM with the HEADERS;
-                    %% we still honour END_STREAM-on-headers (uncommon for
-                    %% CONNECT) but mark the stream as a tunnel candidate.
+    case {Mode, Kind} of
+        {server, initial} ->
+            {Method, Path, OtherHeaders} = extract_request_headers(Headers),
+            IsTunnel = Method =:= <<"CONNECT">>,
+            case parse_content_length(Headers) of
+                {error, Err} ->
+                    send_rst_stream(StreamId, Err, State1),
+                    {ok, connected, State1};
+                {ok, ExpectedCL} ->
+                    BodyForbidden = Method =:= <<"HEAD">>,
                     Stream1 = Stream#stream{
                         state = case EndStream of true -> half_closed_remote; false -> open end,
                         request_headers = Headers,
-                        tunnel = IsTunnel
+                        request_method = Method,
+                        tunnel = IsTunnel,
+                        expected_body_length = ExpectedCL,
+                        body_forbidden = BodyForbidden
                     },
+                    %% §8.1: END_STREAM + CL>0 is malformed.
+                    case ExpectedCL =/= undefined andalso EndStream andalso ExpectedCL > 0 of
+                        true ->
+                            send_rst_stream(StreamId, protocol_error, State1),
+                            {ok, connected, State1};
+                        false ->
+                            State2 = put_stream(StreamId, Stream1, State1),
+                            State3 = State2#state{last_peer_stream_id = max(StreamId, State2#state.last_peer_stream_id)},
+                            notify_owner({h2, self(), {request, StreamId, Method, Path, OtherHeaders}}, State3),
+                            {ok, connected, State3}
+                    end
+            end;
+        {server, trailers} ->
+            case EndStream of
+                false ->
+                    send_rst_stream(StreamId, protocol_error, State1),
+                    {ok, connected, State1};
+                true ->
+                    Stream1 = Stream#stream{state = closed},
                     State2 = put_stream(StreamId, Stream1, State1),
-                    State3 = State2#state{last_peer_stream_id = max(StreamId, State2#state.last_peer_stream_id)},
-
-                    notify_owner({h2, self(), {request, StreamId, Method, Path, OtherHeaders}}, State3),
-                    {ok, connected, State3};
-
-                client ->
-                    %% Check if this is a response or trailers
-                    case Stream#stream.response_headers of
-                        [] ->
-                            %% RFC 9113 §8.3.2: :status must be a 3-digit
-                            %% integer in 100..599. A malformed value is a
-                            %% stream-level PROTOCOL_ERROR, not a crash.
-                            case parse_status(Headers) of
-                                {ok, Status} ->
-                                    Stream1 = Stream#stream{
-                                        state = case EndStream of true -> half_closed_remote; false -> open end,
-                                        response_headers = Headers
-                                    },
-                                    State2 = put_stream(StreamId, Stream1, State1),
-                                    OtherHeaders = lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers),
-                                    notify_owner({h2, self(), {response, StreamId, Status, OtherHeaders}}, State2),
-                                    case EndStream of
+                    notify_owner({h2, self(), {trailers, StreamId, Headers}}, State2),
+                    State3 = close_stream(StreamId, State2),
+                    {ok, connected, State3}
+            end;
+        {client, interim} ->
+            %% 1xx informational response: deliver and keep stream open.
+            {ok, Status} = parse_status(Headers),
+            OtherHeaders = lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers),
+            notify_owner({h2, self(), {informational, StreamId, Status, OtherHeaders}}, State1),
+            {ok, connected, State1};
+        {client, initial} ->
+            case parse_status(Headers) of
+                {ok, Status} ->
+                    IsHeadRequest = false,  %% we never send HEAD via high-level API yet
+                    BodyForbidden = IsHeadRequest
+                                    orelse Status =:= 204 orelse Status =:= 304,
+                    case parse_content_length(Headers) of
+                        {error, Err} ->
+                            send_rst_stream(StreamId, Err, State1),
+                            {ok, connected, State1};
+                        {ok, ExpectedCL} ->
+                            Stream1 = Stream#stream{
+                                state = case EndStream of true -> half_closed_remote; false -> open end,
+                                response_headers = Headers,
+                                response_seen_final = true,
+                                expected_body_length = ExpectedCL,
+                                body_forbidden = BodyForbidden
+                            },
+                            State2 = put_stream(StreamId, Stream1, State1),
+                            OtherHeaders = lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers),
+                            notify_owner({h2, self(), {response, StreamId, Status, OtherHeaders}}, State2),
+                            case EndStream of
+                                true ->
+                                    %% §8.1: END_STREAM with CL>0 is malformed.
+                                    case ExpectedCL =/= undefined andalso ExpectedCL > 0 of
                                         true ->
+                                            send_rst_stream(StreamId, protocol_error, State2),
                                             State3 = close_stream(StreamId, State2),
                                             {ok, connected, State3};
                                         false ->
-                                            {ok, connected, State2}
+                                            State3 = close_stream(StreamId, State2),
+                                            {ok, connected, State3}
                                     end;
-                                malformed ->
-                                    send_rst_stream(StreamId, protocol_error, State1),
-                                    State2 = close_stream(StreamId, State1),
+                                false ->
                                     {ok, connected, State2}
-                            end;
-                        _ ->
-                            %% This is trailers (subsequent HEADERS on this stream)
-                            Stream1 = Stream#stream{state = closed},
-                            State2 = put_stream(StreamId, Stream1, State1),
+                            end
+                    end;
+                malformed ->
+                    send_rst_stream(StreamId, protocol_error, State1),
+                    State2 = close_stream(StreamId, State1),
+                    {ok, connected, State2}
+            end;
+        {client, trailers} ->
+            Stream1 = Stream#stream{state = closed},
+            State2 = put_stream(StreamId, Stream1, State1),
+            notify_owner({h2, self(), {trailers, StreamId, Headers}}, State2),
+            State3 = close_stream(StreamId, State2),
+            {ok, connected, State3}
+    end.
 
-                            %% Notify owner with trailers
-                            notify_owner({h2, self(), {trailers, StreamId, Headers}}, State2),
+%% RFC 9113 §8.1.1: Content-Length parser. Multiple headers with the same
+%% value collapse into one; mismatched values are malformed. Non-numeric or
+%% negative values are malformed.
+parse_content_length(Headers) ->
+    Values = [V || {<<"content-length">>, V} <- Headers],
+    case lists:usort(Values) of
+        [] ->
+            {ok, undefined};
+        [Single] ->
+            case parse_nonneg_integer(Single) of
+                {ok, N} -> {ok, N};
+                error -> {error, protocol_error}
+            end;
+        _ ->
+            {error, protocol_error}
+    end.
 
-                            State3 = close_stream(StreamId, State2),
-                            {ok, connected, State3}
-                    end
-            end.
+parse_nonneg_integer(Bin) ->
+    try binary_to_integer(Bin) of
+        N when N >= 0 -> {ok, N};
+        _ -> error
+    catch
+        _:_ -> error
+    end.
 
 %% Validate an initial request/response HEADERS block per RFC 7540 §8.1.2.
 %% Checks: pseudo-header order/set/duplicates, lowercase header names,
@@ -1072,11 +1154,15 @@ check_no_pseudo_in_trailers(Headers) ->
         _ -> {error, protocol_error}
     end.
 
+%% RFC 9113 §8.2: reject uppercase in field names, empty names, and values
+%% containing NUL/LF/CR.
 check_lowercase_names(Headers) ->
-    %% Pseudo-header names already start with ':' and by convention are
-    %% lowercase; we only need to verify the ASCII letters in each name byte.
-    HasUpper = lists:any(fun({Name, _}) -> has_upper(Name) end, Headers),
-    case HasUpper of
+    Bad = lists:any(
+        fun({<<>>, _}) -> true;
+           ({Name, Value}) ->
+               has_upper(Name) orelse has_bad_value_byte(Value)
+        end, Headers),
+    case Bad of
         true -> {error, protocol_error};
         false -> ok
     end.
@@ -1084,6 +1170,12 @@ check_lowercase_names(Headers) ->
 has_upper(<<>>) -> false;
 has_upper(<<C, _/binary>>) when C >= $A, C =< $Z -> true;
 has_upper(<<_, Rest/binary>>) -> has_upper(Rest).
+
+has_bad_value_byte(<<>>) -> false;
+has_bad_value_byte(<<0, _/binary>>) -> true;
+has_bad_value_byte(<<$\n, _/binary>>) -> true;
+has_bad_value_byte(<<$\r, _/binary>>) -> true;
+has_bad_value_byte(<<_, Rest/binary>>) -> has_bad_value_byte(Rest).
 
 %% RFC 7540 §8.1.2.2: reject connection-specific headers; TE only allowed with
 %% the exact value "trailers".
@@ -1249,15 +1341,34 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
             State0 = State#state{recv_conn_window_size = ConnWindow - FlowControlled},
             State0a = maybe_send_conn_window_update(FlowControlled, State0),
             case maps:find(StreamId, Streams) of
-                {ok, #stream{state = StreamState, recv_window_size = StreamWindow} = Stream} when StreamState == open; StreamState == half_closed_local ->
+                {ok, #stream{state = StreamState, recv_window_size = StreamWindow,
+                             body_forbidden = BodyForbidden,
+                             expected_body_length = ExpectedCL,
+                             received_body_length = ReceivedSoFar,
+                             tunnel = IsTunnel} = Stream} when StreamState == open; StreamState == half_closed_local ->
+                    DataSize = byte_size(Data),
+                    %% §8.1.1 body enforcement (not applicable to tunnels).
+                    BodyViolation =
+                        (not IsTunnel) andalso
+                        ((BodyForbidden andalso DataSize > 0)
+                         orelse (ExpectedCL =/= undefined andalso ReceivedSoFar + DataSize > ExpectedCL)
+                         orelse (EndStream andalso ExpectedCL =/= undefined
+                                 andalso ReceivedSoFar + DataSize =/= ExpectedCL)),
                     if
                         FlowControlled > StreamWindow ->
                             send_rst_stream(StreamId, flow_control_error, State0a),
                             State1 = close_stream(StreamId, State0a),
                             {ok, connected, State1};
+                        BodyViolation ->
+                            send_rst_stream(StreamId, protocol_error, State0a),
+                            State1 = close_stream(StreamId, State0a),
+                            {ok, connected, State1};
                         true ->
                             NewStreamWindow = StreamWindow - FlowControlled,
-                            Stream1 = Stream#stream{recv_window_size = NewStreamWindow},
+                            Stream1 = Stream#stream{
+                                recv_window_size = NewStreamWindow,
+                                received_body_length = ReceivedSoFar + DataSize
+                            },
 
                             Stream2 = case EndStream of
                                 true ->
@@ -1889,4 +2000,34 @@ parse_status_test_() ->
      ?_assertEqual(malformed, parse_status([{<<":status">>, <<"600">>}])),
      ?_assertEqual(malformed, parse_status([{<<":status">>, <<>>}])),
      ?_assertEqual(malformed, parse_status([]))].
+
+parse_content_length_test_() ->
+    [?_assertEqual({ok, undefined}, parse_content_length([])),
+     ?_assertEqual({ok, 0},  parse_content_length([{<<"content-length">>, <<"0">>}])),
+     ?_assertEqual({ok, 42}, parse_content_length([{<<"content-length">>, <<"42">>}])),
+     %% Duplicate with same value collapses.
+     ?_assertEqual({ok, 42}, parse_content_length([{<<"content-length">>, <<"42">>},
+                                                    {<<"content-length">>, <<"42">>}])),
+     %% Mismatched duplicates → malformed.
+     ?_assertEqual({error, protocol_error},
+                   parse_content_length([{<<"content-length">>, <<"1">>},
+                                         {<<"content-length">>, <<"2">>}])),
+     %% Non-numeric.
+     ?_assertEqual({error, protocol_error},
+                   parse_content_length([{<<"content-length">>, <<"abc">>}])),
+     %% Negative.
+     ?_assertEqual({error, protocol_error},
+                   parse_content_length([{<<"content-length">>, <<"-1">>}]))].
+
+header_value_validation_test_() ->
+    [?_assertEqual({error, protocol_error},
+                   check_lowercase_names([{<<"x">>, <<"a", 0, "b">>}])),
+     ?_assertEqual({error, protocol_error},
+                   check_lowercase_names([{<<"x">>, <<"a\nb">>}])),
+     ?_assertEqual({error, protocol_error},
+                   check_lowercase_names([{<<"x">>, <<"a\rb">>}])),
+     ?_assertEqual({error, protocol_error},
+                   check_lowercase_names([{<<>>, <<"v">>}])),
+     ?_assertEqual(ok,
+                   check_lowercase_names([{<<"x">>, <<"ok">>}]))].
 -endif.

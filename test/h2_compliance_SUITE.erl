@@ -70,7 +70,8 @@
 
     %% RFC 9113 additional compliance (second-look audit)
     tunnel_outbound_trailers_rejected_test/1,
-    server_push_setting_disabled_test/1
+    server_push_setting_disabled_test/1,
+    header_value_with_nul_rejected_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -151,7 +152,8 @@ groups() ->
         ]},
         {compliance_v2, [sequence], [
             tunnel_outbound_trailers_rejected_test,
-            server_push_setting_disabled_test
+            server_push_setting_disabled_test,
+            header_value_with_nul_rejected_test
         ]}
     ].
 
@@ -1197,6 +1199,28 @@ read_first_settings(Sock) ->
 parse_settings_payload(<<>>) -> [];
 parse_settings_payload(<<Id:16, Value:32, Rest/binary>>) ->
     [{Id, Value} | parse_settings_payload(Rest)].
+
+%% RFC 9113 §8.2: header values containing NUL/LF/CR are malformed.
+%% Server must respond with a stream-level PROTOCOL_ERROR.
+header_value_with_nul_rejected_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, Sid} = h2:request(Conn, [
+        {<<":method">>, <<"GET">>},
+        {<<":path">>, <<"/">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"localhost">>},
+        {<<"x-bad">>, <<"he", 0, "llo">>}
+    ]),
+    receive
+        {h2, Conn, {stream_reset, Sid, protocol_error}} -> ok;
+        {h2, Conn, {stream_reset, Sid, _}} -> ok
+    after 2000 ->
+        ct:fail(no_rst)
+    end,
+    h2:close(Conn),
+    drain_exits(),
+    ok.
 
 %% ============================================================================
 %% Helper Functions
