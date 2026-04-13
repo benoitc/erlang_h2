@@ -128,9 +128,11 @@ wait_connected(Conn, Timeout) ->
 
 %% @doc Activate the socket after ownership transfer.
 %% Must be called after transferring socket ownership to this process.
--spec activate(pid()) -> ok.
+%% Synchronous so the caller knows the preface + SETTINGS have been sent and
+%% the socket has been set to active mode before it proceeds.
+-spec activate(pid()) -> ok | {error, term()}.
 activate(Conn) ->
-    gen_statem:cast(Conn, activate).
+    gen_statem:call(Conn, activate).
 
 %% @doc Send a request (client mode).
 -spec send_request(pid(), binary(), binary(), [{binary(), binary()}]) ->
@@ -303,24 +305,20 @@ preface(info, {timeout, Timer, settings_timeout}, #state{settings_timer = Timer}
     State1 = send_goaway_frame(0, settings_timeout, State),
     {next_state, closing, State1};
 
-preface(cast, activate, #state{mode = Mode, transport = Transport, socket = Socket} = State) ->
-    %% Socket ownership has been transferred, now we can send and receive
+preface({call, From}, activate, #state{mode = Mode, transport = Transport, socket = Socket} = State) ->
+    %% Socket ownership has been transferred, now we can send and receive.
     case set_active(Transport, Socket) of
         ok ->
-            %% Send connection preface/settings
             State1 = case Mode of
-                client ->
-                    %% Client sends preface + SETTINGS
-                    send_preface(State);
-                server ->
-                    %% Server just sends SETTINGS
-                    send_settings_frame(State)
+                client -> send_preface(State);
+                server -> send_settings_frame(State)
             end,
-            %% Start settings timer
             Timer = erlang:start_timer(?SETTINGS_TIMEOUT_MS, self(), settings_timeout),
-            {keep_state, State1#state{settings_timer = Timer}};
+            {keep_state, State1#state{settings_timer = Timer},
+             [{reply, From, ok}]};
         {error, Reason} ->
-            stop_and_notify_waiters({shutdown, {socket_error, Reason}}, State)
+            {stop_and_reply, {shutdown, {socket_error, Reason}},
+             [{reply, From, {error, Reason}}], State}
     end;
 
 preface({call, From}, Request, State) ->
@@ -351,10 +349,9 @@ settings(info, {timeout, Timer, settings_timeout}, #state{settings_timer = Timer
     State1 = send_goaway_frame(0, settings_timeout, State),
     {next_state, closing, State1};
 
-settings(cast, activate, #state{transport = Transport, socket = Socket} = State) ->
-    %% Socket ownership has been transferred, set to active mode
-    ok = set_active(Transport, Socket),
-    {keep_state, State};
+settings({call, From}, activate, State) ->
+    %% Already activated on transition out of preface; idempotent.
+    {keep_state, State, [{reply, From, ok}]};
 
 settings({call, From}, Request, State) ->
     handle_call_early(From, Request, settings, State);
@@ -530,7 +527,6 @@ closing(EventType, Event, State) ->
 %% ============================================================================
 
 handle_data(StateName, Data, #state{buffer = Buffer, mode = Mode, preface_received = PrefaceReceived} = State) ->
-    %% Convert iolist to binary if needed
     DataBin = iolist_to_binary(Data),
     NewBuffer = <<Buffer/binary, DataBin/binary>>,
     State1 = State#state{buffer = NewBuffer},
@@ -1650,9 +1646,8 @@ flush_stream_buffer(StreamId, #state{streams = Streams, conn_window_size = ConnW
 %% ============================================================================
 
 send_preface(#state{socket = Socket, transport = Transport} = State) ->
-    %% Send connection preface
-    ok = Transport:send(Socket, ?H2_PREFACE),
-    %% Send initial SETTINGS
+    %% Send connection preface (tolerate peer-close mid-send)
+    _ = Transport:send(Socket, ?H2_PREFACE),
     send_settings_frame(State).
 
 send_settings_frame(#state{local_settings = Settings, pending_settings = Pending} = State) ->

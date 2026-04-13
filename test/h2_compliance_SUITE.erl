@@ -139,12 +139,9 @@ end_per_group(_GroupName, _Config) ->
 
 init_per_testcase(_TestCase, Config) ->
     process_flag(trap_exit, true),
-    %% Start a test server for each test case
+    drain_exits(),
     CertFile = ?config(cert_file, Config),
     KeyFile = ?config(key_file, Config),
-
-    %% Find an available port
-    Port = find_available_port(),
 
     Handler = fun(Conn, StreamId, Method, Path, Headers) ->
         handle_test_request(Conn, StreamId, Method, Path, Headers)
@@ -156,8 +153,10 @@ init_per_testcase(_TestCase, Config) ->
         handler => Handler
     },
 
-    case h2:start_server(Port, ServerOpts) of
+    %% Let the OS pick a free port (avoids TOCTOU with find_available_port).
+    case h2:start_server(0, ServerOpts) of
         {ok, ServerRef} ->
+            Port = h2:server_port(ServerRef),
             [{server_ref, ServerRef}, {port, Port} | Config];
         {error, Reason} ->
             {skip, {server_start_failed, Reason}}
@@ -795,9 +794,3 @@ create_dummy_certs(CertFile, KeyFile) ->
     file:write_file(KeyFile, DummyKey),
     {CertFile, KeyFile}.
 
-find_available_port() ->
-    %% Open a listener on port 0 to get a random available port
-    {ok, LSock} = gen_tcp:listen(0, []),
-    {ok, Port} = inet:port(LSock),
-    gen_tcp:close(LSock),
-    Port.

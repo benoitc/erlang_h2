@@ -65,7 +65,7 @@
 -export([request/2, request/3, request/4, request/5]).
 
 %% Server API
--export([start_server/2, start_server/3, stop_server/1]).
+-export([start_server/2, start_server/3, stop_server/1, server_port/1]).
 -export([send_response/4]).
 
 %% Common API
@@ -84,7 +84,7 @@
 -type headers() :: [{binary(), binary()}].
 -type status() :: 100..599.
 -type error_code() :: h2_error:error_code().
--type server_ref() :: {pid(), reference()}.
+-type server_ref() :: {pid(), reference(), inet:port_number()}.
 
 -type connect_opts() :: #{
     transport => tcp | ssl,
@@ -191,23 +191,31 @@ start_connection(Mode, Socket, Opts) ->
                 true -> ssl;
                 false -> gen_tcp
             end,
-            case Transport of
+            TransferResult = case Transport of
                 ssl -> ssl:controlling_process(Socket, Pid);
                 gen_tcp -> gen_tcp:controlling_process(Socket, Pid)
             end,
-            %% Activate the socket now that ownership is transferred
-            h2_connection:activate(Pid),
-            %% Wait for connection to complete handshake
-            case h2_connection:wait_connected(Pid, Timeout) of
+            case TransferResult of
                 ok ->
-                    {ok, Pid};
-                {error, Reason} ->
+                    h2_connection:activate(Pid),
+                    case h2_connection:wait_connected(Pid, Timeout) of
+                        ok ->
+                            {ok, Pid};
+                        {error, Reason} ->
+                            catch h2_connection:close(Pid),
+                            {error, Reason}
+                    end;
+                {error, TransferReason} ->
                     catch h2_connection:close(Pid),
-                    {error, Reason}
+                    catch close_socket(Transport, Socket),
+                    {error, {controlling_process_failed, TransferReason}}
             end;
         {error, Reason} ->
             {error, Reason}
     end.
+
+close_socket(ssl, Socket) -> ssl:close(Socket);
+close_socket(gen_tcp, Socket) -> gen_tcp:close(Socket).
 
 is_ssl_socket(Socket) when is_tuple(Socket) ->
     element(1, Socket) =:= sslsocket;
@@ -294,7 +302,14 @@ start_server(Port, Opts) ->
                 {keyfile, KeyFile},
                 {alpn_preferred_protocols, [<<"h2">>]},
                 {versions, ['tlsv1.2', 'tlsv1.3']},
-                {reuseaddr, true}
+                {reuseaddr, true},
+                %% Keep accepted sockets passive until h2_connection
+                %% explicitly calls setopts({active, once}) after the
+                %% ownership transfer. Otherwise data can slip into the
+                %% acceptor's mailbox between ssl:handshake and the
+                %% passive-mode setopts, and be lost on ownership transfer.
+                {active, false},
+                {mode, binary}
             ] ++ case CACerts of
                 [] -> [];
                 _ -> [{cacerts, CACerts}, {verify, verify_peer}]
@@ -303,7 +318,7 @@ start_server(Port, Opts) ->
             %% Start listener
             case ssl:listen(Port, SSLOpts) of
                 {ok, ListenSocket} ->
-                    %% Create server state
+                    {ok, {_, BoundPort}} = ssl:sockname(ListenSocket),
                     Ref = make_ref(),
                     ServerState = #{
                         listen_socket => ListenSocket,
@@ -312,18 +327,16 @@ start_server(Port, Opts) ->
                         ref => Ref
                     },
 
-                    %% Start acceptor processes
                     Self = self(),
                     AcceptorPids = [spawn_link(fun() ->
                         acceptor_loop(Self, ServerState)
                     end) || _ <- lists:seq(1, NumAcceptors)],
 
-                    %% Start server manager process
                     ManagerPid = spawn_link(fun() ->
                         server_manager_loop(ListenSocket, AcceptorPids, Ref)
                     end),
 
-                    {ok, {ManagerPid, Ref}};
+                    {ok, {ManagerPid, Ref, BoundPort}};
                 {error, Reason} ->
                     {error, {listen_failed, Reason}}
             end;
@@ -333,11 +346,19 @@ start_server(Port, Opts) ->
 
 %% @doc Stop an HTTP/2 server.
 -spec stop_server(server_ref()) -> ok.
-stop_server({ManagerPid, Ref}) ->
+stop_server({ManagerPid, Ref, _Port}) ->
     ManagerPid ! {stop, Ref},
     ok.
 
+%% @doc Return the TCP port the server is actually listening on.
+-spec server_port(server_ref()) -> inet:port_number().
+server_port({_, _, Port}) -> Port.
+
 server_manager_loop(ListenSocket, AcceptorPids, Ref) ->
+    process_flag(trap_exit, true),
+    server_manager_loop_inner(ListenSocket, AcceptorPids, Ref).
+
+server_manager_loop_inner(ListenSocket, AcceptorPids, Ref) ->
     receive
         {stop, Ref} ->
             %% Stop all acceptors
@@ -347,12 +368,16 @@ server_manager_loop(ListenSocket, AcceptorPids, Ref) ->
         {'EXIT', Pid, _Reason} ->
             %% Acceptor died, remove from list
             NewPids = lists:delete(Pid, AcceptorPids),
-            server_manager_loop(ListenSocket, NewPids, Ref);
+            server_manager_loop_inner(ListenSocket, NewPids, Ref);
         _ ->
-            server_manager_loop(ListenSocket, AcceptorPids, Ref)
+            server_manager_loop_inner(ListenSocket, AcceptorPids, Ref)
     end.
 
-acceptor_loop(Owner, #{listen_socket := ListenSocket, handler := Handler, settings := Settings} = State) ->
+acceptor_loop(Owner, State) ->
+    process_flag(trap_exit, true),
+    acceptor_loop_inner(Owner, State).
+
+acceptor_loop_inner(Owner, #{listen_socket := ListenSocket, handler := Handler, settings := Settings} = State) ->
     case ssl:transport_accept(ListenSocket, infinity) of
         {ok, Socket} ->
             case ssl:handshake(Socket, 30000) of
@@ -362,23 +387,28 @@ acceptor_loop(Owner, #{listen_socket := ListenSocket, handler := Handler, settin
                         {ok, <<"h2">>} ->
                             %% Ensure socket is in passive mode before transfer
                             ssl:setopts(SSLSocket, [{active, false}]),
-                            %% Start connection handler
-                            %% First spawn the process, then transfer socket ownership to it
                             Pid = spawn_link(fun() ->
                                 receive
                                     {socket_ready, Sock} ->
-                                        handle_server_connection(Sock, Handler, Settings)
+                                        handle_server_connection(Sock, Handler, Settings);
+                                    {socket_transfer_failed, _} ->
+                                        ok
                                 end
                             end),
-                            ssl:controlling_process(SSLSocket, Pid),
-                            Pid ! {socket_ready, SSLSocket};
+                            case ssl:controlling_process(SSLSocket, Pid) of
+                                ok ->
+                                    Pid ! {socket_ready, SSLSocket};
+                                {error, TransferReason} ->
+                                    Pid ! {socket_transfer_failed, TransferReason},
+                                    ssl:close(SSLSocket)
+                            end;
                         _ ->
                             ssl:close(SSLSocket)
                     end;
                 {error, _} ->
                     ok
             end,
-            acceptor_loop(Owner, State);
+            acceptor_loop_inner(Owner, State);
         {error, closed} ->
             ok;
         {error, _Reason} ->
@@ -389,11 +419,16 @@ handle_server_connection(Socket, Handler, Settings) ->
     ConnOpts = #{settings => Settings},
     case h2_connection:start_link(server, Socket, self(), ConnOpts) of
         {ok, Conn} ->
-            ssl:controlling_process(Socket, Conn),
-            h2_connection:activate(Conn),
-            server_connection_loop(Conn, Handler);
+            case ssl:controlling_process(Socket, Conn) of
+                ok ->
+                    h2_connection:activate(Conn),
+                    server_connection_loop(Conn, Handler);
+                {error, _} ->
+                    catch h2_connection:close(Conn),
+                    catch ssl:close(Socket)
+            end;
         {error, _Reason} ->
-            ssl:close(Socket)
+            catch ssl:close(Socket)
     end.
 
 server_connection_loop(Conn, Handler) ->
