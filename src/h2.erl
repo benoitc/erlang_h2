@@ -461,7 +461,7 @@ server_connection_loop(Conn, Handler) ->
             server_connection_loop(Conn, Handler);
         {h2, Conn, {closed, _Reason}} ->
             ok;
-        {h2, Conn, {goaway, _LastStreamId}} ->
+        {h2, Conn, {goaway, _LastStreamId, _ErrorCode}} ->
             ok;
         _ ->
             server_connection_loop(Conn, Handler)

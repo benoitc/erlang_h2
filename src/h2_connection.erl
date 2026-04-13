@@ -712,8 +712,9 @@ handle_frame(_StateName, {ping_ack, _Data}, State) ->
     %% PING response received
     {ok, connected, State};
 
-handle_frame(StateName, {goaway, LastStreamId, _ErrorCode, _DebugData}, State) ->
-    notify_owner({h2, self(), {goaway, LastStreamId}}, State),
+handle_frame(StateName, {goaway, LastStreamId, ErrorCodeInt, _DebugData}, State) ->
+    ErrorCode = h2_error:name(ErrorCodeInt),
+    notify_owner({h2, self(), {goaway, LastStreamId, ErrorCode}}, State),
     State1 = State#state{goaway_received = true, last_stream_id = LastStreamId},
     case StateName of
         goaway_sent -> {stop, {shutdown, goaway_exchange}, State1};
@@ -1154,22 +1155,43 @@ check_no_pseudo_in_trailers(Headers) ->
         _ -> {error, protocol_error}
     end.
 
-%% RFC 9113 §8.2: reject uppercase in field names, empty names, and values
-%% containing NUL/LF/CR.
+%% RFC 9113 §8.2: field names are lowercase RFC 7230 tchar (pseudo-headers
+%% start with ':'); values must not contain NUL/CR/LF nor have leading or
+%% trailing SP/HTAB.
 check_lowercase_names(Headers) ->
-    Bad = lists:any(
-        fun({<<>>, _}) -> true;
-           ({Name, Value}) ->
-               has_upper(Name) orelse has_bad_value_byte(Value)
-        end, Headers),
+    Bad = lists:any(fun bad_field/1, Headers),
     case Bad of
         true -> {error, protocol_error};
         false -> ok
     end.
 
-has_upper(<<>>) -> false;
-has_upper(<<C, _/binary>>) when C >= $A, C =< $Z -> true;
-has_upper(<<_, Rest/binary>>) -> has_upper(Rest).
+bad_field({<<>>, _}) -> true;
+bad_field({<<$:, Rest/binary>>, Value}) ->
+    %% Pseudo-header: rest must be lowercase tchar too.
+    not valid_name_bytes(Rest) orelse bad_value(Value);
+bad_field({Name, Value}) ->
+    not valid_name_bytes(Name) orelse bad_value(Value).
+
+%% Allowed bytes in a header field name: lowercase ALPHA, DIGIT, and
+%%   !#$%&'*+-.^_`|~
+valid_name_bytes(<<>>) -> true;
+valid_name_bytes(<<C, Rest/binary>>) ->
+    Ok = (C >= $a andalso C =< $z)
+         orelse (C >= $0 andalso C =< $9)
+         orelse lists:member(C, "!#$%&'*+-.^_`|~"),
+    Ok andalso valid_name_bytes(Rest).
+
+%% A value is bad if empty-after-trimming is fine, but leading/trailing SP/HTAB
+%% or any NUL/CR/LF byte is forbidden.
+bad_value(<<>>) -> false;
+bad_value(<<C, _/binary>>) when C =:= $\s; C =:= $\t -> true;
+bad_value(Bin) ->
+    Last = binary:last(Bin),
+    case Last of
+        $\s -> true;
+        $\t -> true;
+        _ -> has_bad_value_byte(Bin)
+    end.
 
 has_bad_value_byte(<<>>) -> false;
 has_bad_value_byte(<<0, _/binary>>) -> true;
