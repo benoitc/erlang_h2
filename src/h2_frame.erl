@@ -241,14 +241,14 @@ flags(Flags) ->
 
 %% @doc Decode binary to frame.
 %% Returns {ok, Frame, Rest} | {more, N} | {error, Reason}
--spec decode(binary()) -> {ok, frame_data(), binary()} | {more, non_neg_integer()} | {error, term()}.
+-spec decode(binary()) -> {ok, frame_data(), binary()} | {more, non_neg_integer()} | {error, term()} | {error, {stream_error, non_neg_integer(), atom()}, binary()}.
 decode(Bin) ->
     decode(Bin, infinity).
 
 %% @doc Decode binary to frame, rejecting frames larger than MaxFrameSize
 %% with frame_size_error (RFC 7540 §4.2).
 -spec decode(binary(), pos_integer() | infinity) ->
-    {ok, frame_data(), binary()} | {more, non_neg_integer()} | {error, term()}.
+    {ok, frame_data(), binary()} | {more, non_neg_integer()} | {error, term()} | {error, {stream_error, non_neg_integer(), atom()}, binary()}.
 decode(Bin, _MaxFrameSize) when byte_size(Bin) < ?FRAME_HEADER_SIZE ->
     {more, ?FRAME_HEADER_SIZE - byte_size(Bin)};
 decode(<<Length:24, _Type:8, _Flags:8, _:1, _StreamId:31, _/binary>>, MaxFrameSize)
@@ -260,6 +260,8 @@ decode(<<Length:24, _Type:8, _Flags:8, _:1, _StreamId:31, Rest/binary>> = Bin, _
 decode(<<Length:24, Type:8, Flags:8, _:1, StreamId:31, Payload:Length/binary, Rest/binary>>, _MaxFrameSize) ->
     case decode_frame(Type, Flags, StreamId, Payload) of
         {ok, Frame} -> {ok, Frame, Rest};
+        %% Stream-scoped errors carry Rest so the caller can keep decoding.
+        {error, {stream_error, _, _} = SE} -> {error, SE, Rest};
         {error, _} = Err -> Err
     end.
 
@@ -365,8 +367,11 @@ decode_frame(?GOAWAY, _Flags, _StreamId, _Payload) ->
 
 decode_frame(?WINDOW_UPDATE, _Flags, StreamId, <<_:1, Increment:31>>) when Increment > 0 ->
     {ok, {window_update, StreamId, Increment}};
-decode_frame(?WINDOW_UPDATE, _Flags, _StreamId, <<_:1, 0:31>>) ->
-    {error, protocol_error}; %% Zero increment is an error
+decode_frame(?WINDOW_UPDATE, _Flags, 0, <<_:1, 0:31>>) ->
+    {error, protocol_error}; %% Connection-level: GOAWAY
+decode_frame(?WINDOW_UPDATE, _Flags, StreamId, <<_:1, 0:31>>) ->
+    %% RFC 9113 §6.9.1: zero increment on a non-zero stream is a STREAM error.
+    {error, {stream_error, StreamId, protocol_error}};
 decode_frame(?WINDOW_UPDATE, _Flags, _StreamId, _Payload) ->
     {error, frame_size_error};
 
@@ -503,6 +508,18 @@ window_update_test() ->
     Bin = encode(Frame),
     {ok, Decoded, <<>>} = decode(Bin),
     ?assertEqual({window_update, 1, 1000}, Decoded).
+
+%% RFC 9113 §6.9.1: WINDOW_UPDATE with increment 0 is a stream error on a
+%% non-zero stream, a connection error on stream 0.
+window_update_zero_stream_level_test() ->
+    %% Stream id 5, increment 0
+    Bin = <<4:24, ?WINDOW_UPDATE:8, 0:8, 0:1, 5:31, 0:1, 0:31>>,
+    ?assertMatch({error, {stream_error, 5, protocol_error}, <<>>}, decode(Bin)).
+
+window_update_zero_connection_level_test() ->
+    %% Stream id 0, increment 0
+    Bin = <<4:24, ?WINDOW_UPDATE:8, 0:8, 0:1, 0:31, 0:1, 0:31>>,
+    ?assertEqual({error, protocol_error}, decode(Bin)).
 
 continuation_test() ->
     Frame = continuation(1, <<"more_headers">>, true),

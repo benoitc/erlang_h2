@@ -108,7 +108,11 @@
     %% END_HEADERS arrives, the only frame we may accept until
     %% END_HEADERS is a matching CONTINUATION on the same stream.
     %% {StreamId, EndStream} while awaiting; undefined otherwise.
-    expecting_continuation :: {non_neg_integer(), boolean()} | undefined
+    expecting_continuation :: {non_neg_integer(), boolean()} | undefined,
+
+    %% Scheme to advertise on outbound :scheme pseudo-header.
+    %% Derived from transport at init: ssl -> https, gen_tcp -> http.
+    scheme = <<"https">> :: binary()
 }).
 
 %% ============================================================================
@@ -258,9 +262,18 @@ init({Mode, Socket, Owner, Opts}) ->
         false -> gen_tcp
     end,
 
-    %% Initialize settings
-    LocalSettings = maps:merge(h2_settings:default(), maps:get(settings, Opts, #{})),
+    %% Initialize settings.
+    %% RFC 9113 §6.5.2: a server MUST NOT advertise SETTINGS_ENABLE_PUSH=1.
+    %% We don't implement push as either client or server, so always 0.
+    UserSettings = maps:get(settings, Opts, #{}),
+    LocalSettings = (maps:merge(h2_settings:default(), UserSettings))#{enable_push => 0},
     PeerSettings = h2_settings:default(),
+
+    %% Scheme depends on transport: TCP → http, TLS → https.
+    Scheme = case Transport of
+        ssl     -> <<"https">>;
+        gen_tcp -> <<"http">>
+    end,
 
     %% Initialize HPACK contexts
     EncodeCtx = h2_hpack:new_context(h2_settings:get(header_table_size, PeerSettings)),
@@ -284,7 +297,8 @@ init({Mode, Socket, Owner, Opts}) ->
         decode_context = DecodeCtx,
         next_stream_id = case Mode of client -> 1; server -> 2 end,
         conn_window_size = InitialWindow,
-        recv_conn_window_size = RecvWindow
+        recv_conn_window_size = RecvWindow,
+        scheme = Scheme
     },
 
     %% Note: Socket is NOT set to active here - it will be activated
@@ -614,6 +628,12 @@ process_frames(StateName, #state{buffer = Buffer, local_settings = Local} = Stat
             ok = set_active(State#state.transport, State#state.socket),
             %% Determine the correct state based on connection conditions
             determine_state_transition(State);
+        {error, {stream_error, StreamId, ErrorCode}, Rest} ->
+            %% Frame-level decode error scoped to a single stream
+            %% (e.g. WINDOW_UPDATE 0 on a non-zero stream id).
+            send_rst_stream(StreamId, ErrorCode, State),
+            State1 = close_stream(StreamId, State),
+            process_frames(StateName, State1#state{buffer = Rest});
         {error, Reason} ->
             State1 = send_goaway_frame(State#state.last_peer_stream_id, Reason, State),
             {next_state, closing, State1}
@@ -976,23 +996,28 @@ decode_and_process_headers_cont(StreamId, Headers, EndStream, #state{mode = Mode
                     %% Check if this is a response or trailers
                     case Stream#stream.response_headers of
                         [] ->
-                            %% This is a response (first HEADERS on this stream)
-                            Stream1 = Stream#stream{
-                                state = case EndStream of true -> half_closed_remote; false -> open end,
-                                response_headers = Headers
-                            },
-                            State2 = put_stream(StreamId, Stream1, State1),
-
-                            %% Notify owner
-                            Status = extract_status(Headers),
-                            OtherHeaders = lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers),
-                            notify_owner({h2, self(), {response, StreamId, Status, OtherHeaders}}, State2),
-
-                            case EndStream of
-                                true ->
-                                    State3 = close_stream(StreamId, State2),
-                                    {ok, connected, State3};
-                                false ->
+                            %% RFC 9113 §8.3.2: :status must be a 3-digit
+                            %% integer in 100..599. A malformed value is a
+                            %% stream-level PROTOCOL_ERROR, not a crash.
+                            case parse_status(Headers) of
+                                {ok, Status} ->
+                                    Stream1 = Stream#stream{
+                                        state = case EndStream of true -> half_closed_remote; false -> open end,
+                                        response_headers = Headers
+                                    },
+                                    State2 = put_stream(StreamId, Stream1, State1),
+                                    OtherHeaders = lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers),
+                                    notify_owner({h2, self(), {response, StreamId, Status, OtherHeaders}}, State2),
+                                    case EndStream of
+                                        true ->
+                                            State3 = close_stream(StreamId, State2),
+                                            {ok, connected, State3};
+                                        false ->
+                                            {ok, connected, State2}
+                                    end;
+                                malformed ->
+                                    send_rst_stream(StreamId, protocol_error, State1),
+                                    State2 = close_stream(StreamId, State1),
                                     {ok, connected, State2}
                             end;
                         _ ->
@@ -1191,10 +1216,15 @@ extract_request_headers(Headers) ->
     OtherHeaders = lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers),
     {Method, Path, OtherHeaders}.
 
-extract_status(Headers) ->
+%% RFC 9113 §8.3.2: :status MUST be present on a response HEADERS, exactly
+%% three ASCII digits in the range 100..599. Anything else is a malformed
+%% response and must trigger a stream PROTOCOL_ERROR.
+parse_status(Headers) ->
     case proplists:get_value(<<":status">>, Headers) of
-        undefined -> 200;
-        StatusBin -> binary_to_integer(StatusBin)
+        <<D1, D2, D3>> when D1 >= $1, D1 =< $5, D2 >= $0, D2 =< $9, D3 >= $0, D3 =< $9 ->
+            {ok, (D1 - $0) * 100 + (D2 - $0) * 10 + (D3 - $0)};
+        _ ->
+            malformed
     end.
 
 is_pseudo_header(<<$:, _/binary>>) -> true;
@@ -1319,6 +1349,7 @@ maybe_send_window_update(StreamId, _DataSize, #state{recv_conn_window_size = Con
 handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client, next_stream_id = StreamId,
                                                         peer_max_concurrent_streams = MaxStreams,
                                                         peer_initial_window_size = InitialWindow,
+                                                        scheme = Scheme,
                                                         encode_context = EncCtx} = State) ->
     ActiveStreams = count_active_streams(State),
 
@@ -1337,7 +1368,7 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
                 false ->
                     [{<<":method">>, Method},
                      {<<":path">>, Path},
-                     {<<":scheme">>, <<"https">>},
+                     {<<":scheme">>, Scheme},
                      {<<":authority">>, Authority}
                      | lists:filter(fun({N1, _}) -> N1 =/= <<"host">> end, Headers)]
             end,
@@ -1516,6 +1547,9 @@ handle_send_data(From, StreamId, Data, EndStream, #state{streams = Streams, conn
 
 handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams, encode_context = EncCtx} = State) ->
     case maps:find(StreamId, Streams) of
+        {ok, #stream{tunnel = true}} ->
+            %% RFC 7540 §8.3: trailers are forbidden on a CONNECT tunnel.
+            {keep_state, State, [{reply, From, {error, tunnel_no_trailers}}]};
         {ok, #stream{state = StreamState} = Stream} when StreamState == open; StreamState == half_closed_remote ->
             %% Encode trailers
             {HeaderBlock, EncCtx1} = h2_hpack:encode(Trailers, EncCtx),
@@ -1846,5 +1880,14 @@ notify_owner(Msg, #state{owner = Owner}) ->
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
-%% Basic unit tests will be in the test suite
+parse_status_test_() ->
+    [?_assertEqual({ok, 200}, parse_status([{<<":status">>, <<"200">>}])),
+     ?_assertEqual({ok, 100}, parse_status([{<<":status">>, <<"100">>}])),
+     ?_assertEqual({ok, 599}, parse_status([{<<":status">>, <<"599">>}])),
+     ?_assertEqual(malformed, parse_status([{<<":status">>, <<"abc">>}])),
+     ?_assertEqual(malformed, parse_status([{<<":status">>, <<"2000">>}])),
+     ?_assertEqual(malformed, parse_status([{<<":status">>, <<"99">>}])),
+     ?_assertEqual(malformed, parse_status([{<<":status">>, <<"600">>}])),
+     ?_assertEqual(malformed, parse_status([{<<":status">>, <<>>}])),
+     ?_assertEqual(malformed, parse_status([]))].
 -endif.

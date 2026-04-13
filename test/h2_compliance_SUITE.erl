@@ -66,7 +66,11 @@
     connect_tunnel_basic_test/1,
     connect_tunnel_half_close_test/1,
     connect_response_4xx_test/1,
-    connect_trailers_rejected_test/1
+    connect_trailers_rejected_test/1,
+
+    %% RFC 9113 additional compliance (second-look audit)
+    tunnel_outbound_trailers_rejected_test/1,
+    server_push_setting_disabled_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -89,7 +93,8 @@ all() ->
         {group, error_handling},
         {group, misc},
         {group, api_parity},
-        {group, tunnel}
+        {group, tunnel},
+        {group, compliance_v2}
     ].
 
 groups() ->
@@ -143,6 +148,10 @@ groups() ->
             connect_tunnel_half_close_test,
             connect_response_4xx_test,
             connect_trailers_rejected_test
+        ]},
+        {compliance_v2, [sequence], [
+            tunnel_outbound_trailers_rejected_test,
+            server_push_setting_disabled_test
         ]}
     ].
 
@@ -1107,6 +1116,87 @@ connect_trailers_rejected_test(Config) ->
     h2:stop_server(Ref),
     drain_exits(),
     ok.
+
+%% ============================================================================
+%% Compliance v2 (second-look audit)
+%% ============================================================================
+
+tunnel_outbound_trailers_rejected_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    Self = self(),
+    Handler = fun(Conn, Sid, <<"CONNECT">>, _, _) ->
+        h2:send_response(Conn, Sid, 200, []),
+        Result = h2:send_trailers(Conn, Sid, [{<<"x">>, <<"y">>}]),
+        Self ! {trailer_result, Result},
+        receive after 500 -> ok end
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => Handler
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, Sid} = h2:request(Conn, <<"CONNECT">>, <<>>,
+                           [{<<"host">>, <<"t:1">>}]),
+    receive {h2, Conn, {response, Sid, 200, _}} -> ok
+    after 2000 -> ct:fail(no_connect_response) end,
+    receive
+        {trailer_result, {error, tunnel_no_trailers}} -> ok
+    after 2000 ->
+        ct:fail(trailers_not_rejected)
+    end,
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% RFC 9113 §6.5.2: a server MUST NOT send SETTINGS_ENABLE_PUSH=1. Open a
+%% raw TLS socket, read the server's initial SETTINGS frame, and check the
+%% ENABLE_PUSH parameter value.
+server_push_setting_disabled_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = ssl:connect("localhost", Port,
+                             [{active, false}, {mode, binary},
+                              {alpn_advertised_protocols, [<<"h2">>]},
+                              {verify, verify_none}], 5000),
+    ok = ssl:send(Sock, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>),
+    %% Server sends its SETTINGS right after our preface arrives.
+    SettingsPayload = read_first_settings(Sock),
+    Pairs = parse_settings_payload(SettingsPayload),
+    %% SETTINGS_ENABLE_PUSH = 0x2
+    case proplists:get_value(16#2, Pairs) of
+        undefined ->
+            ok;  %% Not advertised → default 1 per spec; reject.
+        Value ->
+            ?assertEqual(0, Value)
+    end,
+    ssl:close(Sock),
+    ok.
+
+read_first_settings(Sock) ->
+    %% Read frames until we see a non-ACK SETTINGS from the server.
+    {ok, <<Len:24, Type:8, Flags:8, _:32>>} = ssl:recv(Sock, 9, 2000),
+    case {Type, Flags band 16#1} of
+        {16#4, 0} ->
+            case Len of
+                0 -> <<>>;
+                _ -> {ok, Payload} = ssl:recv(Sock, Len, 2000), Payload
+            end;
+        _ ->
+            _ = case Len of
+                0 -> <<>>;
+                _ -> {ok, _} = ssl:recv(Sock, Len, 2000), <<>>
+            end,
+            read_first_settings(Sock)
+    end.
+
+parse_settings_payload(<<>>) -> [];
+parse_settings_payload(<<Id:16, Value:32, Rest/binary>>) ->
+    [{Id, Value} | parse_settings_payload(Rest)].
 
 %% ============================================================================
 %% Helper Functions
