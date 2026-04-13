@@ -74,7 +74,9 @@ prop_frame_data_roundtrip() ->
             Frame = h2_frame:data(StreamId, Data, EndStream),
             Encoded = h2_frame:encode(Frame),
             {ok, Decoded, <<>>} = h2_frame:decode(Encoded),
-            {data, StreamId, Data, EndStream} =:= Decoded
+            %% Decoder now reports padded payload size; unpadded DATA has
+            %% FlowControlled = byte_size(Data).
+            Decoded =:= {data, StreamId, Data, EndStream, byte_size(Data)}
         end).
 
 %% @doc Property: Settings encoding roundtrips
@@ -247,7 +249,9 @@ frames_equal(Frame1, Frame2) when is_tuple(Frame1), is_tuple(Frame2) ->
     normalize_frame(Frame1) =:= normalize_frame(Frame2).
 
 normalize_frame({data, StreamId, Data, EndStream}) ->
-    {data, StreamId, Data, EndStream};
+    {data, StreamId, Data, EndStream, byte_size(Data)};
+normalize_frame({data, StreamId, Data, EndStream, FlowControlled}) ->
+    {data, StreamId, Data, EndStream, FlowControlled};
 normalize_frame({headers, StreamId, HeaderBlock, EndStream, EndHeaders}) ->
     {headers, StreamId, HeaderBlock, EndStream, EndHeaders};
 normalize_frame({headers, StreamId, HeaderBlock, EndStream, EndHeaders, Priority}) ->

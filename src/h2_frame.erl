@@ -40,6 +40,11 @@
 
 -type frame_data() ::
     {data, StreamId :: non_neg_integer(), Data :: binary(), EndStream :: boolean()} |
+    %% Internal-only variant produced by decode/1,2 when padding is present so
+    %% the connection layer can charge the full padded payload against flow
+    %% control (RFC 9113 §6.1). The constructor data/3 never emits this.
+    {data, StreamId :: non_neg_integer(), Data :: binary(), EndStream :: boolean(),
+     FlowControlled :: non_neg_integer()} |
     {headers, StreamId :: non_neg_integer(), HeaderBlock :: binary(), EndStream :: boolean(), EndHeaders :: boolean()} |
     {headers, StreamId :: non_neg_integer(), HeaderBlock :: binary(), EndStream :: boolean(), EndHeaders :: boolean(),
      Priority :: {Exclusive :: boolean(), DependsOn :: non_neg_integer(), Weight :: 1..256}} |
@@ -278,7 +283,8 @@ decode_frame(?DATA, Flags, StreamId, Payload) ->
     EndStream = (Flags band ?FLAG_END_STREAM) =/= 0,
     Padded = (Flags band ?FLAG_PADDED) =/= 0,
     case strip_padding(Padded, Payload) of
-        {ok, Data} -> {ok, {data, StreamId, Data, EndStream}};
+        %% FlowControlled = the full payload size on the wire (incl. pad).
+        {ok, Data} -> {ok, {data, StreamId, Data, EndStream, byte_size(Payload)}};
         {error, _} = Err -> Err
     end;
 
@@ -433,13 +439,22 @@ data_test() ->
     Frame = data(1, <<"hello">>, true),
     Bin = encode(Frame),
     {ok, Decoded, <<>>} = decode(Bin),
-    ?assertEqual({data, 1, <<"hello">>, true}, Decoded).
+    ?assertEqual({data, 1, <<"hello">>, true, 5}, Decoded).
 
 data_no_end_stream_test() ->
     Frame = data(1, <<"hello">>, false),
     Bin = encode(Frame),
     {ok, Decoded, <<>>} = decode(Bin),
-    ?assertEqual({data, 1, <<"hello">>, false}, Decoded).
+    ?assertEqual({data, 1, <<"hello">>, false, 5}, Decoded).
+
+%% RFC 9113 §6.1: padding must be counted against receive flow control.
+%% Verify decoder reports the full padded payload as FlowControlled.
+data_padded_flow_controlled_test() ->
+    Frame = data(1, <<"hi">>, false, <<1,2,3>>),
+    Bin = encode(Frame),
+    {ok, Decoded, <<>>} = decode(Bin),
+    %% Data = <<"hi">> (2 bytes), Payload = 1 (padlen byte) + 2 (data) + 3 (pad) = 6.
+    ?assertEqual({data, 1, <<"hi">>, false, 6}, Decoded).
 
 headers_test() ->
     Frame = headers(1, <<"header_block">>, true),
@@ -544,9 +559,9 @@ multiple_frames_test() ->
     Frame2 = encode(data(1, <<"world">>, true)),
     Combined = <<Frame1/binary, Frame2/binary>>,
     {ok, D1, Rest} = decode(Combined),
-    ?assertEqual({data, 1, <<"hello">>, false}, D1),
+    ?assertEqual({data, 1, <<"hello">>, false, 5}, D1),
     {ok, D2, <<>>} = decode(Rest),
-    ?assertEqual({data, 1, <<"world">>, true}, D2).
+    ?assertEqual({data, 1, <<"world">>, true, 5}, D2).
 
 %% ---- Spec-compliance: frame validation ----
 
@@ -599,7 +614,7 @@ padding_equal_payload_accepted_test() ->
     %% This is legal per RFC 7540 §6.1 since pad value (5) < payload length (6).
     Frame = data(1, <<>>, true, <<1,2,3,4,5>>),
     Bin = encode(Frame),
-    {ok, {data, 1, <<>>, true}, <<>>} = decode(Bin).
+    {ok, {data, 1, <<>>, true, 6}, <<>>} = decode(Bin).
 
 padding_over_payload_rejected_test() ->
     %% Manually craft a DATA frame where PadLength claims more bytes than follow.

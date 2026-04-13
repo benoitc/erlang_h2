@@ -748,8 +748,8 @@ handle_frame(_StateName, {headers, StreamId, HeaderBlock, EndStream, EndHeaders,
 handle_frame(_StateName, {continuation, StreamId, HeaderBlock, EndHeaders}, State) ->
     handle_continuation(StreamId, HeaderBlock, EndHeaders, State);
 
-handle_frame(_StateName, {data, StreamId, Data, EndStream}, State) ->
-    handle_data_frame(StreamId, Data, EndStream, State);
+handle_frame(_StateName, {data, StreamId, Data, EndStream, FlowControlled}, State) ->
+    handle_data_frame(StreamId, Data, EndStream, FlowControlled, State);
 
 handle_frame(_StateName, {rst_stream, StreamId, ErrorCode},
              #state{streams = Streams} = State) ->
@@ -1234,28 +1234,31 @@ is_pseudo_header(_) -> false.
 %% Internal: Data Frame Handling
 %% ============================================================================
 
-handle_data_frame(StreamId, Data, EndStream, #state{streams = Streams, recv_conn_window_size = ConnWindow} = State) ->
-    DataSize = byte_size(Data),
-
-    %% Check connection flow control
+%% RFC 9113 §6.1: the receiver MUST count the full DATA payload (including
+%% the pad length byte and any padding) against the connection-level flow
+%% control window — *regardless* of stream state. Failing to consume post-
+%% reset DATA desynchronizes the peer's accounting and lets it overshoot the
+%% advertised receive window.
+handle_data_frame(StreamId, Data, EndStream, FlowControlled,
+                  #state{streams = Streams, recv_conn_window_size = ConnWindow} = State) ->
     if
-        DataSize > ConnWindow ->
+        FlowControlled > ConnWindow ->
+            %% Peer violated our advertised connection window.
             {error, flow_control_error, State};
         true ->
+            State0 = State#state{recv_conn_window_size = ConnWindow - FlowControlled},
+            State0a = maybe_send_conn_window_update(FlowControlled, State0),
             case maps:find(StreamId, Streams) of
                 {ok, #stream{state = StreamState, recv_window_size = StreamWindow} = Stream} when StreamState == open; StreamState == half_closed_local ->
                     if
-                        DataSize > StreamWindow ->
-                            send_rst_stream(StreamId, flow_control_error, State),
-                            State1 = close_stream(StreamId, State),
+                        FlowControlled > StreamWindow ->
+                            send_rst_stream(StreamId, flow_control_error, State0a),
+                            State1 = close_stream(StreamId, State0a),
                             {ok, connected, State1};
                         true ->
-                            %% Update windows
-                            NewConnWindow = ConnWindow - DataSize,
-                            NewStreamWindow = StreamWindow - DataSize,
+                            NewStreamWindow = StreamWindow - FlowControlled,
                             Stream1 = Stream#stream{recv_window_size = NewStreamWindow},
 
-                            %% Update stream state if end of stream
                             Stream2 = case EndStream of
                                 true ->
                                     case StreamState of
@@ -1266,38 +1269,31 @@ handle_data_frame(StreamId, Data, EndStream, #state{streams = Streams, recv_conn
                                     Stream1
                             end,
 
-                            {Stream3, State0} = dispatch_data(StreamId, Stream2, Data, EndStream, State),
-                            State1 = State0#state{
-                                recv_conn_window_size = NewConnWindow,
-                                streams = maps:put(StreamId, Stream3, Streams)
+                            {Stream3, State1} = dispatch_data(StreamId, Stream2, Data, EndStream, State0a),
+                            State2 = State1#state{
+                                streams = maps:put(StreamId, Stream3, State1#state.streams)
                             },
 
-                            %% Send WINDOW_UPDATE if needed
-                            State2 = maybe_send_window_update(StreamId, DataSize, State1),
+                            State3 = maybe_send_window_update(StreamId, FlowControlled, State2),
 
                             case EndStream andalso Stream2#stream.state == closed of
                                 true ->
-                                    State3 = close_stream(StreamId, State2),
-                                    {ok, connected, State3};
+                                    State4 = close_stream(StreamId, State3),
+                                    {ok, connected, State4};
                                 false ->
-                                    {ok, connected, State2}
+                                    {ok, connected, State3}
                             end
                     end;
                 {ok, _} ->
-                    send_rst_stream(StreamId, stream_closed, State),
-                    {ok, connected, State};
+                    send_rst_stream(StreamId, stream_closed, State0a),
+                    {ok, connected, State0a};
                 error ->
-                    %% Unknown stream. If the id falls within the range of
-                    %% peer-initiated streams we've already seen, it was
-                    %% closed/reset — reply STREAM_CLOSED (RFC 7540 §5.1).
-                    %% Otherwise this is an invalid stream id → connection
-                    %% PROTOCOL_ERROR.
-                    case in_closed_stream_range(StreamId, State) of
+                    case in_closed_stream_range(StreamId, State0a) of
                         true ->
-                            send_rst_stream(StreamId, stream_closed, State),
-                            {ok, connected, State};
+                            send_rst_stream(StreamId, stream_closed, State0a),
+                            {ok, connected, State0a};
                         false ->
-                            {error, protocol_error, State}
+                            {error, protocol_error, State0a}
                     end
             end
     end.
@@ -1315,31 +1311,34 @@ in_closed_stream_range(StreamId, #state{mode = Mode, last_peer_stream_id = LastP
             orelse (StreamId rem 2 =:= 0 andalso StreamId < NextLocal)
     end.
 
-maybe_send_window_update(StreamId, _DataSize, #state{recv_conn_window_size = ConnWindow,
-                                                     local_settings = Settings,
-                                                     streams = Streams} = State) ->
+%% Connection-level WINDOW_UPDATE refill. Called for every DATA frame,
+%% including those on closed/unknown streams — per RFC 9113 §5.1 the
+%% connection window is consumed regardless of stream state.
+maybe_send_conn_window_update(_DataSize, #state{recv_conn_window_size = ConnWindow,
+                                                 local_settings = Settings} = State) ->
     InitialWindow = h2_settings:get(initial_window_size, Settings),
     Threshold = InitialWindow div 2,
-
-    %% Connection-level window update
-    State1 = case ConnWindow < Threshold of
+    case ConnWindow < Threshold of
         true ->
             ConnIncrement = InitialWindow - ConnWindow,
             send_frame(h2_frame:window_update(0, ConnIncrement), State),
             State#state{recv_conn_window_size = ConnWindow + ConnIncrement};
         false ->
             State
-    end,
+    end.
 
-    %% Stream-level window update
+maybe_send_window_update(StreamId, _DataSize, #state{local_settings = Settings,
+                                                     streams = Streams} = State) ->
+    InitialWindow = h2_settings:get(initial_window_size, Settings),
+    Threshold = InitialWindow div 2,
     case maps:find(StreamId, Streams) of
         {ok, #stream{recv_window_size = StreamWindow} = Stream} when StreamWindow < Threshold ->
             StreamIncrement = InitialWindow - StreamWindow,
-            send_frame(h2_frame:window_update(StreamId, StreamIncrement), State1),
+            send_frame(h2_frame:window_update(StreamId, StreamIncrement), State),
             Stream1 = Stream#stream{recv_window_size = StreamWindow + StreamIncrement},
-            State1#state{streams = maps:put(StreamId, Stream1, Streams)};
+            State#state{streams = maps:put(StreamId, Stream1, Streams)};
         _ ->
-            State1
+            State
     end.
 
 %% ============================================================================
