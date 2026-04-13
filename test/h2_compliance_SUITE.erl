@@ -92,7 +92,14 @@
     extended_connect_client_refuses_when_peer_disabled_test/1,
     extended_connect_method_must_be_connect_test/1,
     extended_connect_trailers_rejected_test/1,
-    extended_connect_server_rejects_when_disabled_test/1
+    extended_connect_server_rejects_when_disabled_test/1,
+
+    %% Third-pass review findings
+    informational_end_stream_rejected_test/1,
+    authority_userinfo_rejected_outbound_test/1,
+    authority_userinfo_rejected_inbound_test/1,
+    extended_connect_bad_protocol_token_rejected_test/1,
+    connect_non_2xx_trailers_allowed_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -195,7 +202,14 @@ groups() ->
             extended_connect_client_refuses_when_peer_disabled_test,
             extended_connect_method_must_be_connect_test,
             extended_connect_trailers_rejected_test,
-            extended_connect_server_rejects_when_disabled_test
+            extended_connect_server_rejects_when_disabled_test,
+
+            %% Third-pass review fixes
+            informational_end_stream_rejected_test,
+            authority_userinfo_rejected_outbound_test,
+            authority_userinfo_rejected_inbound_test,
+            extended_connect_bad_protocol_token_rejected_test,
+            connect_non_2xx_trailers_allowed_test
         ]}
     ].
 
@@ -1755,6 +1769,223 @@ wait_for_rst_stream(Sock, StreamId, Timeout) ->
             end;
         {error, _} ->
             timeout
+    end.
+
+%% ============================================================================
+%% Third-pass review fixes (RFC 9113 §8.1, RFC 9110 §15.2, RFC 9113 §8.3.1,
+%% RFC 7540 §8.3, RFC 8441 §4)
+%% ============================================================================
+
+%% RFC 9113 §8.1: a 1xx interim response with END_STREAM is malformed.
+%% Raw TLS server replies 103 + END_STREAM; h2 client must reject with
+%% RST_STREAM(PROTOCOL_ERROR) and must NOT deliver an `informational` event.
+informational_end_stream_rejected_test(Config) ->
+    {ok, LS, Port} = raw_tls_listen(Config),
+    Parent = self(),
+    _Srv = spawn(fun() ->
+        {ok, S} = raw_tls_accept(LS),
+        fake_server_await_headers(S),
+        {Block, _} = h2_hpack:encode([{<<":status">>, <<"103">>}],
+                                     h2_hpack:new_context()),
+        ok = ssl:send(S, h2_frame:encode(h2_frame:headers(1, Block, true))),
+        %% Read the client's RST_STREAM back on this socket.
+        Result = wait_for_rst_stream(S, 1, 3000),
+        Parent ! {srv_rst, Result},
+        timer:sleep(200),
+        ssl:close(S)
+    end),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, Sid} = h2:request(Conn, <<"GET">>, <<"/">>, [{<<"host">>, <<"localhost">>}]),
+    %% The guard must fire client-side: no informational event should surface.
+    receive
+        {h2, Conn, {informational, Sid, 103, _}} ->
+            ct:fail(interim_end_stream_accepted)
+    after 500 ->
+        ok
+    end,
+    %% And the raw server must have received the RST_STREAM.
+    receive
+        {srv_rst, {ok, ErrorCode}} ->
+            ?assertEqual(1, ErrorCode);          %% PROTOCOL_ERROR
+        {srv_rst, timeout} ->
+            ct:fail(client_did_not_rst)
+    after 4000 ->
+        ct:fail(no_srv_rst_result)
+    end,
+    catch h2:close(Conn),
+    catch ssl:close(LS),
+    drain_exits(),
+    ok.
+
+%% RFC 9113 §8.3.1: outbound `:authority` with userinfo MUST be rejected
+%% client-side before HPACK encoding.
+authority_userinfo_rejected_outbound_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    Result = h2:request(Conn, [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"user:pass@localhost">>}
+    ]),
+    ?assertEqual({error, protocol_error}, Result),
+    h2:close(Conn),
+    drain_exits(),
+    ok.
+
+%% Inbound version via raw SSL: server MUST stream-reset a HEADERS frame
+%% whose `:authority` contains userinfo.
+authority_userinfo_rejected_inbound_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"bob@localhost">>}
+    ],
+    {Block, _Ctx} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    case wait_for_rst_stream(Sock, 1, 3000) of
+        {ok, ErrorCode} -> ?assertEqual(1, ErrorCode);
+        timeout -> ct:fail(no_rst_stream)
+    end,
+    ssl:close(Sock),
+    ok.
+
+%% RFC 8441 §4: `:protocol` MUST be a RFC 7230 token. A server advertising
+%% ENABLE_CONNECT_PROTOCOL=1 still rejects a non-token value.
+extended_connect_bad_protocol_token_rejected_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => fun(_, _, _, _, _) -> ok end,
+        enable_connect_protocol => true
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Sock} = raw_h2_client(Port),
+    Headers = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/c">>},
+        {<<":authority">>, <<"localhost">>},
+        {<<":protocol">>, <<"web socket">>}   %% space → not a token
+    ],
+    {Block, _Ctx} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, false))),
+    case wait_for_rst_stream(Sock, 1, 3000) of
+        {ok, ErrorCode} -> ?assertEqual(1, ErrorCode);
+        timeout -> ct:fail(no_rst_stream)
+    end,
+    ssl:close(Sock),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% RFC 7540 §8.3: a non-2xx response to CONNECT does NOT open a tunnel, so
+%% the server MAY send trailers on a 4xx CONNECT response. Before the fix,
+%% the tunnel flag was set on request receipt and blocked trailers.
+connect_non_2xx_trailers_allowed_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    Self = self(),
+    Handler = fun(Conn, Sid, <<"CONNECT">>, _, _) ->
+        h2:send_response(Conn, Sid, 502, []),
+        Result = h2:send_trailers(Conn, Sid, [{<<"x-reason">>, <<"bad-gateway">>}]),
+        Self ! {trailer_result, Result}
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => Handler
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, _Sid} = h2:request(Conn, <<"CONNECT">>, <<>>,
+                            [{<<"host">>, <<"t:1">>}]),
+    receive
+        {trailer_result, ok} -> ok;
+        {trailer_result, Other} -> ct:fail({trailers_rejected, Other})
+    after 3000 ->
+        ct:fail(no_trailer_result)
+    end,
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% Raw HTTP/2 client: SSL connect + preface + empty SETTINGS + drain server
+%% SETTINGS + SETTINGS_ACK. Returns a socket ready to send HEADERS.
+raw_h2_client(Port) ->
+    {ok, Sock} = ssl:connect("localhost", Port,
+                             [{active, false}, {mode, binary},
+                              {alpn_advertised_protocols, [<<"h2">>]},
+                              {verify, verify_none}], 5000),
+    ok = ssl:send(Sock, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:settings([]))),
+    _ = read_first_settings(Sock),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:settings_ack())),
+    {ok, Sock}.
+
+%% ---- Raw TLS fake-server helpers (for client-side behaviour tests) -------
+
+raw_tls_listen(Config) ->
+    Opts = [
+        {certfile, ?config(cert_file, Config)},
+        {keyfile, ?config(key_file, Config)},
+        {alpn_preferred_protocols, [<<"h2">>]},
+        {versions, ['tlsv1.2', 'tlsv1.3']},
+        {reuseaddr, true},
+        {active, false},
+        {mode, binary}
+    ],
+    {ok, LS} = ssl:listen(0, Opts),
+    {ok, {_, Port}} = ssl:sockname(LS),
+    {ok, LS, Port}.
+
+raw_tls_accept(LS) ->
+    {ok, Tr} = ssl:transport_accept(LS, 5000),
+    {ok, S}  = ssl:handshake(Tr, 5000),
+    %% Read client preface, expect its SETTINGS, send ours + ACK theirs.
+    {ok, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>} =
+        ssl:recv(S, byte_size(<<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>), 5000),
+    ok = ssl:send(S, h2_frame:encode(h2_frame:settings([]))),
+    _ = drain_frames_until_settings(S),
+    ok = ssl:send(S, h2_frame:encode(h2_frame:settings_ack())),
+    {ok, S}.
+
+%% Read frames until we see the client's SETTINGS (non-ACK) then ACK any
+%% trailing ACK it might send; returns ok when the client is ready.
+drain_frames_until_settings(S) ->
+    case ssl:recv(S, 9, 5000) of
+        {ok, <<Len:24, Type:8, Flags:8, _:32>>} ->
+            _ = case Len of
+                0 -> <<>>;
+                _ -> {ok, _} = ssl:recv(S, Len, 5000)
+            end,
+            case {Type, Flags band 16#1} of
+                {16#4, 0} -> ok;   %% SETTINGS (non-ACK) seen — done
+                _ -> drain_frames_until_settings(S)
+            end;
+        {error, _} -> ok
+    end.
+
+%% Wait for a HEADERS frame from the client on stream 1.
+fake_server_await_headers(S) ->
+    {ok, <<Len:24, Type:8, _Flags:8, _:1, _Sid:31>>} = ssl:recv(S, 9, 5000),
+    case Type of
+        16#1 ->
+            _ = case Len of 0 -> <<>>; _ -> {ok, _} = ssl:recv(S, Len, 5000) end,
+            ok;
+        _ ->
+            _ = case Len of 0 -> <<>>; _ -> {ok, _} = ssl:recv(S, Len, 5000) end,
+            fake_server_await_headers(S)
     end.
 
 %% ============================================================================

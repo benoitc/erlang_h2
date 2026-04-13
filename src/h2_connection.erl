@@ -1042,10 +1042,19 @@ dispatch_headers(server, trailers, StreamId, Stream, Headers, true, State) ->
     deliver_trailers(StreamId, Stream, Headers, State, fun notify_stream/3);
 
 %% Client receives a 1xx informational response. Stream stays open.
-dispatch_headers(client, interim, StreamId, _Stream, Headers, _EndStream, State) ->
-    {ok, Status} = parse_status(Headers),
-    notify_owner({h2, self(), {informational, StreamId, Status, strip_pseudo(Headers)}}, State),
-    {ok, connected, State};
+%% RFC 9113 §8.1 / RFC 9110 §15.2: interim responses MUST NOT carry END_STREAM
+%% and MUST NOT carry content (Content-Length is meaningless).
+dispatch_headers(client, interim, StreamId, _Stream, _Headers, true, State) ->
+    stream_reject_and_close(StreamId, protocol_error, State);
+dispatch_headers(client, interim, StreamId, _Stream, Headers, false, State) ->
+    case proplists:is_defined(<<"content-length">>, Headers) of
+        true ->
+            stream_reject_and_close(StreamId, protocol_error, State);
+        false ->
+            {ok, Status} = parse_status(Headers),
+            notify_owner({h2, self(), {informational, StreamId, Status, strip_pseudo(Headers)}}, State),
+            {ok, connected, State}
+    end;
 
 %% Client receives the final response HEADERS.
 dispatch_headers(client, initial, StreamId, Stream, Headers, EndStream, State) ->
@@ -1077,11 +1086,13 @@ handle_server_initial(StreamId, Stream, Headers, Protocol, EndStream, State) ->
 
 commit_server_initial(StreamId, Stream, Headers, Protocol, ExpectedCL, EndStream, State) ->
     {Method, Path, OtherHeaders} = extract_request_headers(Headers),
+    %% RFC 7540 §8.3: a CONNECT stream becomes a tunnel only once the 2xx
+    %% response is sent. Keep tunnel=false here; handle_send_response flips it.
     Stream1 = Stream#stream{
         state = stream_state_after_end(EndStream),
         request_headers = Headers,
         request_method = Method,
-        tunnel = Method =:= <<"CONNECT">>,
+        tunnel = false,
         protocol = Protocol,
         expected_body_length = ExpectedCL,
         body_forbidden = Method =:= <<"HEAD">>
@@ -1099,10 +1110,15 @@ handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State) ->
         {ok, ExpectedCL} ->
             BodyForbidden = Stream#stream.request_method =:= <<"HEAD">>
                             orelse Status =:= 204 orelse Status =:= 304,
+            %% RFC 7540 §8.3: stream becomes a tunnel only on a 2xx response
+            %% to a CONNECT request.
+            IsTunnel = Stream#stream.request_method =:= <<"CONNECT">>
+                       andalso Status >= 200 andalso Status < 300,
             Stream1 = Stream#stream{
                 state = stream_state_after_end(EndStream),
                 response_headers = Headers,
                 response_seen_final = true,
+                tunnel = IsTunnel,
                 expected_body_length = ExpectedCL,
                 body_forbidden = BodyForbidden
             },
@@ -1249,6 +1265,20 @@ valid_name_bytes(<<C, Rest/binary>>) ->
          orelse lists:member(C, "!#$%&'*+-.^_`|~"),
     Ok andalso valid_name_bytes(Rest).
 
+%% RFC 7230 §3.2.6 `token` — same alphabet as a header field name but
+%% case-insensitive (uppercase also allowed). Used for RFC 8441 `:protocol`.
+valid_token(<<>>)       -> false;
+valid_token(Bin) when is_binary(Bin) -> valid_token_bytes(Bin);
+valid_token(_)          -> false.
+
+valid_token_bytes(<<>>) -> true;
+valid_token_bytes(<<C, Rest/binary>>) ->
+    Ok = (C >= $a andalso C =< $z)
+         orelse (C >= $A andalso C =< $Z)
+         orelse (C >= $0 andalso C =< $9)
+         orelse lists:member(C, "!#$%&'*+-.^_`|~"),
+    Ok andalso valid_token_bytes(Rest).
+
 %% A value is bad if empty-after-trimming is fine, but leading/trailing SP/HTAB
 %% or any NUL/CR/LF byte is forbidden.
 bad_value(<<>>) -> false;
@@ -1292,7 +1322,9 @@ check_request_specific(server, Headers) ->
     Method = proplists:get_value(<<":method">>, Headers),
     case Method of
         undefined -> ok;  %% already caught in check_pseudo_set
-        <<"CONNECT">> -> ok;  %% CONNECT has no :path/:scheme
+        <<"CONNECT">> ->
+            %% CONNECT has no :path/:scheme but :authority (no userinfo) still applies.
+            check_authority_host(Headers);
         _ ->
             case check_path(Headers) of
                 ok -> check_authority_host(Headers);
@@ -1324,13 +1356,21 @@ check_authority_host(Headers) ->
     case proplists:get_value(<<":authority">>, Headers) of
         undefined -> ok;
         Authority ->
-            case proplists:get_value(<<"host">>, Headers) of
-                undefined -> ok;
-                Host ->
-                    case string:equal(Authority, Host, true) of
-                        true -> ok;
-                        false -> {error, protocol_error}
-                    end
+            %% RFC 9113 §8.3.1: `:authority` MUST NOT include the deprecated
+            %% userinfo subcomponent for http/https schemes.
+            case binary:match(Authority, <<"@">>) of
+                nomatch -> check_host_consistency(Authority, Headers);
+                _       -> {error, protocol_error}
+            end
+    end.
+
+check_host_consistency(Authority, Headers) ->
+    case proplists:get_value(<<"host">>, Headers) of
+        undefined -> ok;
+        Host ->
+            case string:equal(Authority, Host, true) of
+                true  -> ok;
+                false -> {error, protocol_error}
             end
     end.
 
@@ -1374,8 +1414,11 @@ check_pseudo_set(server, Headers) ->
                             end;
                         {<<"CONNECT">>, _} ->
                             %% Extended CONNECT (RFC 8441 §4): `:method=CONNECT`
-                            %% plus `:protocol`, `:scheme`, `:path`, `:authority`
-                            %% all REQUIRED.
+                            %% plus `:protocol` (RFC 7230 token), `:scheme`,
+                            %% `:path`, `:authority` all REQUIRED.
+                            case valid_token(Protocol) of
+                                false -> {error, protocol_error};
+                                true ->
                             case {proplists:get_value(<<":scheme">>, Headers),
                                   proplists:get_value(<<":path">>, Headers),
                                   proplists:get_value(<<":authority">>, Headers)} of
@@ -1384,6 +1427,7 @@ check_pseudo_set(server, Headers) ->
                                 {_, <<>>, _} -> {error, protocol_error};
                                 {_, _, undefined} -> {error, protocol_error};
                                 _ -> ok
+                            end
                             end;
                         {_, P} when P =/= undefined ->
                             %% `:protocol` without method CONNECT is malformed.
@@ -1662,12 +1706,15 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
                         true -> half_closed_local;
                         false -> open
                     end,
+                    %% RFC 7540 §8.3: tunnel is only established on the 2xx
+                    %% response; do NOT pre-set tunnel=true here. The client-side
+                    %% flip happens in handle_client_initial.
                     Stream = #stream{
                         id = StreamId,
                         state = StreamState,
                         window_size = InitialWindow,
                         recv_window_size = RecvWindow,
-                        tunnel = IsConnect,
+                        tunnel = false,
                         request_method = Method
                     },
 
@@ -1699,7 +1746,6 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
         _ ->
             Method = proplists:get_value(<<":method">>, Headers),
             Protocol = proplists:get_value(<<":protocol">>, Headers),
-            IsConnect = Method =:= <<"CONNECT">>,
             %% RFC 8441: client MUST NOT send Extended CONNECT until peer has
             %% advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1; method MUST be
             %% CONNECT when `:protocol` is present.
@@ -1728,12 +1774,13 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
             {HeaderBlock, EncCtx1} = h2_hpack:encode(Headers, EncCtx),
             RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
             StreamState = case EndStream of true -> half_closed_local; false -> open end,
+            %% RFC 7540 §8.3 / RFC 8441: tunnel only opens on the 2xx response.
             Stream = #stream{
                 id = StreamId,
                 state = StreamState,
                 window_size = InitialWindow,
                 recv_window_size = RecvWindow,
-                tunnel = IsConnect,
+                tunnel = false,
                 protocol = Protocol,
                 request_method = Method
             },
@@ -1757,11 +1804,14 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
         _ when Status =:= 101 ->
             %% RFC 9113 §8.6: HTTP/2 MUST NOT generate 101 Switching Protocols.
             {keep_state, State, [{reply, From, {error, status_101_forbidden}}]};
-        {ok, #stream{state = StreamState, tunnel = IsTunnel} = Stream}
+        {ok, #stream{state = StreamState, request_method = ReqMethod} = Stream}
           when StreamState == open; StreamState == half_closed_remote ->
-            %% RFC 7540 §8.3: a tunnel response (CONNECT 2xx) MUST NOT carry
-            %% Content-Length or Transfer-Encoding headers.
-            case IsTunnel andalso Status >= 200 andalso Status < 300 andalso
+            %% RFC 7540 §8.3: a CONNECT 2xx response MUST NOT carry
+            %% Content-Length or Transfer-Encoding; the stream becomes a
+            %% tunnel only when the 2xx goes out, never before.
+            IsConnectRequest = ReqMethod =:= <<"CONNECT">>,
+            IsSuccess        = Status >= 200 andalso Status < 300,
+            case IsConnectRequest andalso IsSuccess andalso
                  has_banned_tunnel_header(Headers) of
                 true ->
                     {keep_state, State,
@@ -1779,10 +1829,7 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
                         ok ->
                     {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
                     send_header_block(StreamId, HeaderBlock, false, State),
-                    %% Tunnel is "established" once a 2xx response goes out;
-                    %% non-2xx responses keep tunnel=false (and the stream
-                    %% behaves like a normal short response).
-                    NewTunnel = IsTunnel andalso Status >= 200 andalso Status < 300,
+                    NewTunnel = IsConnectRequest andalso IsSuccess,
                     Stream1 = Stream#stream{response_headers = AllHeaders, tunnel = NewTunnel},
                     State1 = State#state{
                         encode_context = EncCtx1,

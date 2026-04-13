@@ -22,6 +22,10 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 - Cached `peer_max_frame_size` / `peer_initial_window_size` / `peer_max_concurrent_streams` on the connection state record.
 
 ### Fixed
+- 1xx interim responses with `END_STREAM` or `Content-Length` now stream-RST with `PROTOCOL_ERROR` (RFC 9113 §8.1, RFC 9110 §15.2). Previously accepted silently.
+- CONNECT tunnel flag is no longer pre-set on the request; the stream becomes a tunnel only when the 2xx response is sent (server) or received (client). Non-2xx CONNECT responses now correctly permit trailers and enforce body rules (RFC 7540 §8.3).
+- `:authority` containing userinfo (`user@host`) is rejected with `PROTOCOL_ERROR` on both inbound and outbound paths (RFC 9113 §8.3.1). `check_authority_host` also now runs for CONNECT requests.
+- Extended CONNECT `:protocol` value validated as an RFC 7230 token; non-token values (whitespace, control bytes, etc.) → stream `PROTOCOL_ERROR` (RFC 8441 §4).
 - `SETTINGS_ENABLE_PUSH` is now always advertised as 0 (RFC 9113 §6.5.2). Was incorrectly sending 1 while rejecting PUSH_PROMISE.
 - `:scheme` pseudo-header now follows the actual transport (`http` on TCP, `https` on TLS). Previously hardcoded to `https`.
 - `:method = CONNECT` outbound: trailers rejected with `{error, tunnel_no_trailers}`.
