@@ -17,14 +17,22 @@
 -export([encode_integer/2, decode_integer/2]).
 -export([huffman_encode/1, huffman_decode/1]).
 
+-on_load(init_tables/0).
+
 -include("h2.hrl").
 -include("h2_hpack_huffman.hrl").
+
+-define(PT_HUFFMAN_ENCODE, {?MODULE, huffman_encode_tuple}).
+-define(PT_HUFFMAN_DECODE, {?MODULE, huffman_decode_sorted}).
+-define(PT_STATIC_TABLE,   {?MODULE, static_table_tuple}).
 
 %% Context record for encoder/decoder state
 -record(hpack_context, {
     max_table_size = ?DEFAULT_HEADER_TABLE_SIZE :: non_neg_integer(),
     table_size = 0 :: non_neg_integer(),
     dynamic_table = [] :: [{binary(), binary()}],
+    %% Cached length of dynamic_table to avoid O(n) length/1 on every lookup.
+    dynamic_table_length = 0 :: non_neg_integer(),
     %% RFC 7541 §4.2: when the peer lowers SETTINGS_HEADER_TABLE_SIZE,
     %% the next header block MUST begin with one or more dynamic-table
     %% size updates that reduce the size at or below the new limit.
@@ -144,6 +152,18 @@ set_peer_max_table_size(Max, #hpack_context{peer_max_table_size = OldMax} = Ctx)
         true -> Ctx1#hpack_context{pending_size_update = true};
         false -> Ctx1
     end.
+
+%% @doc Initialize Huffman lookup tables. Called at module load time.
+-spec init_tables() -> ok.
+init_tables() ->
+    persistent_term:put(?PT_HUFFMAN_ENCODE,
+                        list_to_tuple(?HUFFMAN_ENCODE_TABLE)),
+    persistent_term:put(?PT_HUFFMAN_DECODE,
+                        lists:sort(fun({_, _, L1}, {_, _, L2}) -> L1 =< L2 end,
+                                   ?HUFFMAN_ENCODE_TABLE)),
+    persistent_term:put(?PT_STATIC_TABLE,
+                        list_to_tuple(?STATIC_TABLE)),
+    ok.
 
 %% @doc Encode a list of headers.
 -spec encode(headers(), context()) -> {binary(), context()}.
@@ -390,12 +410,13 @@ find_in_dynamic(Name, Value, [_|Rest], Index, NameMatch) ->
     find_in_dynamic(Name, Value, Rest, Index + 1, NameMatch).
 
 lookup(Index, _Ctx) when Index >= 1, Index =< ?HPACK_STATIC_TABLE_SIZE ->
-    {Name, Value} = lists:nth(Index, ?STATIC_TABLE),
+    {Name, Value} = element(Index, persistent_term:get(?PT_STATIC_TABLE)),
     {ok, Name, Value};
-lookup(Index, #hpack_context{dynamic_table = DynTable}) ->
+lookup(Index, #hpack_context{dynamic_table = DynTable,
+                             dynamic_table_length = Len}) ->
     DynIndex = Index - ?HPACK_STATIC_TABLE_SIZE,
     if
-        DynIndex >= 1, DynIndex =< length(DynTable) ->
+        DynIndex >= 1, DynIndex =< Len ->
             {Name, Value} = lists:nth(DynIndex, DynTable),
             {ok, Name, Value};
         true ->
@@ -403,12 +424,13 @@ lookup(Index, #hpack_context{dynamic_table = DynTable}) ->
     end.
 
 lookup_name(Index, _Ctx) when Index >= 1, Index =< ?HPACK_STATIC_TABLE_SIZE ->
-    {Name, _} = lists:nth(Index, ?STATIC_TABLE),
+    {Name, _} = element(Index, persistent_term:get(?PT_STATIC_TABLE)),
     Name;
-lookup_name(Index, #hpack_context{dynamic_table = DynTable}) ->
+lookup_name(Index, #hpack_context{dynamic_table = DynTable,
+                                  dynamic_table_length = Len}) ->
     DynIndex = Index - ?HPACK_STATIC_TABLE_SIZE,
     if
-        DynIndex >= 1, DynIndex =< length(DynTable) ->
+        DynIndex >= 1, DynIndex =< Len ->
             {Name, _} = lists:nth(DynIndex, DynTable),
             Name;
         true ->
@@ -420,22 +442,26 @@ add_to_dynamic_table(Name, Value, Ctx) ->
     Ctx1 = evict_to_fit(EntrySize, Ctx),
     #hpack_context{
         dynamic_table = DynTable,
+        dynamic_table_length = Len,
         table_size = TableSize,
         max_table_size = MaxSize
     } = Ctx1,
     if
         EntrySize > MaxSize ->
             %% Entry too large, clear table
-            Ctx1#hpack_context{dynamic_table = [], table_size = 0};
+            Ctx1#hpack_context{dynamic_table = [], dynamic_table_length = 0,
+                               table_size = 0};
         true ->
             Ctx1#hpack_context{
                 dynamic_table = [{Name, Value}|DynTable],
+                dynamic_table_length = Len + 1,
                 table_size = TableSize + EntrySize
             }
     end.
 
 evict_to_fit(NewEntrySize, #hpack_context{
     dynamic_table = DynTable,
+    dynamic_table_length = Len,
     table_size = TableSize,
     max_table_size = MaxSize
 } = Ctx) ->
@@ -444,17 +470,20 @@ evict_to_fit(NewEntrySize, #hpack_context{
         TableSize =< TargetSize ->
             Ctx;
         true ->
-            evict_entries(DynTable, TableSize, TargetSize, Ctx)
+            %% Reverse once (oldest first), drop from front until under target.
+            Reversed = lists:reverse(DynTable),
+            {Kept, NewSize, NewLen} = drop_until(Reversed, TableSize, Len, TargetSize),
+            Ctx#hpack_context{dynamic_table = lists:reverse(Kept),
+                              dynamic_table_length = NewLen,
+                              table_size = NewSize}
     end.
 
-evict_entries([], _Size, _Target, Ctx) ->
-    Ctx#hpack_context{dynamic_table = [], table_size = 0};
-evict_entries(DynTable, Size, Target, Ctx) when Size =< Target ->
-    Ctx#hpack_context{dynamic_table = DynTable, table_size = Size};
-evict_entries(DynTable, Size, Target, Ctx) ->
-    [{Name, Value}|Rest] = lists:reverse(DynTable),
-    EntrySize = entry_size(Name, Value),
-    evict_entries(lists:reverse(Rest), Size - EntrySize, Target, Ctx).
+drop_until([], _Size, _Len, _Target) ->
+    {[], 0, 0};
+drop_until(List, Size, Len, Target) when Size =< Target ->
+    {List, Size, Len};
+drop_until([{N, V}|Rest], Size, Len, Target) ->
+    drop_until(Rest, Size - entry_size(N, V), Len - 1, Target).
 
 entry_size(Name, Value) ->
     byte_size(Name) + byte_size(Value) + 32.
@@ -515,17 +544,19 @@ huffman_encode(Bin) ->
     Padding = (1 bsl PadLen) - 1,
     <<Bits/bits, Padding:PadLen>>.
 
-huffman_encode_bits(<<>>, Acc) ->
+huffman_encode_bits(Bin, Acc) ->
+    huffman_encode_bits(Bin, Acc, persistent_term:get(?PT_HUFFMAN_ENCODE)).
+
+huffman_encode_bits(<<>>, Acc, _Tab) ->
     Acc;
-huffman_encode_bits(<<C, Rest/binary>>, Acc) ->
-    {_, Code, Len} = lists:nth(C + 1, ?HUFFMAN_ENCODE_TABLE),
-    huffman_encode_bits(Rest, <<Acc/bits, Code:Len>>).
+huffman_encode_bits(<<C, Rest/binary>>, Acc, Tab) ->
+    {_, Code, Len} = element(C + 1, Tab),
+    huffman_encode_bits(Rest, <<Acc/bits, Code:Len>>, Tab).
 
 %% @doc Huffman decode a binary string.
 -spec huffman_decode(binary()) -> {ok, binary()} | {error, term()}.
 huffman_decode(Bin) ->
-    %% Build decode table sorted by code length for efficient matching
-    DecodeTable = build_decode_table(),
+    DecodeTable = persistent_term:get(?PT_HUFFMAN_DECODE),
     huffman_decode_loop(Bin, <<>>, <<>>, DecodeTable).
 
 huffman_decode_loop(<<>>, <<>>, Acc, _Table) ->
@@ -560,10 +591,6 @@ decode_symbols(Bits, MoreBytes, Acc, Table) ->
         {error, _} = Err ->
             Err
     end.
-
-%% Build decode table sorted by code length
-build_decode_table() ->
-    lists:sort(fun({_, _, L1}, {_, _, L2}) -> L1 =< L2 end, ?HUFFMAN_ENCODE_TABLE).
 
 %% Match a Huffman code from the bit buffer
 match_huffman_code(Bits, Table) ->
