@@ -1,276 +1,103 @@
-# h2 Features
+# Features
 
-## Overview
+`h2` implements HTTP/2 as a client and a server on top of Erlang/OTP sockets. This page lists what is supported, what is intentionally left out, and the internal modules a library user may want to know about.
 
-h2 provides low-level HTTP/2 protocol primitives for Erlang applications. It handles frame encoding/decoding, header compression, and related protocol details without imposing connection management strategies.
+## Supported
 
-## Modules
+### Protocol (RFC 7540)
 
-### h2_frame - Frame Encoding/Decoding
+- Connection preface (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) and exact-match validation on the server.
+- All frame types: `DATA`, `HEADERS`, `PRIORITY`, `RST_STREAM`, `SETTINGS`, `PING`, `GOAWAY`, `WINDOW_UPDATE`, `CONTINUATION`. `PUSH_PROMISE` is decoded but not generated (push disabled).
+- Stream state machine per §5.1 with correct transitions for `idle → open → half_closed_{local,remote} → closed`, including reserved states for reception of PUSH_PROMISE.
+- Flow control at both connection and stream level, including `SETTINGS_INITIAL_WINDOW_SIZE` retroactive adjustment with signed 32-bit overflow detection.
+- SETTINGS negotiation: synchronous ACK timing, `SETTINGS_TIMEOUT`, validation of each parameter's legal range.
+- Two-phase GOAWAY: graceful drain window before socket close.
+- CONTINUATION interleaving: only CONTINUATION frames on the same stream accepted between HEADERS and END_HEADERS; anything else is a `PROTOCOL_ERROR`.
+- Pseudo-header validation: required set per direction, order rule, lowercase header names, `:path` non-empty for non-CONNECT, `:authority` / `Host` consistency.
+- Connection-specific headers rejected (`Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding`, `Upgrade`).
+- Error codes per §7 plus per-type stream-id validation on receive.
+- CONNECT tunnel mode (§8.3): a 2xx response promotes the stream to a raw byte tunnel; `END_STREAM` is half-close, trailers rejected, CL/TE rejected.
 
-Implements all HTTP/2 frame types per RFC 7540 Section 4.
+### HPACK (RFC 7541)
 
-#### Frame Types
+- Static table (61 entries), dynamic table (FIFO eviction), Huffman coding, variable-length integer encoding.
+- `SETTINGS_HEADER_TABLE_SIZE` propagated to both encoders; decoder enforces that any size update is `≤` the peer-advertised cap and that size updates appear only at the start of a header block.
+- Huffman decoder rejects an embedded EOS symbol and rejects padding that isn't strictly a prefix of `11…1`.
+- Encode and decode paths use precomputed, shared tables (`persistent_term`) initialized at module load.
 
-| Type | Code | Description |
-|------|------|-------------|
-| DATA | 0x0 | Conveys payload data |
-| HEADERS | 0x1 | Opens a stream, carries headers |
-| PRIORITY | 0x2 | Stream dependency and weight |
-| RST_STREAM | 0x3 | Terminates a stream |
-| SETTINGS | 0x4 | Configuration parameters |
-| PUSH_PROMISE | 0x5 | Server push initiation |
-| PING | 0x6 | Connection health check |
-| GOAWAY | 0x7 | Connection shutdown |
-| WINDOW_UPDATE | 0x8 | Flow control increment |
-| CONTINUATION | 0x9 | Continuation of header block |
+### TLS
 
-#### API
+- ALPN `h2` required on the client, advertised on the server.
+- TLS 1.2 and 1.3.
+- SNI carried automatically from the client hostname.
 
-```erlang
-%% Encoding
-h2_frame:encode(Frame) -> binary().
+### API surface
 
-%% Decoding (streaming-aware)
-h2_frame:decode(Binary) -> {ok, Frame, Rest} | {more, BytesNeeded} | {error, Reason}.
-
-%% Frame constructors
-h2_frame:data(StreamId, EndStream, Data) -> frame().
-h2_frame:data(StreamId, EndStream, Data, PadLength) -> frame().
-h2_frame:headers(StreamId, EndStream, EndHeaders, HeaderBlock) -> frame().
-h2_frame:headers(StreamId, EndStream, EndHeaders, HeaderBlock, PadLength) -> frame().
-h2_frame:priority(StreamId, Exclusive, DepStreamId, Weight) -> frame().
-h2_frame:rst_stream(StreamId, ErrorCode) -> frame().
-h2_frame:settings(SettingsList) -> frame().
-h2_frame:settings_ack() -> frame().
-h2_frame:push_promise(StreamId, PromisedId, EndHeaders, HeaderBlock) -> frame().
-h2_frame:ping(OpaqueData) -> frame().
-h2_frame:ping_ack(OpaqueData) -> frame().
-h2_frame:goaway(LastStreamId, ErrorCode, DebugData) -> frame().
-h2_frame:window_update(StreamId, Increment) -> frame().
-h2_frame:continuation(StreamId, EndHeaders, HeaderBlock) -> frame().
-```
-
-#### Streaming Decode
-
-The decoder handles incomplete data gracefully:
+Public module `h2`:
 
 ```erlang
-case h2_frame:decode(Buffer) of
-    {ok, Frame, Rest} ->
-        %% Process frame, continue with Rest
-        handle_frame(Frame),
-        decode_loop(Rest);
-    {more, N} ->
-        %% Need N more bytes, wait for more data
-        receive_more(N, Buffer);
-    {error, Reason} ->
-        %% Protocol error
-        handle_error(Reason)
-end.
+%% Client
+h2:connect/2,3
+h2:wait_connected/1,2
+h2:request/2,3,4,5
+h2:send_data/3,4
+h2:send_trailers/3
+h2:cancel/2,3
+h2:set_stream_handler/3,4
+h2:unset_stream_handler/2
+h2:goaway/1,2
+h2:close/1
+h2:controlling_process/2
+
+%% Server
+h2:start_server/2,3
+h2:stop_server/1
+h2:server_port/1
+h2:send_response/4
+
+%% Inspection
+h2:get_settings/1
+h2:get_peer_settings/1
 ```
 
-### h2_hpack - Header Compression
+See the README for usage snippets and `src/h2.erl` for full edoc.
 
-HPACK implementation per RFC 7541 with static table, dynamic table, and Huffman encoding.
-
-#### Features
-
-- **Static Table**: 61 predefined common headers (RFC 7541 Appendix A)
-- **Dynamic Table**: FIFO eviction with configurable max size
-- **Huffman Encoding**: Optional string compression
-- **Integer Encoding**: Variable-length prefix encoding (1-8 bit prefixes)
-
-#### API
+### Events to the owner process
 
 ```erlang
-%% Context management
-h2_hpack:new_context() -> context().
-h2_hpack:new_context(MaxTableSize) -> context().
-h2_hpack:set_max_table_size(NewSize, Context) -> context().
-
-%% Encoding/Decoding
-h2_hpack:encode(Headers, Context) -> {ok, Binary, NewContext}.
-h2_hpack:decode(Binary, Context) -> {ok, Headers, NewContext} | {error, Reason}.
-
-%% Huffman
-h2_hpack:huffman_encode(Binary) -> Binary.
-h2_hpack:huffman_decode(Binary) -> {ok, Binary} | {error, Reason}.
-
-%% Integer encoding
-h2_hpack:encode_integer(Value, PrefixBits) -> Binary.
-h2_hpack:decode_integer(Binary, PrefixBits) -> {ok, Value, Rest}.
+{h2, Conn, connected}
+{h2, Conn, {response, StreamId, Status, Headers}}
+{h2, Conn, {data, StreamId, Data, EndStream}}
+{h2, Conn, {trailers, StreamId, Headers}}
+{h2, Conn, {stream_reset, StreamId, ErrorCode}}
+{h2, Conn, {goaway, LastStreamId, ErrorCode}}
+{h2, Conn, {closed, Reason}}
 ```
 
-#### Header Encoding Strategies
+Identical shape to `quic_h3` so application code that dispatches on protocol events can be shared between h2 and h3.
 
-1. **Indexed**: Exact match in static/dynamic table (most efficient)
-2. **Literal with Indexing**: Adds to dynamic table for future reference
-3. **Literal without Indexing**: Temporary headers, not cached
+## Intentionally out of scope
 
-### h2_settings - Settings Management
+- **Server push (§8.2)** — deprecated by browsers, removed from HTTP/3.
+- **Stream priorities (§5.3)** — deprecated by RFC 9218 (Extensible Priorities); not implemented and not announced.
+- **HTTP/2 cleartext upgrade (§3.2)** — this release is ALPN-only. Starting an h2 connection over prior knowledge TCP is supported (`transport => tcp`), but `Upgrade: h2c` from an HTTP/1.1 request is not.
+- **Alt-Svc advertisement** — library concern, leave to the caller.
+- **Extended CONNECT / RFC 8441** — the `:protocol` pseudo-header and the `SETTINGS_ENABLE_CONNECT_PROTOCOL` setting are announced but the handshake for WebSocket-over-h2 / WebTransport is not implemented yet.
 
-HTTP/2 settings parameters per RFC 7540 Section 6.5.
+## Internal modules
 
-#### Parameters
+Useful to know when extending or debugging:
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| header_table_size | 4096 | HPACK dynamic table size |
-| enable_push | 1 | Server push enabled |
-| max_concurrent_streams | unlimited | Maximum concurrent streams |
-| initial_window_size | 65535 | Initial flow control window |
-| max_frame_size | 16384 | Maximum frame payload size |
-| max_header_list_size | unlimited | Maximum header list size |
-| enable_connect_protocol | 0 | Extended CONNECT (RFC 8441) |
-
-#### API
-
-```erlang
-h2_settings:default() -> settings().
-h2_settings:get(Key, Settings) -> Value | undefined.
-h2_settings:set(Key, Value, Settings) -> settings().
-h2_settings:merge(Received, Current) -> settings().
-h2_settings:encode(Settings) -> binary().
-h2_settings:decode(Binary) -> {ok, Settings} | {error, Reason}.
-h2_settings:validate(Settings) -> ok | {error, Reason}.
-```
-
-### h2_error - Error Codes
-
-HTTP/2 error codes per RFC 7540 Section 7.
-
-#### Error Codes
-
-| Code | Name | Description |
-|------|------|-------------|
-| 0x0 | NO_ERROR | Graceful shutdown |
-| 0x1 | PROTOCOL_ERROR | Protocol violation |
-| 0x2 | INTERNAL_ERROR | Implementation fault |
-| 0x3 | FLOW_CONTROL_ERROR | Flow control violation |
-| 0x4 | SETTINGS_TIMEOUT | Settings not acknowledged |
-| 0x5 | STREAM_CLOSED | Frame on closed stream |
-| 0x6 | FRAME_SIZE_ERROR | Invalid frame size |
-| 0x7 | REFUSED_STREAM | Stream refused |
-| 0x8 | CANCEL | Stream cancelled |
-| 0x9 | COMPRESSION_ERROR | HPACK decompression failure |
-| 0xa | CONNECT_ERROR | TCP connection error |
-| 0xb | ENHANCE_YOUR_CALM | Excessive load |
-| 0xc | INADEQUATE_SECURITY | TLS requirements not met |
-| 0xd | HTTP_1_1_REQUIRED | Use HTTP/1.1 instead |
-
-#### API
-
-```erlang
-h2_error:code(Name) -> integer().
-h2_error:name(Code) -> atom().
-h2_error:format(CodeOrName) -> string().
-```
-
-### h2_capsule - Capsule Protocol
-
-RFC 9297 Capsule Protocol for HTTP CONNECT tunnels and WebTransport.
-
-#### Format
-
-```
-Capsule {
-  Type (variable-length integer),
-  Length (variable-length integer),
-  Payload (..)
-}
-```
-
-#### API
-
-```erlang
-h2_capsule:encode(Type, Payload) -> binary().
-h2_capsule:decode(Binary) -> {ok, {Type, Payload}, Rest} | {more, N} | {error, Reason}.
-h2_capsule:decode_all(Binary) -> {ok, Capsules, Rest} | {error, Reason}.
-h2_capsule:datagram(Payload) -> capsule().
-```
-
-### h2_varint - Variable-Length Integers
-
-QUIC-style variable-length integer encoding per RFC 9000 Section 16.
-
-#### Encoding Table
-
-| 2 MSBs | Length | Range |
-|--------|--------|-------|
-| 00 | 1 byte | 0-63 |
-| 01 | 2 bytes | 0-16,383 |
-| 10 | 4 bytes | 0-1,073,741,823 |
-| 11 | 8 bytes | 0-4,611,686,018,427,387,903 |
-
-#### API
-
-```erlang
-h2_varint:encode(Integer) -> binary().
-h2_varint:decode(Binary) -> {ok, Integer, Rest} | {more, N} | {error, Reason}.
-h2_varint:encoded_size(Integer) -> 1 | 2 | 4 | 8.
-```
-
-## Protocol Constants
-
-Available in `include/h2.hrl`:
-
-```erlang
-%% Connection preface (24 bytes)
--define(H2_PREFACE, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>).
-
-%% Frame size limits
--define(H2_DEFAULT_MAX_FRAME_SIZE, 16384).
--define(H2_MAX_MAX_FRAME_SIZE, 16777215).
-
-%% Window size limits
--define(H2_MAX_WINDOW_SIZE, 2147483647).
-```
-
-## Example: Simple HTTP/2 Client
-
-```erlang
--module(h2_example).
--export([request/3]).
-
-request(Host, Port, Path) ->
-    {ok, Sock} = gen_tcp:connect(Host, Port, [binary, {active, false}]),
-
-    %% Send connection preface
-    ok = gen_tcp:send(Sock, ?H2_PREFACE),
-
-    %% Send SETTINGS
-    Settings = h2_frame:settings([]),
-    ok = gen_tcp:send(Sock, h2_frame:encode(Settings)),
-
-    %% Create request headers
-    EncCtx = h2_hpack:new_context(),
-    Headers = [
-        {<<":method">>, <<"GET">>},
-        {<<":scheme">>, <<"http">>},
-        {<<":authority">>, list_to_binary(Host)},
-        {<<":path">>, Path}
-    ],
-    {ok, HeaderBlock, _} = h2_hpack:encode(Headers, EncCtx),
-
-    %% Send HEADERS frame
-    HeadersFrame = h2_frame:headers(1, true, true, HeaderBlock),
-    ok = gen_tcp:send(Sock, h2_frame:encode(HeadersFrame)),
-
-    %% Receive response...
-    receive_response(Sock).
-```
+| Module | Role |
+|---|---|
+| `h2_connection` | `gen_statem` owning the socket; one process per connection. |
+| `h2_server` | TLS listener supervisor + acceptor pool, dispatches accepted sockets to `h2_connection` in server mode. |
+| `h2_frame` | Pure frame encode/decode with per-type stream-id 0 and size validation. |
+| `h2_hpack` | HPACK context type, encode/decode, size updates, Huffman. |
+| `h2_settings` | Typed settings map, encode/decode/validate, parameter defaults. |
+| `h2_error` | HTTP/2 error code ↔ atom ↔ format-string mapping. |
 
 ## Testing
 
-Run all tests:
-
-```bash
-rebar3 eunit
-```
-
-Run tests with coverage:
-
-```bash
-rebar3 cover
-```
+- `rebar3 eunit` — 286 unit tests and 800 PropEr properties across frame/HPACK/settings/varint.
+- `rebar3 ct` — 32 Common Test cases: RFC compliance, client/server round-trips, CONNECT tunnel, API-parity with `quic_h3`, error paths.
