@@ -73,6 +73,7 @@
 -export([send_trailers/3]).
 -export([cancel/2, cancel/3]).
 -export([cancel_stream/2, cancel_stream/3]).
+-export([set_stream_handler/3, set_stream_handler/4, unset_stream_handler/2]).
 -export([goaway/1, goaway/2]).
 -export([close/1]).
 -export([get_settings/1, get_peer_settings/1]).
@@ -410,9 +411,12 @@ acceptor_loop_inner(Owner, #{listen_socket := ListenSocket, handler := Handler, 
             end,
             acceptor_loop_inner(Owner, State);
         {error, closed} ->
-            ok;
+            %% Listen socket closed (server shutdown). Exit with `shutdown`
+            %% so any wrapper/connection processes still spawn_link'd to us
+            %% (in-flight connections) tear down too.
+            exit(shutdown);
         {error, _Reason} ->
-            acceptor_loop(Owner, State)
+            acceptor_loop_inner(Owner, State)
     end.
 
 handle_server_connection(Socket, Handler, Settings) ->
@@ -434,10 +438,9 @@ handle_server_connection(Socket, Handler, Settings) ->
 server_connection_loop(Conn, Handler) ->
     receive
         {h2, Conn, {request, StreamId, Method, Path, Headers}} ->
-            %% Spawn handler for this request
             spawn(fun() ->
                 try
-                    Handler(Conn, StreamId, Method, Path, Headers)
+                    invoke_handler(Handler, Conn, StreamId, Method, Path, Headers)
                 catch
                     Class:Reason:Stack ->
                         error_logger:error_msg("Handler error: ~p:~p~n~p~n", [Class, Reason, Stack]),
@@ -449,13 +452,18 @@ server_connection_loop(Conn, Handler) ->
         {h2, Conn, {data, _StreamId, _Data, _IsFin}} ->
             %% Data received (for POST/PUT bodies)
             server_connection_loop(Conn, Handler);
-        {h2, Conn, closed} ->
+        {h2, Conn, {closed, _Reason}} ->
             ok;
-        {h2, Conn, {goaway, _LastStreamId, _ErrorCode}} ->
+        {h2, Conn, {goaway, _LastStreamId}} ->
             ok;
         _ ->
             server_connection_loop(Conn, Handler)
     end.
+
+invoke_handler(Handler, Conn, StreamId, Method, Path, Headers) when is_function(Handler, 5) ->
+    Handler(Conn, StreamId, Method, Path, Headers);
+invoke_handler(Module, Conn, StreamId, Method, Path, Headers) when is_atom(Module) ->
+    Module:handle_request(Conn, StreamId, Method, Path, Headers).
 
 %% @doc Send an HTTP/2 response (server mode).
 -spec send_response(connection(), stream_id(), status(), headers()) ->
@@ -501,6 +509,21 @@ cancel_stream(Conn, StreamId) ->
 -spec cancel_stream(connection(), stream_id(), error_code()) -> ok | {error, term()}.
 cancel_stream(Conn, StreamId, ErrorCode) ->
     cancel(Conn, StreamId, ErrorCode).
+
+%% @doc Register a pid to receive body data for a stream.
+-spec set_stream_handler(connection(), stream_id(), pid()) ->
+    ok | {ok, [{binary(), boolean()}]} | {error, term()}.
+set_stream_handler(Conn, StreamId, Pid) ->
+    h2_connection:set_stream_handler(Conn, StreamId, Pid).
+
+-spec set_stream_handler(connection(), stream_id(), pid(), map()) ->
+    ok | {ok, [{binary(), boolean()}]} | {error, term()}.
+set_stream_handler(Conn, StreamId, Pid, Opts) ->
+    h2_connection:set_stream_handler(Conn, StreamId, Pid, Opts).
+
+-spec unset_stream_handler(connection(), stream_id()) -> ok.
+unset_stream_handler(Conn, StreamId) ->
+    h2_connection:unset_stream_handler(Conn, StreamId).
 
 %% @doc Initiate graceful connection shutdown.
 -spec goaway(connection()) -> ok | {error, term()}.

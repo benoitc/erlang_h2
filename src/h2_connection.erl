@@ -20,6 +20,7 @@
 -export([activate/1]).
 -export([wait_connected/1, wait_connected/2]).
 -export([send_request/4, send_request/5, send_request_headers/3, send_response/4, send_data/3, send_data/4]).
+-export([set_stream_handler/3, set_stream_handler/4, unset_stream_handler/2]).
 -export([send_trailers/3]).
 -export([cancel_stream/2, cancel_stream/3]).
 -export([send_goaway/1, send_goaway/2, close/1]).
@@ -43,10 +44,14 @@
     window_size :: integer(),
     recv_window_size :: integer(),
     send_buffer = <<>> :: binary(),
-    pending_end_stream = false :: boolean(),  %% Track if buffered data should end stream
+    pending_end_stream = false :: boolean(),
     header_buffer = <<>> :: binary(),
     request_headers = [] :: [{binary(), binary()}],
-    response_headers = [] :: [{binary(), binary()}]
+    response_headers = [] :: [{binary(), binary()}],
+    %% Optional pid to receive body data for this stream (set_stream_handler).
+    handler :: pid() | undefined,
+    %% Data buffered before a handler is registered.
+    recv_buffer = [] :: [{binary(), boolean()}]
 }).
 
 %% Connection state
@@ -151,6 +156,22 @@ send_request(Conn, Method, Path, Headers, EndStream) ->
     {ok, non_neg_integer()} | {error, term()}.
 send_request_headers(Conn, Headers, EndStream) ->
     gen_statem:call(Conn, {send_request_headers, Headers, EndStream}).
+
+%% @doc Register a pid to receive body data for StreamId.
+%% Matches quic_h3:set_stream_handler/3,4.
+-spec set_stream_handler(pid(), non_neg_integer(), pid()) ->
+    ok | {ok, [{binary(), boolean()}]} | {error, term()}.
+set_stream_handler(Conn, StreamId, Pid) ->
+    set_stream_handler(Conn, StreamId, Pid, #{}).
+
+-spec set_stream_handler(pid(), non_neg_integer(), pid(), map()) ->
+    ok | {ok, [{binary(), boolean()}]} | {error, term()}.
+set_stream_handler(Conn, StreamId, Pid, Opts) ->
+    gen_statem:call(Conn, {set_stream_handler, StreamId, Pid, Opts}).
+
+-spec unset_stream_handler(pid(), non_neg_integer()) -> ok.
+unset_stream_handler(Conn, StreamId) ->
+    gen_statem:call(Conn, {unset_stream_handler, StreamId}).
 
 %% @doc Send a response (server mode).
 -spec send_response(pid(), non_neg_integer(), non_neg_integer(), [{binary(), binary()}]) ->
@@ -260,17 +281,18 @@ init({Mode, Socket, Owner, Opts}) ->
 
     {ok, preface, State}.
 
-terminate(_Reason, _StateName, #state{socket = Socket, transport = Transport, goaway_sent = GoawaySent}) ->
+terminate(Reason, _StateName, #state{socket = Socket, transport = Transport, goaway_sent = GoawaySent} = State) ->
     %% Send GOAWAY if not already sent
     case GoawaySent of
         false ->
             Frame = h2_frame:goaway(0, no_error, <<>>),
-            _ = Transport:send(Socket, h2_frame:encode(Frame)),
-            ok;
+            _ = Transport:send(Socket, h2_frame:encode(Frame));
         true ->
             ok
     end,
     Transport:close(Socket),
+    %% Notify owner exactly once that the connection is gone.
+    notify_owner({h2, self(), {closed, peel_reason(Reason)}}, State),
     ok.
 
 code_change(_OldVsn, StateName, State, _Extra) ->
@@ -381,10 +403,8 @@ connected(info, {ssl, Socket, Data}, #state{socket = Socket} = State) ->
     handle_data(connected, Data, State);
 
 connected(info, {tcp_closed, Socket}, #state{socket = Socket} = State) ->
-    notify_owner({h2, self(), closed}, State),
     {stop, {shutdown, tcp_closed}, State};
 connected(info, {ssl_closed, Socket}, #state{socket = Socket} = State) ->
-    notify_owner({h2, self(), closed}, State),
     {stop, {shutdown, ssl_closed}, State};
 
 connected({call, From}, {send_request, Method, Path, Headers, EndStream}, State) ->
@@ -404,6 +424,12 @@ connected({call, From}, {send_trailers, StreamId, Trailers}, State) ->
 
 connected({call, From}, {cancel_stream, StreamId, ErrorCode}, State) ->
     handle_cancel_stream(From, StreamId, ErrorCode, State);
+
+connected({call, From}, {set_stream_handler, StreamId, Pid, Opts}, State) ->
+    handle_set_stream_handler(From, StreamId, Pid, Opts, State);
+
+connected({call, From}, {unset_stream_handler, StreamId}, State) ->
+    handle_unset_stream_handler(From, StreamId, State);
 
 connected({call, From}, {send_goaway, ErrorCode}, State) ->
     handle_send_goaway(From, ErrorCode, connected, State);
@@ -641,8 +667,8 @@ handle_frame(_StateName, {ping_ack, _Data}, State) ->
     %% PING response received
     {ok, connected, State};
 
-handle_frame(StateName, {goaway, LastStreamId, ErrorCode, _DebugData}, State) ->
-    notify_owner({h2, self(), {goaway, LastStreamId, h2_error:name(ErrorCode)}}, State),
+handle_frame(StateName, {goaway, LastStreamId, _ErrorCode, _DebugData}, State) ->
+    notify_owner({h2, self(), {goaway, LastStreamId}}, State),
     State1 = State#state{goaway_received = true, last_stream_id = LastStreamId},
     case StateName of
         goaway_sent -> {stop, {shutdown, goaway_exchange}, State1};
@@ -1166,13 +1192,11 @@ handle_data_frame(StreamId, Data, EndStream, #state{streams = Streams, recv_conn
                                     Stream1
                             end,
 
-                            State1 = State#state{
+                            {Stream3, State0} = dispatch_data(StreamId, Stream2, Data, EndStream, State),
+                            State1 = State0#state{
                                 recv_conn_window_size = NewConnWindow,
-                                streams = maps:put(StreamId, Stream2, Streams)
+                                streams = maps:put(StreamId, Stream3, Streams)
                             },
-
-                            %% Notify owner
-                            notify_owner({h2, self(), {data, StreamId, Data, EndStream}}, State1),
 
                             %% Send WINDOW_UPDATE if needed
                             State2 = maybe_send_window_update(StreamId, DataSize, State1),
@@ -1480,12 +1504,56 @@ handle_cancel_stream(From, StreamId, ErrorCode, #state{streams = Streams} = Stat
             {keep_state, State, [{reply, From, {error, unknown_stream}}]}
     end.
 
+handle_set_stream_handler(From, StreamId, Pid, Opts, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream{recv_buffer = Buf} = Stream} ->
+            Drain = maps:get(drain_buffer, Opts, true),
+            Stream1 = Stream#stream{handler = Pid, recv_buffer = []},
+            State1 = put_stream(StreamId, Stream1, State),
+            Reply = case {Drain, Buf} of
+                {true, []}      -> ok;
+                {true, _}       -> {ok, lists:reverse(Buf)};
+                {false, _} ->
+                    %% Re-send buffered data as messages to the handler.
+                    lists:foreach(fun({D, Fin}) ->
+                        Pid ! {h2, self(), {data, StreamId, D, Fin}}
+                    end, lists:reverse(Buf)),
+                    ok
+            end,
+            {keep_state, State1, [{reply, From, Reply}]};
+        error ->
+            {keep_state, State, [{reply, From, {error, unknown_stream}}]}
+    end.
+
+handle_unset_stream_handler(From, StreamId, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            Stream1 = Stream#stream{handler = undefined},
+            State1 = put_stream(StreamId, Stream1, State),
+            {keep_state, State1, [{reply, From, ok}]};
+        error ->
+            {keep_state, State, [{reply, From, ok}]}
+    end.
+
+%% Deliver DATA to the stream's registered handler, or fall back to the
+%% mode default (client→owner, server→buffer for later handler).
+%% Matches quic_h3:notify_stream_data/4 semantics.
+dispatch_data(StreamId, #stream{handler = Pid} = Stream, Data, Fin, State) when is_pid(Pid) ->
+    Pid ! {h2, self(), {data, StreamId, Data, Fin}},
+    {Stream, State};
+dispatch_data(StreamId, #stream{} = Stream, Data, Fin, #state{mode = client} = State) ->
+    notify_owner({h2, self(), {data, StreamId, Data, Fin}}, State),
+    {Stream, State};
+dispatch_data(_StreamId, #stream{recv_buffer = Buf} = Stream, Data, Fin, State) ->
+    {Stream#stream{recv_buffer = [{Data, Fin} | Buf]}, State}.
+
 handle_send_goaway(From, ErrorCode, CurrentState, State) ->
     %% RFC 7540 §6.8: two-phase GOAWAY. Send a "shutdown warning" first with
     %% LastStreamID = 2^31-1 and NO_ERROR so the peer can finish in-flight
     %% streams; after a brief drain, send the real GOAWAY with the actual
     %% last_peer_stream_id and close.
     State1 = send_goaway_frame(?MAX_STREAM_ID, no_error, State),
+    notify_owner({h2, self(), goaway_sent}, State1),
     DrainTimer = erlang:start_timer(?GOAWAY_DRAIN_MS, self(), goaway_drain),
     State2 = State1#state{
         goaway_error = ErrorCode,

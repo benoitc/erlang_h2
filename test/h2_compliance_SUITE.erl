@@ -53,8 +53,18 @@
     ping_test/1,
 
     %% Trailers tests
-    trailers_test/1
+    trailers_test/1,
+
+    %% API parity (quic_h3) tests
+    connected_event_test/1,
+    goaway_event_test/1,
+    closed_event_test/1,
+    stream_handler_test/1,
+    handler_module_test/1
 ]).
+
+%% Module-style handler callback used by handler_module_test.
+-export([handle_request/5]).
 
 %% ============================================================================
 %% CT Callbacks
@@ -71,7 +81,8 @@ all() ->
         {group, flow_control},
         {group, stream_state},
         {group, error_handling},
-        {group, misc}
+        {group, misc},
+        {group, api_parity}
     ].
 
 groups() ->
@@ -112,6 +123,13 @@ groups() ->
         {misc, [sequence], [
             ping_test,
             trailers_test
+        ]},
+        {api_parity, [sequence], [
+            connected_event_test,
+            goaway_event_test,
+            closed_event_test,
+            stream_handler_test,
+            handler_module_test
         ]}
     ].
 
@@ -725,6 +743,150 @@ trailers_test(Config) ->
 
     h2:close(Conn),
     ok.
+
+%% ============================================================================
+%% API parity (quic_h3) tests
+%% ============================================================================
+
+connected_event_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    %% The 'connected' event must arrive (may have been delivered before this
+    %% receive runs since wait_connected is synchronous).
+    receive
+        {h2, Conn, connected} -> ok
+    after 1000 ->
+        ct:fail(no_connected_event)
+    end,
+    h2:close(Conn),
+    ok.
+
+goaway_event_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    receive {h2, Conn, connected} -> ok after 1000 -> ct:fail(no_connected) end,
+    process_flag(trap_exit, true),
+    ok = h2:goaway(Conn),
+    %% Local sender sees goaway_sent event.
+    receive
+        {h2, Conn, goaway_sent} -> ok
+    after 2000 ->
+        ct:fail(no_goaway_sent_event)
+    end,
+    catch h2:close(Conn),
+    drain_exits(),
+    ok.
+
+closed_event_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    receive {h2, Conn, connected} -> ok after 1000 -> ct:fail(no_connected) end,
+    %% Stop the server; the client should see {closed, _}.
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        ServerRef -> h2:stop_server(ServerRef)
+    end,
+    receive
+        {h2, Conn, {closed, _Reason}} -> ok
+    after 2000 ->
+        ct:fail(no_closed_event)
+    end,
+    catch h2:close(Conn),
+    drain_exits(),
+    ok.
+
+stream_handler_test(Config) ->
+    Self = self(),
+    %% Re-start a server in this test that hands POST bodies off to a worker
+    %% via set_stream_handler/3.
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    Handler = fun(Conn, StreamId, <<"POST">>, _Path, _Headers) ->
+        Worker = spawn(fun() ->
+            receive
+                {start, Sid} ->
+                    Body = collect_body(Conn, Sid, <<>>),
+                    Self ! {worker_got, Body}
+            end
+        end),
+        case h2:set_stream_handler(Conn, StreamId, Worker) of
+            ok ->
+                Worker ! {start, StreamId},
+                ok;
+            {ok, Buffered} ->
+                Worker ! {start, StreamId},
+                lists:foreach(fun({D, Fin}) ->
+                    Worker ! {h2, Conn, {data, StreamId, D, Fin}}
+                end, Buffered),
+                ok
+        end,
+        h2:send_response(Conn, StreamId, 200, []),
+        h2:send_data(Conn, StreamId, <<"ok">>, true);
+    (Conn, StreamId, _Method, _Path, _Headers) ->
+        h2:send_response(Conn, StreamId, 405, []),
+        h2:send_data(Conn, StreamId, <<>>, true)
+    end,
+    {ok, ServerRef} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => Handler
+    }),
+    Port2 = h2:server_port(ServerRef),
+    {ok, Conn} = h2:connect("localhost", Port2, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, Sid} = h2:request(Conn, <<"POST">>, <<"/upload">>, [
+        {<<"host">>, <<"localhost">>}
+    ], <<"hello world">>),
+    Resp = receive_full_response(Conn, Sid, 2000),
+    ?assertMatch({200, _, <<"ok">>}, Resp),
+    receive
+        {worker_got, Body} ->
+            ?assertEqual(<<"hello world">>, Body)
+    after 2000 ->
+        ct:fail(worker_no_body)
+    end,
+    h2:close(Conn),
+    h2:stop_server(ServerRef),
+    drain_exits(),
+    ok.
+
+handler_module_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    {ok, ServerRef} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => ?MODULE  %% module-style callback; uses handle_request/5 below
+    }),
+    Port2 = h2:server_port(ServerRef),
+    {ok, Conn} = h2:connect("localhost", Port2, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, Sid} = h2:request(Conn, <<"GET">>, <<"/m">>, [
+        {<<"host">>, <<"localhost">>}
+    ]),
+    Resp = receive_full_response(Conn, Sid, 2000),
+    ?assertMatch({201, _, <<"module-handler">>}, Resp),
+    h2:close(Conn),
+    h2:stop_server(ServerRef),
+    drain_exits(),
+    ok.
+
+%% Module callback used by handler_module_test.
+handle_request(Conn, StreamId, _Method, _Path, _Headers) ->
+    h2:send_response(Conn, StreamId, 201, [{<<"content-type">>, <<"text/plain">>}]),
+    h2:send_data(Conn, StreamId, <<"module-handler">>, true).
+
+collect_body(Conn, StreamId, Acc) ->
+    receive
+        {h2, Conn, {data, StreamId, Data, true}} ->
+            <<Acc/binary, Data/binary>>;
+        {h2, Conn, {data, StreamId, Data, false}} ->
+            collect_body(Conn, StreamId, <<Acc/binary, Data/binary>>)
+    after 2000 ->
+        Acc
+    end.
 
 %% ============================================================================
 %% Helper Functions
