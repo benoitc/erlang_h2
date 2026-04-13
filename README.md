@@ -2,9 +2,10 @@
 
 HTTP/2 client and server for Erlang/OTP.
 
-- Full **RFC 7540** protocol (frames, streams, flow control, SETTINGS negotiation, GOAWAY, CONTINUATION).
+- Full **RFC 7540 / RFC 9113** protocol (frames, streams, flow control, SETTINGS negotiation, GOAWAY, CONTINUATION, malformed-message enforcement).
 - **RFC 7541** HPACK with static + dynamic tables and Huffman coding.
 - **RFC 7540 §8.3** CONNECT tunnel mode for bidirectional byte streams.
+- **RFC 8441** Extended CONNECT (`:protocol` pseudo-header) for bootstrapping WebSockets and similar protocols over HTTP/2.
 - ALPN `h2` over TLS 1.2+ by default; cleartext (`h2c` over plain TCP) also supported.
 - Owner-process event messages (`{h2, Conn, Event}`) mirroring the [`quic_h3`](https://github.com/benoitc/erlang_quic) HTTP/3 API so cross-protocol code stays symmetric.
 
@@ -41,8 +42,9 @@ Messages delivered to the owner process:
 | Message | Meaning |
 |---|---|
 | `{h2, Conn, connected}` | handshake + SETTINGS exchange complete |
-| `{h2, Conn, {response, StreamId, Status, Headers}}` | response headers |
-| `{h2, Conn, {data, StreamId, Data, EndStream}}` | response body fragment |
+| `{h2, Conn, {response, StreamId, Status, Headers}}` | final response headers (2xx–5xx) |
+| `{h2, Conn, {informational, StreamId, Status, Headers}}` | 1xx interim response (100/103/…) |
+| `{h2, Conn, {data, StreamId, Data, EndStream}}` | response body fragment (an empty final frame marks end-of-stream for body-less responses) |
 | `{h2, Conn, {trailers, StreamId, Headers}}` | response trailers |
 | `{h2, Conn, {stream_reset, StreamId, ErrorCode}}` | peer sent RST_STREAM |
 | `{h2, Conn, {goaway, LastStreamId, ErrorCode}}` | peer is shutting down |
@@ -89,12 +91,14 @@ ok = h2:stop_server(Server).
 Options to `h2:start_server/2,3`:
 
 ```erlang
-#{cert      := binary() | string(),
-  key       := binary() | string(),
-  cacerts   => [binary()],
-  handler   := fun((Conn, StreamId, Method, Path, Headers) -> any()),
-  settings  => h2_settings:settings(),
-  acceptors => pos_integer()}        %% default: 10
+#{cert                    := binary() | string(),
+  key                     := binary() | string(),
+  cacerts                 => [binary()],
+  handler                 := fun((Conn, StreamId, Method, Path, Headers) -> any()),
+  settings                => h2_settings:settings(),
+  acceptors               => pos_integer(),       %% default: schedulers
+  transport               => ssl | tcp,           %% default: ssl
+  enable_connect_protocol => boolean()}           %% RFC 8441, default: false
 ```
 
 A module handler (`handler => {Mod, Args}`) is also supported; `Mod:handle_request/5` receives the same arguments.
@@ -172,8 +176,10 @@ If the peer never advertised the setting, `h2:request/3` returns `{error, extend
 
 ```bash
 rebar3 compile
-rebar3 eunit          # 286 tests + 800 PropEr properties
-rebar3 ct             # 32 compliance + API-parity + tunnel cases
+rebar3 eunit          # 310 tests + 800 PropEr properties
+rebar3 ct             # 54 compliance + API-parity + tunnel cases
+rebar3 dialyzer       # clean
+rebar3 xref           # clean
 rebar3 ex_doc         # HTML docs
 ```
 

@@ -4,7 +4,7 @@
 
 ## Supported
 
-### Protocol (RFC 7540)
+### Protocol (RFC 7540 / RFC 9113)
 
 - Connection preface (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) and exact-match validation on the server.
 - All frame types: `DATA`, `HEADERS`, `PRIORITY`, `RST_STREAM`, `SETTINGS`, `PING`, `GOAWAY`, `WINDOW_UPDATE`, `CONTINUATION`. `PUSH_PROMISE` is decoded but not generated (push disabled).
@@ -14,7 +14,14 @@
 - Two-phase GOAWAY: graceful drain window before socket close.
 - CONTINUATION interleaving: only CONTINUATION frames on the same stream accepted between HEADERS and END_HEADERS; anything else is a `PROTOCOL_ERROR`.
 - Pseudo-header validation: required set per direction, order rule, lowercase header names, `:path` non-empty for non-CONNECT, `:authority` / `Host` consistency.
+- Field syntax: names restricted to RFC 7230 `tchar` (rejects SP/HTAB/colon in regular headers, DEL, non-ASCII); values reject NUL/CR/LF and leading/trailing SP/HTAB.
 - Connection-specific headers rejected (`Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding`, `Upgrade`).
+- `Content-Length` enforcement (§8.1.1): mismatched duplicates, non-numeric/negative values, DATA overshoot or END_STREAM mismatch → stream `PROTOCOL_ERROR`.
+- Body forbidden on HEAD responses, 1xx, 204, 304 — enforced via stream flag.
+- 1xx interim responses delivered as a distinct `informational` event; 101 rejected on both send and receive (§8.6).
+- `SETTINGS_MAX_HEADER_LIST_SIZE` enforced in both directions (outbound: `{error, header_list_too_large}`; inbound: stream `PROTOCOL_ERROR`).
+- Padded DATA: full padded payload counted against the flow-control window; post-reset DATA still consumes the connection window.
+- Oversized HEADERS blocks automatically split into HEADERS + CONTINUATION chain (§4.2).
 - Error codes per §7 plus per-type stream-id validation on receive.
 - CONNECT tunnel mode (§8.3): a 2xx response promotes the stream to a raw byte tunnel; `END_STREAM` is half-close, trailers rejected, CL/TE rejected.
 - Extended CONNECT (RFC 8441): server opt-in via `enable_connect_protocol => true` advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL=1`; client opts in via `h2:request(Conn, Headers, #{protocol => <<"websocket">>})`. `:scheme`, `:path`, `:authority`, `:protocol` all required; client refuses with `{error, extended_connect_disabled}` until the peer has advertised the setting; server rejects inbound `:protocol` with `PROTOCOL_ERROR` if it has not opted in. Tunnel semantics same as vanilla CONNECT.
@@ -68,12 +75,15 @@ See the README for usage snippets and `src/h2.erl` for full edoc.
 ```erlang
 {h2, Conn, connected}
 {h2, Conn, {response, StreamId, Status, Headers}}
+{h2, Conn, {informational, StreamId, Status, Headers}}    %% 1xx interim
 {h2, Conn, {data, StreamId, Data, EndStream}}
 {h2, Conn, {trailers, StreamId, Headers}}
 {h2, Conn, {stream_reset, StreamId, ErrorCode}}
 {h2, Conn, {goaway, LastStreamId, ErrorCode}}
 {h2, Conn, {closed, Reason}}
 ```
+
+Per-stream events (`data`, `trailers`, `stream_reset`) are routed to the process registered via `h2:set_stream_handler/3,4` if set; otherwise they fall back to the connection owner.
 
 Identical shape to `quic_h3` so application code that dispatches on protocol events can be shared between h2 and h3.
 
@@ -101,5 +111,6 @@ Useful to know when extending or debugging:
 
 ## Testing
 
-- `rebar3 eunit` — 286 unit tests and 800 PropEr properties across frame/HPACK/settings/varint.
-- `rebar3 ct` — 32 Common Test cases: RFC compliance, client/server round-trips, CONNECT tunnel, API-parity with `quic_h3`, error paths.
+- `rebar3 eunit` — 310 unit tests and 800 PropEr properties across frame/HPACK/settings/varint.
+- `rebar3 ct` — 54 Common Test cases: RFC compliance, client/server round-trips, CONNECT and Extended CONNECT tunnels, API-parity with `quic_h3`, malformed-message enforcement, flow-control accounting, error paths.
+- `rebar3 dialyzer` / `rebar3 xref` — clean.
