@@ -146,8 +146,12 @@ connect_ssl(Host, Port, Opts, Timeout) ->
         {alpn_advertised_protocols, [<<"h2">>]},
         {versions, ['tlsv1.2', 'tlsv1.3']}
     ],
+    %% Honor top-level verify and cacerts from connect_opts(), merged with
+    %% any explicit ssl_opts (ssl_opts takes precedence).
+    TopLevel = [{verify, V} || V <- [maps:get(verify, Opts, undefined)], V =/= undefined]
+               ++ [{cacerts, C} || C <- [maps:get(cacerts, Opts, undefined)], C =/= undefined],
     SSLOpts0 = maps:get(ssl_opts, Opts, []),
-    SSLOpts = merge_opts(DefaultSSLOpts, SSLOpts0),
+    SSLOpts = merge_opts(merge_opts(DefaultSSLOpts, TopLevel), SSLOpts0),
 
     case ssl:connect(Host, Port, SSLOpts, Timeout) of
         {ok, Socket} ->
@@ -291,36 +295,32 @@ start_server(Name, Port, Opts) when is_atom(Name) ->
 -spec start_server(inet:port_number(), server_opts()) ->
     {ok, server_ref()} | {error, term()}.
 start_server(Port, Opts) ->
-    %% Validate required options
+    Transport = maps:get(transport, Opts, ssl),
+    case Transport of
+        ssl -> start_server_ssl(Port, Opts);
+        tcp -> start_server_tcp(Port, Opts)
+    end.
+
+start_server_ssl(Port, Opts) ->
     case {maps:find(cert, Opts), maps:find(key, Opts), maps:find(handler, Opts)} of
         {{ok, Cert}, {ok, Key}, {ok, Handler}} ->
             NumAcceptors = maps:get(acceptors, Opts, erlang:system_info(schedulers)),
             Settings = maps:get(settings, Opts, #{}),
             CACerts = maps:get(cacerts, Opts, []),
-
-            %% Load certificates
             CertFile = load_file(Cert),
             KeyFile = load_file(Key),
-
             SSLOpts = [
                 {certfile, CertFile},
                 {keyfile, KeyFile},
                 {alpn_preferred_protocols, [<<"h2">>]},
                 {versions, ['tlsv1.2', 'tlsv1.3']},
                 {reuseaddr, true},
-                %% Keep accepted sockets passive until h2_connection
-                %% explicitly calls setopts({active, once}) after the
-                %% ownership transfer. Otherwise data can slip into the
-                %% acceptor's mailbox between ssl:handshake and the
-                %% passive-mode setopts, and be lost on ownership transfer.
                 {active, false},
                 {mode, binary}
             ] ++ case CACerts of
                 [] -> [];
                 _ -> [{cacerts, CACerts}, {verify, verify_peer}]
             end,
-
-            %% Start listener
             case ssl:listen(Port, SSLOpts) of
                 {ok, ListenSocket} ->
                     {ok, {_, BoundPort}} = ssl:sockname(ListenSocket),
@@ -331,22 +331,56 @@ start_server(Port, Opts) ->
                         settings => Settings,
                         ref => Ref
                     },
-
                     Self = self(),
                     AcceptorPids = [spawn_link(fun() ->
                         acceptor_loop(Self, ServerState)
                     end) || _ <- lists:seq(1, NumAcceptors)],
-
                     ManagerPid = spawn_link(fun() ->
                         server_manager_loop(ListenSocket, AcceptorPids, Ref)
                     end),
-
                     {ok, {ManagerPid, Ref, BoundPort}};
                 {error, Reason} ->
                     {error, {listen_failed, Reason}}
             end;
         _ ->
             {error, {missing_required_option, [cert, key, handler]}}
+    end.
+
+%% Cleartext (h2c over TCP, prior-knowledge) server listener.
+start_server_tcp(Port, Opts) ->
+    case maps:find(handler, Opts) of
+        {ok, Handler} ->
+            NumAcceptors = maps:get(acceptors, Opts, erlang:system_info(schedulers)),
+            Settings = maps:get(settings, Opts, #{}),
+            TCPOpts = [
+                {reuseaddr, true},
+                {active, false},
+                {mode, binary},
+                {packet, raw}
+            ],
+            case gen_tcp:listen(Port, TCPOpts) of
+                {ok, ListenSocket} ->
+                    {ok, {_, BoundPort}} = inet:sockname(ListenSocket),
+                    Ref = make_ref(),
+                    ServerState = #{
+                        listen_socket => ListenSocket,
+                        handler => Handler,
+                        settings => Settings,
+                        ref => Ref
+                    },
+                    Self = self(),
+                    AcceptorPids = [spawn_link(fun() ->
+                        tcp_acceptor_loop(Self, ServerState)
+                    end) || _ <- lists:seq(1, NumAcceptors)],
+                    ManagerPid = spawn_link(fun() ->
+                        tcp_server_manager_loop(ListenSocket, AcceptorPids, Ref)
+                    end),
+                    {ok, {ManagerPid, Ref, BoundPort}};
+                {error, Reason} ->
+                    {error, {listen_failed, Reason}}
+            end;
+        _ ->
+            {error, {missing_required_option, [handler]}}
     end.
 
 %% @doc Stop an HTTP/2 server.
@@ -427,19 +461,79 @@ acceptor_loop_inner(Owner, #{listen_socket := ListenSocket, handler := Handler, 
     end.
 
 handle_server_connection(Socket, Handler, Settings) ->
+    handle_server_connection(Socket, Handler, Settings, ssl).
+
+handle_server_connection(Socket, Handler, Settings, Transport) ->
     ConnOpts = #{settings => Settings},
+    TransferFn = case Transport of
+        ssl -> fun ssl:controlling_process/2;
+        gen_tcp -> fun gen_tcp:controlling_process/2
+    end,
+    CloseFn = case Transport of
+        ssl -> fun ssl:close/1;
+        gen_tcp -> fun gen_tcp:close/1
+    end,
     case h2_connection:start_link(server, Socket, self(), ConnOpts) of
         {ok, Conn} ->
-            case ssl:controlling_process(Socket, Conn) of
+            case TransferFn(Socket, Conn) of
                 ok ->
                     _ = h2_connection:activate(Conn),
                     server_connection_loop(Conn, Handler);
                 {error, _} ->
                     catch h2_connection:close(Conn),
-                    catch ssl:close(Socket)
+                    catch CloseFn(Socket)
             end;
         {error, _Reason} ->
-            catch ssl:close(Socket)
+            catch CloseFn(Socket)
+    end.
+
+tcp_server_manager_loop(ListenSocket, AcceptorPids, Ref) ->
+    process_flag(trap_exit, true),
+    tcp_server_manager_loop_inner(ListenSocket, AcceptorPids, Ref).
+
+tcp_server_manager_loop_inner(ListenSocket, AcceptorPids, Ref) ->
+    receive
+        {stop, Ref} ->
+            lists:foreach(fun(Pid) -> exit(Pid, shutdown) end, AcceptorPids),
+            _ = gen_tcp:close(ListenSocket),
+            ok;
+        {'EXIT', Pid, _Reason} ->
+            NewPids = lists:delete(Pid, AcceptorPids),
+            tcp_server_manager_loop_inner(ListenSocket, NewPids, Ref);
+        _ ->
+            tcp_server_manager_loop_inner(ListenSocket, AcceptorPids, Ref)
+    end.
+
+tcp_acceptor_loop(Owner, State) ->
+    process_flag(trap_exit, true),
+    tcp_acceptor_loop_inner(Owner, State).
+
+tcp_acceptor_loop_inner(Owner, #{listen_socket := ListenSocket, handler := Handler, settings := Settings} = State) ->
+    case gen_tcp:accept(ListenSocket, infinity) of
+        {ok, Socket} ->
+            _ = inet:setopts(Socket, [{active, false}]),
+            Pid = spawn_link(fun() ->
+                receive
+                    {socket_ready, Sock} ->
+                        handle_server_connection(Sock, Handler, Settings, gen_tcp);
+                    {socket_transfer_failed, _} ->
+                        ok
+                end
+            end),
+            case gen_tcp:controlling_process(Socket, Pid) of
+                ok ->
+                    Pid ! {socket_ready, Socket},
+                    ok;
+                {error, TransferReason} ->
+                    Pid ! {socket_transfer_failed, TransferReason},
+                    _ = gen_tcp:close(Socket),
+                    ok
+            end,
+            tcp_acceptor_loop_inner(Owner, State);
+        {error, closed} ->
+            exit(shutdown);
+        {error, _Reason} ->
+            tcp_acceptor_loop_inner(Owner, State)
     end.
 
 server_connection_loop(Conn, Handler) ->

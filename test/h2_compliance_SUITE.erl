@@ -79,7 +79,11 @@
     leading_space_value_rejected_test/1,
     invalid_name_chars_rejected_test/1,
     large_request_split_test/1,
-    peer_max_header_list_size_enforced_test/1
+    peer_max_header_list_size_enforced_test/1,
+    connect_verify_option_honored_test/1,
+    tcp_server_round_trip_test/1,
+    stream_handler_receives_trailers_test/1,
+    empty_response_emits_trailing_data_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -169,7 +173,11 @@ groups() ->
             leading_space_value_rejected_test,
             invalid_name_chars_rejected_test,
             large_request_split_test,
-            peer_max_header_list_size_enforced_test
+            peer_max_header_list_size_enforced_test,
+            connect_verify_option_honored_test,
+            tcp_server_round_trip_test,
+            stream_handler_receives_trailers_test,
+            empty_response_emits_trailing_data_test
         ]}
     ].
 
@@ -1359,6 +1367,118 @@ peer_max_header_list_size_enforced_test(Config) ->
     ?assertEqual({error, header_list_too_large},
         h2:request(Conn, <<"GET">>, <<"/">>,
                    [{<<"host">>, <<"l">>}, {<<"x-big">>, Big}])),
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% h2:connect/3 top-level verify option is honored.
+connect_verify_option_honored_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{verify => verify_none}),
+    {ok, _Sid} = h2:request(Conn, <<"GET">>, <<"/">>, [{<<"host">>, <<"localhost">>}]),
+    h2:close(Conn),
+    drain_exits(),
+    ok.
+
+%% transport => tcp starts a cleartext listener and round-trips a request.
+tcp_server_round_trip_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        transport => tcp,
+        handler => fun(Conn, Sid, _, _, _) ->
+            h2:send_response(Conn, Sid, 200, []),
+            h2:send_data(Conn, Sid, <<"ok">>, true)
+        end
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{transport => tcp}),
+    {ok, Sid} = h2:request(Conn, <<"GET">>, <<"/">>, [{<<"host">>, <<"localhost">>}]),
+    receive
+        {h2, Conn, {response, Sid, 200, _}} -> ok
+    after 2000 -> ct:fail(no_response) end,
+    receive
+        {h2, Conn, {data, Sid, <<"ok">>, true}} -> ok
+    after 2000 -> ct:fail(no_body) end,
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% A process registered as a stream handler receives trailers.
+stream_handler_receives_trailers_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    Self = self(),
+    Handler = fun(Conn, Sid, _, _, _) ->
+        case h2:set_stream_handler(Conn, Sid, Self) of
+            ok -> ok;
+            {ok, _Buf} -> ok
+        end,
+        Self ! {ready, Conn, Sid},
+        %% Block briefly so the trailer event is processed before this exits.
+        timer:sleep(800)
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => Handler
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    %% Open stream without END_STREAM so we can add DATA + trailers.
+    {ok, Sid} = h2:request(Conn, [
+        {<<":method">>, <<"POST">>},
+        {<<":path">>, <<"/">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"localhost">>}
+    ], #{end_stream => false}),
+    receive {ready, _, _} -> ok after 2000 -> ct:fail(no_handler) end,
+    ok = h2:send_data(Conn, Sid, <<"body">>, false),
+    ok = h2:send_trailers(Conn, Sid, [{<<"x-trail">>, <<"v">>}]),
+    receive
+        {h2, _SrvConn, {trailers, _, Trailers}} ->
+            ?assertEqual(<<"v">>, proplists:get_value(<<"x-trail">>, Trailers))
+    after 2500 ->
+        ct:fail(no_trailers)
+    end,
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% Body-less response (204) should still deliver a trailing {data, _, <<>>, true}
+%% event so clients waiting for end-of-stream don't hang. Matches quic_h3.
+empty_response_emits_trailing_data_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    Handler = fun(Conn, Sid, _, _, _) ->
+        h2:send_response(Conn, Sid, 204, []),
+        %% Force HEADERS with END_STREAM by sending empty DATA with fin.
+        h2:send_data(Conn, Sid, <<>>, true)
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => Handler
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{verify => verify_none}),
+    {ok, Sid} = h2:request(Conn, <<"GET">>, <<"/">>, [{<<"host">>, <<"l">>}]),
+    receive {h2, Conn, {response, Sid, 204, _}} -> ok
+    after 2000 -> ct:fail(no_response) end,
+    receive
+        {h2, Conn, {data, Sid, <<>>, true}} -> ok
+    after 1500 ->
+        ct:fail(no_trailing_data)
+    end,
     h2:close(Conn),
     h2:stop_server(Ref),
     drain_exits(),

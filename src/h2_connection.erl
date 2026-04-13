@@ -771,7 +771,7 @@ handle_frame(_StateName, {rst_stream, StreamId, ErrorCode},
     %% never opened by either side) is a connection PROTOCOL_ERROR.
     case maps:is_key(StreamId, Streams) orelse in_closed_stream_range(StreamId, State) of
         true ->
-            notify_owner({h2, self(), {stream_reset, StreamId, h2_error:name(ErrorCode)}}, State),
+            notify_stream(StreamId, {stream_reset, StreamId, h2_error:name(ErrorCode)}, State),
             State1 = close_stream(StreamId, State),
             {ok, connected, State1};
         false ->
@@ -1045,7 +1045,7 @@ decode_and_process_headers_cont(Kind, StreamId, Headers, EndStream, #state{mode 
                 true ->
                     Stream1 = Stream#stream{state = closed},
                     State2 = put_stream(StreamId, Stream1, State1),
-                    notify_owner({h2, self(), {trailers, StreamId, Headers}}, State2),
+                    notify_stream(StreamId, {trailers, StreamId, Headers}, State2),
                     State3 = close_stream(StreamId, State2),
                     {ok, connected, State3}
             end;
@@ -1085,6 +1085,14 @@ decode_and_process_headers_cont(Kind, StreamId, Headers, EndStream, #state{mode 
                                             State3 = close_stream(StreamId, State2),
                                             {ok, connected, State3};
                                         false ->
+                                            %% Body-less response (HEAD / 204 /
+                                            %% 304 / empty): emit a trailing
+                                            %% empty DATA event so clients that
+                                            %% wait for end-of-stream don't
+                                            %% hang. Matches quic_h3.
+                                            notify_stream(StreamId,
+                                                {data, StreamId, <<>>, true},
+                                                State2),
                                             State3 = close_stream(StreamId, State2),
                                             {ok, connected, State3}
                                     end;
@@ -2128,6 +2136,18 @@ is_ssl_socket(_) ->
 notify_owner(Msg, #state{owner = Owner}) ->
     Owner ! Msg,
     ok.
+
+%% Send a per-stream event to the registered stream handler if any, else
+%% fall back to the connection owner. Used for stream_reset and trailers so
+%% they follow the same routing as DATA dispatched via dispatch_data/5.
+notify_stream(StreamId, Event, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream{handler = Pid}} when is_pid(Pid) ->
+            Pid ! {h2, self(), Event},
+            ok;
+        _ ->
+            notify_owner({h2, self(), Event}, State)
+    end.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
