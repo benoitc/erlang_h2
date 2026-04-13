@@ -17,6 +17,7 @@
 - Connection-specific headers rejected (`Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding`, `Upgrade`).
 - Error codes per §7 plus per-type stream-id validation on receive.
 - CONNECT tunnel mode (§8.3): a 2xx response promotes the stream to a raw byte tunnel; `END_STREAM` is half-close, trailers rejected, CL/TE rejected.
+- Extended CONNECT (RFC 8441): server opt-in via `enable_connect_protocol => true` advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL=1`; client opts in via `h2:request(Conn, Headers, #{protocol => <<"websocket">>})`. `:scheme`, `:path`, `:authority`, `:protocol` all required; client refuses with `{error, extended_connect_disabled}` until the peer has advertised the setting; server rejects inbound `:protocol` with `PROTOCOL_ERROR` if it has not opted in. Tunnel semantics same as vanilla CONNECT.
 
 ### HPACK (RFC 7541)
 
@@ -82,7 +83,8 @@ Identical shape to `quic_h3` so application code that dispatches on protocol eve
 - **Stream priorities (§5.3)** — deprecated by RFC 9218 (Extensible Priorities); not implemented and not announced.
 - **HTTP/2 cleartext upgrade (§3.2)** — this release is ALPN-only. Starting an h2 connection over prior knowledge TCP is supported (`transport => tcp`), but `Upgrade: h2c` from an HTTP/1.1 request is not.
 - **Alt-Svc advertisement** — library concern, leave to the caller.
-- **Extended CONNECT / RFC 8441** — the `:protocol` pseudo-header and the `SETTINGS_ENABLE_CONNECT_PROTOCOL` setting are announced but the handshake for WebSocket-over-h2 / WebTransport is not implemented yet.
+- **WebTransport (RFC 9220)** — separate framing/setting; deferred.
+- **WebSocket framing on top of an Extended CONNECT tunnel** — out of scope here; this library exposes the tunnel via `:protocol`, the framing layer belongs in a dedicated module.
 
 ## Internal modules
 

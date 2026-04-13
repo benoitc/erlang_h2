@@ -127,6 +127,35 @@ end.
 
 Tunnel semantics: DATA frames carry raw bytes (no body-length enforcement), `END_STREAM` is a half-close, trailers are rejected, and `Content-Length` / `Transfer-Encoding` on the 2xx response are rejected.
 
+## Extended CONNECT (RFC 8441)
+
+Bootstrap WebSockets (or any protocol) over an HTTP/2 stream. Server opts in:
+
+```erlang
+{ok, Server} = h2:start_server(8443, #{
+    cert => "server.pem",
+    key => "server-key.pem",
+    handler => Handler,
+    enable_connect_protocol => true   %% advertises SETTINGS_ENABLE_CONNECT_PROTOCOL=1
+}).
+```
+
+Client uses the `protocol` opt; `:scheme`, `:path`, `:authority` are required:
+
+```erlang
+{ok, Conn} = h2:connect("localhost", 8443),
+{ok, Sid}  = h2:request(Conn, [
+    {<<":method">>, <<"CONNECT">>},
+    {<<":scheme">>, <<"https">>},
+    {<<":path">>, <<"/chat">>},
+    {<<":authority">>, <<"localhost">>}
+], #{protocol => <<"websocket">>}),
+receive {h2, Conn, {response, Sid, 200, _}} -> ok end,
+ok = h2:send_data(Conn, Sid, FrameBytes, false).
+```
+
+If the peer never advertised the setting, `h2:request/3` returns `{error, extended_connect_disabled}`. Server handlers see `:protocol` in the request `Headers` argument. Tunnel semantics (no body length, no trailers) apply once the 2xx is sent.
+
 ## Modules
 
 | Module | Purpose |
@@ -155,7 +184,6 @@ Production-oriented: spec-correct and deterministic under the in-tree CT suite. 
 - Server push (§8.2) — deprecated and rarely useful.
 - Stream priorities (§5.3) — deprecated by RFC 9218.
 - Alt-Svc and HTTP/2 cleartext upgrade (§3.2) — ALPN-only in this release.
-- Extended CONNECT / RFC 8441 `:protocol` — planned.
 
 ## License
 

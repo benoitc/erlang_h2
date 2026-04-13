@@ -5,11 +5,12 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 ## [Unreleased]
 
 ### Added
+- Extended CONNECT (RFC 8441): server opt-in via `h2:start_server(Port, #{enable_connect_protocol => true, ...})` advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL=1`. Client uses `h2:request(Conn, Headers, #{protocol => <<"websocket">>})`. New errors: `{error, extended_connect_disabled}` (peer never advertised the setting), `{error, extended_connect_method}` (`:protocol` requires `:method=CONNECT`). Inbound: server rejects `:protocol` with stream `PROTOCOL_ERROR` if it has not opted in.
 - `h2:start_server` now honors `transport => tcp` (cleartext h2c prior-knowledge listener with gen_tcp acceptor pool).
 - `h2:connect/3` top-level `verify` and `cacerts` options are merged into SSL options (typespec no longer lies).
 - Owner event `{h2, Conn, {informational, StreamId, Status, Headers}}` for 1xx interim responses (excluding 101).
 - Send-side header validation runs before HPACK encode on `send_request`, `send_request_headers`, `send_response`, and `send_trailers`.
-- CT `compliance_v2` group: 15 new cases covering second-look audit findings.
+- CT `compliance_v2` group: 22 new cases covering second-look audit findings and Extended CONNECT.
 
 ### Changed
 - Owner event `{h2, Conn, {goaway, LastStreamId}}` is now `{goaway, LastStreamId, ErrorCode}` (was always documented as 3-tuple).

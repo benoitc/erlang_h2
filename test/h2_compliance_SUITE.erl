@@ -83,7 +83,16 @@
     connect_verify_option_honored_test/1,
     tcp_server_round_trip_test/1,
     stream_handler_receives_trailers_test/1,
-    empty_response_emits_trailing_data_test/1
+    empty_response_emits_trailing_data_test/1,
+
+    %% Extended CONNECT (RFC 8441)
+    extended_connect_setting_advertised_test/1,
+    extended_connect_setting_default_off_test/1,
+    extended_connect_round_trip_test/1,
+    extended_connect_client_refuses_when_peer_disabled_test/1,
+    extended_connect_method_must_be_connect_test/1,
+    extended_connect_trailers_rejected_test/1,
+    extended_connect_server_rejects_when_disabled_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -177,7 +186,16 @@ groups() ->
             connect_verify_option_honored_test,
             tcp_server_round_trip_test,
             stream_handler_receives_trailers_test,
-            empty_response_emits_trailing_data_test
+            empty_response_emits_trailing_data_test,
+
+            %% RFC 8441 Extended CONNECT
+            extended_connect_setting_advertised_test,
+            extended_connect_setting_default_off_test,
+            extended_connect_round_trip_test,
+            extended_connect_client_refuses_when_peer_disabled_test,
+            extended_connect_method_must_be_connect_test,
+            extended_connect_trailers_rejected_test,
+            extended_connect_server_rejects_when_disabled_test
         ]}
     ].
 
@@ -1500,6 +1518,244 @@ header_value_with_nul_rejected_test(Config) ->
     h2:close(Conn),
     drain_exits(),
     ok.
+
+%% ============================================================================
+%% RFC 8441 Extended CONNECT tests
+%% ============================================================================
+
+%% Server with enable_connect_protocol=true advertises SETTINGS id 0x8 = 1.
+extended_connect_setting_advertised_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => fun(_, _, _, _, _) -> ok end,
+        enable_connect_protocol => true
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Sock} = ssl:connect("localhost", Port,
+                             [{active, false}, {mode, binary},
+                              {alpn_advertised_protocols, [<<"h2">>]},
+                              {verify, verify_none}], 5000),
+    ok = ssl:send(Sock, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>),
+    Payload = read_first_settings(Sock),
+    Pairs = parse_settings_payload(Payload),
+    %% SETTINGS_ENABLE_CONNECT_PROTOCOL = 0x8
+    ?assertEqual(1, proplists:get_value(16#8, Pairs)),
+    ssl:close(Sock),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% Default server does not advertise the setting (or sends it as 0).
+extended_connect_setting_default_off_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = ssl:connect("localhost", Port,
+                             [{active, false}, {mode, binary},
+                              {alpn_advertised_protocols, [<<"h2">>]},
+                              {verify, verify_none}], 5000),
+    ok = ssl:send(Sock, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>),
+    Payload = read_first_settings(Sock),
+    Pairs = parse_settings_payload(Payload),
+    case proplists:get_value(16#8, Pairs) of
+        undefined -> ok;
+        Value -> ?assertEqual(0, Value)
+    end,
+    ssl:close(Sock),
+    ok.
+
+%% End-to-end Extended CONNECT round-trip: client sends `:protocol = websocket`,
+%% server replies 200, both sides exchange tunnel bytes.
+extended_connect_round_trip_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    Self = self(),
+    Handler = fun(Conn, Sid, <<"CONNECT">>, _, Headers) ->
+        Self ! {ec_request, Sid, proplists:get_value(<<":protocol">>, Headers)},
+        Worker = spawn(fun() ->
+            receive {start, S} ->
+                tunnel_echo_loop(Conn, S)
+            end
+        end),
+        case h2:set_stream_handler(Conn, Sid, Worker) of
+            ok            -> Worker ! {start, Sid};
+            {ok, Buf}     ->
+                Worker ! {start, Sid},
+                lists:foreach(fun({D, F}) ->
+                    Worker ! {h2, Conn, {data, Sid, D, F}}
+                end, Buf)
+        end,
+        h2:send_response(Conn, Sid, 200, [])
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => Handler,
+        enable_connect_protocol => true
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    %% Wait for SETTINGS exchange so peer_settings reflect server opt-in.
+    timer:sleep(100),
+    {ok, Sid} = h2:request(Conn, [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/chat">>},
+        {<<":authority">>, <<"localhost">>}
+    ], #{protocol => <<"websocket">>}),
+    receive {ec_request, Sid, <<"websocket">>} -> ok
+    after 2000 -> ct:fail(no_extended_connect_seen_by_server) end,
+    receive {h2, Conn, {response, Sid, 200, _}} -> ok
+    after 2000 -> ct:fail(no_response) end,
+    ok = h2:send_data(Conn, Sid, <<"hello">>, false),
+    receive {h2, Conn, {data, Sid, <<"hello">>, false}} -> ok
+    after 2000 -> ct:fail(no_echo) end,
+    ok = h2:send_data(Conn, Sid, <<"bye">>, true),
+    receive {h2, Conn, {data, Sid, <<"bye">>, true}} -> ok
+    after 2000 -> ct:fail(no_final_echo) end,
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% Client sending Extended CONNECT to a server that did not advertise the
+%% setting must fail with extended_connect_disabled before any frame is sent.
+extended_connect_client_refuses_when_peer_disabled_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    timer:sleep(100),
+    Result = h2:request(Conn, [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/chat">>},
+        {<<":authority">>, <<"localhost">>}
+    ], #{protocol => <<"websocket">>}),
+    ?assertEqual({error, extended_connect_disabled}, Result),
+    h2:close(Conn),
+    drain_exits(),
+    ok.
+
+%% `:protocol` requires `:method=CONNECT`; any other method is rejected client-side.
+extended_connect_method_must_be_connect_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => fun(_, _, _, _, _) -> ok end,
+        enable_connect_protocol => true
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    timer:sleep(100),
+    Result = h2:request(Conn, [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/chat">>},
+        {<<":authority">>, <<"localhost">>},
+        {<<":protocol">>, <<"websocket">>}
+    ], #{end_stream => false}),
+    ?assertEqual({error, extended_connect_method}, Result),
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% Trailers stay forbidden on the tunnel established by Extended CONNECT.
+extended_connect_trailers_rejected_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    Self = self(),
+    Handler = fun(Conn, Sid, <<"CONNECT">>, _, _) ->
+        h2:send_response(Conn, Sid, 200, []),
+        Result = h2:send_trailers(Conn, Sid, [{<<"x">>, <<"y">>}]),
+        Self ! {trailer_result, Result},
+        receive after 500 -> ok end
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => Handler,
+        enable_connect_protocol => true
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    timer:sleep(100),
+    {ok, Sid} = h2:request(Conn, [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/c">>},
+        {<<":authority">>, <<"localhost">>}
+    ], #{protocol => <<"websocket">>}),
+    receive {h2, Conn, {response, Sid, 200, _}} -> ok
+    after 2000 -> ct:fail(no_response) end,
+    receive {trailer_result, {error, tunnel_no_trailers}} -> ok
+    after 2000 -> ct:fail(trailers_not_rejected) end,
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% Server that did NOT advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1 must reject
+%% an inbound HEADERS frame carrying `:protocol` with stream-level PROTOCOL_ERROR
+%% (RFC 8441 §4). Uses raw SSL to bypass the client guard.
+extended_connect_server_rejects_when_disabled_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = ssl:connect("localhost", Port,
+                             [{active, false}, {mode, binary},
+                              {alpn_advertised_protocols, [<<"h2">>]},
+                              {verify, verify_none}], 5000),
+    %% Preface + empty SETTINGS.
+    ok = ssl:send(Sock, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:settings([]))),
+    %% Drain server SETTINGS, then ACK it.
+    _ = read_first_settings(Sock),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:settings_ack())),
+    %% Send Extended CONNECT HEADERS on stream 1.
+    Headers = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/c">>},
+        {<<":authority">>, <<"localhost">>},
+        {<<":protocol">>, <<"websocket">>}
+    ],
+    {Block, _Ctx} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, false))),
+    %% Expect RST_STREAM with PROTOCOL_ERROR (= 1) on stream 1.
+    case wait_for_rst_stream(Sock, 1, 3000) of
+        {ok, ErrorCode} ->
+            ?assertEqual(1, ErrorCode);  %% PROTOCOL_ERROR
+        timeout ->
+            ct:fail(no_rst_stream)
+    end,
+    ssl:close(Sock),
+    ok.
+
+wait_for_rst_stream(Sock, StreamId, Timeout) ->
+    case ssl:recv(Sock, 9, Timeout) of
+        {ok, <<Len:24, Type:8, _Flags:8, _:1, Sid:31>>} ->
+            Payload = case Len of
+                0 -> <<>>;
+                _ -> {ok, P} = ssl:recv(Sock, Len, Timeout), P
+            end,
+            case {Type, Sid, Payload} of
+                {16#3, StreamId, <<ErrorCode:32>>} ->
+                    {ok, ErrorCode};
+                _ ->
+                    wait_for_rst_stream(Sock, StreamId, Timeout)
+            end;
+        {error, _} ->
+            timeout
+    end.
 
 %% ============================================================================
 %% Helper Functions

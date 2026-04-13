@@ -67,7 +67,10 @@
     %% Interim 1xx responses do NOT set this; subsequent HEADERS after it are trailers.
     response_seen_final = false :: boolean(),
     %% Request method, captured server-side to decide body-forbidden and tunnel rules.
-    request_method :: undefined | binary()
+    request_method :: undefined | binary(),
+    %% RFC 8441: Extended CONNECT protocol token (e.g. <<"websocket">>).
+    %% Set when the request carries a `:protocol` pseudo-header.
+    protocol :: undefined | binary()
 }).
 
 %% Connection state
@@ -125,7 +128,11 @@
 
     %% Scheme to advertise on outbound :scheme pseudo-header.
     %% Derived from transport at init: ssl -> https, gen_tcp -> http.
-    scheme = <<"https">> :: binary()
+    scheme = <<"https">> :: binary(),
+
+    %% RFC 8441: when true, server advertises SETTINGS_ENABLE_CONNECT_PROTOCOL=1
+    %% and accepts requests with the `:protocol` pseudo-header. Server-side opt-in.
+    enable_connect_protocol = false :: boolean()
 }).
 
 %% ============================================================================
@@ -279,7 +286,16 @@ init({Mode, Socket, Owner, Opts}) ->
     %% RFC 9113 §6.5.2: a server MUST NOT advertise SETTINGS_ENABLE_PUSH=1.
     %% We don't implement push as either client or server, so always 0.
     UserSettings = maps:get(settings, Opts, #{}),
-    LocalSettings = (maps:merge(h2_settings:default(), UserSettings))#{enable_push => 0},
+    EnableConnectProtocol = Mode =:= server
+                            andalso maps:get(enable_connect_protocol, Opts, false) =:= true,
+    %% RFC 8441 §3: server opts in by sending SETTINGS_ENABLE_CONNECT_PROTOCOL=1.
+    ConnectProtoSettings = case EnableConnectProtocol of
+        true  -> #{enable_connect_protocol => 1};
+        false -> #{}
+    end,
+    LocalSettings = maps:merge(
+        maps:merge(h2_settings:default(), UserSettings),
+        ConnectProtoSettings#{enable_push => 0}),
     PeerSettings = h2_settings:default(),
 
     %% Scheme depends on transport: TCP → http, TLS → https.
@@ -311,7 +327,8 @@ init({Mode, Socket, Owner, Opts}) ->
         next_stream_id = case Mode of client -> 1; server -> 2 end,
         conn_window_size = InitialWindow,
         recv_conn_window_size = RecvWindow,
-        scheme = Scheme
+        scheme = Scheme,
+        enable_connect_protocol = EnableConnectProtocol
     },
 
     %% Note: Socket is NOT set to active here - it will be activated
@@ -1010,7 +1027,17 @@ decode_and_process_headers_cont(Kind, StreamId, Headers, EndStream, #state{mode 
     case {Mode, Kind} of
         {server, initial} ->
             {Method, Path, OtherHeaders} = extract_request_headers(Headers),
+            Protocol = proplists:get_value(<<":protocol">>, Headers),
             IsTunnel = Method =:= <<"CONNECT">>,
+            %% RFC 8441 §4: server MUST treat Extended CONNECT as malformed
+            %% when it has not advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1.
+            ExtendedConnectAllowed = Protocol =:= undefined
+                                     orelse State1#state.enable_connect_protocol,
+            case ExtendedConnectAllowed of
+                false ->
+                    send_rst_stream(StreamId, protocol_error, State1),
+                    {ok, connected, State1};
+                true ->
             case parse_content_length(Headers) of
                 {error, Err} ->
                     send_rst_stream(StreamId, Err, State1),
@@ -1022,6 +1049,7 @@ decode_and_process_headers_cont(Kind, StreamId, Headers, EndStream, #state{mode 
                         request_headers = Headers,
                         request_method = Method,
                         tunnel = IsTunnel,
+                        protocol = Protocol,
                         expected_body_length = ExpectedCL,
                         body_forbidden = BodyForbidden
                     },
@@ -1036,6 +1064,7 @@ decode_and_process_headers_cont(Kind, StreamId, Headers, EndStream, #state{mode 
                             notify_owner({h2, self(), {request, StreamId, Method, Path, OtherHeaders}}, State3),
                             {ok, connected, State3}
                     end
+            end
             end;
         {server, trailers} ->
             case EndStream of
@@ -1305,17 +1334,43 @@ check_pseudo_set(server, Headers) ->
     case length(Pseudos) =:= length(Uniq) of
         false -> {error, protocol_error};
         true ->
-            Allowed = [<<":method">>, <<":scheme">>, <<":path">>, <<":authority">>],
+            %% RFC 8441 §4: `:protocol` is allowed only with method CONNECT.
+            Allowed = [<<":method">>, <<":scheme">>, <<":path">>, <<":authority">>,
+                       <<":protocol">>],
             case [N || N <- Pseudos, not lists:member(N, Allowed)] of
                 [] ->
                     Method = proplists:get_value(<<":method">>, Headers),
-                    case Method of
-                        undefined -> {error, protocol_error};
-                        <<"CONNECT">> ->
-                            case proplists:get_value(<<":authority">>, Headers) of
-                                undefined -> {error, protocol_error};
+                    Protocol = proplists:get_value(<<":protocol">>, Headers),
+                    case {Method, Protocol} of
+                        {undefined, _} -> {error, protocol_error};
+                        {_, undefined} when Method =:= <<"CONNECT">> ->
+                            %% Vanilla CONNECT (RFC 7540 §8.3): `:authority`
+                            %% required, `:scheme`/`:path` MUST be omitted.
+                            HasScheme = proplists:is_defined(<<":scheme">>, Headers),
+                            HasPath   = proplists:is_defined(<<":path">>, Headers),
+                            case {proplists:get_value(<<":authority">>, Headers),
+                                  HasScheme, HasPath} of
+                                {undefined, _, _} -> {error, protocol_error};
+                                {_, true, _} -> {error, protocol_error};
+                                {_, _, true} -> {error, protocol_error};
                                 _ -> ok
                             end;
+                        {<<"CONNECT">>, _} ->
+                            %% Extended CONNECT (RFC 8441 §4): `:method=CONNECT`
+                            %% plus `:protocol`, `:scheme`, `:path`, `:authority`
+                            %% all REQUIRED.
+                            case {proplists:get_value(<<":scheme">>, Headers),
+                                  proplists:get_value(<<":path">>, Headers),
+                                  proplists:get_value(<<":authority">>, Headers)} of
+                                {undefined, _, _} -> {error, protocol_error};
+                                {_, undefined, _} -> {error, protocol_error};
+                                {_, <<>>, _} -> {error, protocol_error};
+                                {_, _, undefined} -> {error, protocol_error};
+                                _ -> ok
+                            end;
+                        {_, P} when P =/= undefined ->
+                            %% `:protocol` without method CONNECT is malformed.
+                            {error, protocol_error};
                         _ ->
                             case {proplists:get_value(<<":scheme">>, Headers),
                                   proplists:get_value(<<":path">>, Headers)} of
@@ -1349,7 +1404,12 @@ check_pseudo_set(client, Headers) ->
 extract_request_headers(Headers) ->
     Method = proplists:get_value(<<":method">>, Headers, <<"GET">>),
     Path = proplists:get_value(<<":path">>, Headers, <<"/">>),
-    OtherHeaders = lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers),
+    %% Strip pseudo-headers from the user-visible list, except `:protocol`
+    %% (RFC 8441) so handlers can read the Extended CONNECT protocol token.
+    OtherHeaders = lists:filter(
+        fun({<<":protocol">>, _}) -> true;
+           ({N, _}) -> not is_pseudo_header(N)
+        end, Headers),
     {Method, Path, OtherHeaders}.
 
 %% RFC 9113 §8.3.2: :status MUST be present on a response HEADERS, exactly
@@ -1613,6 +1673,7 @@ handle_send_request(From, _Method, _Path, _Headers, _EndStream, State) ->
 handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next_stream_id = StreamId,
                                                               peer_max_concurrent_streams = MaxStreams,
                                                               peer_initial_window_size = InitialWindow,
+                                                              peer_settings = PeerSettings,
                                                               encode_context = EncCtx} = State) ->
     ActiveStreams = count_active_streams(State),
     case MaxStreams of
@@ -1620,7 +1681,25 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
             {keep_state, State, [{reply, From, {error, max_streams_exceeded}}]};
         _ ->
             Method = proplists:get_value(<<":method">>, Headers),
+            Protocol = proplists:get_value(<<":protocol">>, Headers),
             IsConnect = Method =:= <<"CONNECT">>,
+            %% RFC 8441: client MUST NOT send Extended CONNECT until peer has
+            %% advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1; method MUST be
+            %% CONNECT when `:protocol` is present.
+            ExtendedConnectGuard = case Protocol of
+                undefined -> ok;
+                _ when Method =/= <<"CONNECT">> ->
+                    {error, extended_connect_method};
+                _ ->
+                    case h2_settings:get(enable_connect_protocol, PeerSettings) of
+                        1 -> ok;
+                        _ -> {error, extended_connect_disabled}
+                    end
+            end,
+            case ExtendedConnectGuard of
+                {error, _} = ECErr ->
+                    {keep_state, State, [{reply, From, ECErr}]};
+                ok ->
             case validate_outbound_request(Headers) of
                 {error, _} = Err ->
                     {keep_state, State, [{reply, From, Err}]};
@@ -1638,6 +1717,7 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
                 window_size = InitialWindow,
                 recv_window_size = RecvWindow,
                 tunnel = IsConnect,
+                protocol = Protocol,
                 request_method = Method
             },
             send_header_block(StreamId, HeaderBlock, EndStream, State),
@@ -1647,6 +1727,7 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
                 next_stream_id = StreamId + 2
             },
             {keep_state, State1, [{reply, From, {ok, StreamId}}]}
+            end
             end
             end
     end;

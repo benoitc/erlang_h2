@@ -106,7 +106,10 @@
     cacerts => [binary()],
     handler := fun((connection(), stream_id(), binary(), binary(), headers()) -> any()),
     settings => h2_settings:settings(),
-    acceptors => pos_integer()
+    acceptors => pos_integer(),
+    %% RFC 8441: when true, advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1 and
+    %% accept Extended CONNECT requests carrying the `:protocol` pseudo-header.
+    enable_connect_protocol => boolean()
 }.
 
 -export_type([connection/0, stream_id/0, headers/0, status/0, error_code/0]).
@@ -246,8 +249,28 @@ request(Conn, Headers) ->
 -spec request(connection(), headers(), map()) ->
     {ok, stream_id()} | {error, term()}.
 request(Conn, Headers, Opts) ->
-    EndStream = maps:get(end_stream, Opts, true),
-    h2_connection:send_request_headers(Conn, Headers, EndStream).
+    %% RFC 8441 Extended CONNECT: when `protocol` is supplied, inject the
+    %% `:protocol` pseudo-header (unless caller already included it) and
+    %% default end_stream to false (the stream stays open as a tunnel).
+    case maps:get(protocol, Opts, undefined) of
+        undefined ->
+            EndStream = maps:get(end_stream, Opts, true),
+            h2_connection:send_request_headers(Conn, Headers, EndStream);
+        Protocol when is_binary(Protocol) ->
+            Headers1 = case proplists:is_defined(<<":protocol">>, Headers) of
+                true  -> Headers;
+                false -> inject_protocol_pseudo(Headers, Protocol)
+            end,
+            EndStream = maps:get(end_stream, Opts, false),
+            h2_connection:send_request_headers(Conn, Headers1, EndStream)
+    end.
+
+%% Insert `:protocol` after the trailing pseudo-header so the block stays
+%% well-ordered (RFC 9113 §8.3: pseudo-headers must precede regular ones).
+inject_protocol_pseudo(Headers, Protocol) ->
+    {Pseudos, Regular} = lists:splitwith(
+        fun({<<$:, _/binary>>, _}) -> true; (_) -> false end, Headers),
+    Pseudos ++ [{<<":protocol">>, Protocol} | Regular].
 
 %% @doc Send an HTTP/2 request.
 %% For body-less requests (GET, HEAD, etc.), sends HEADERS with END_STREAM.
@@ -306,6 +329,7 @@ start_server_ssl(Port, Opts) ->
         {{ok, Cert}, {ok, Key}, {ok, Handler}} ->
             NumAcceptors = maps:get(acceptors, Opts, erlang:system_info(schedulers)),
             Settings = maps:get(settings, Opts, #{}),
+            EnableConnectProtocol = maps:get(enable_connect_protocol, Opts, false),
             CACerts = maps:get(cacerts, Opts, []),
             CertFile = load_file(Cert),
             KeyFile = load_file(Key),
@@ -329,6 +353,7 @@ start_server_ssl(Port, Opts) ->
                         listen_socket => ListenSocket,
                         handler => Handler,
                         settings => Settings,
+                        enable_connect_protocol => EnableConnectProtocol,
                         ref => Ref
                     },
                     Self = self(),
@@ -352,6 +377,7 @@ start_server_tcp(Port, Opts) ->
         {ok, Handler} ->
             NumAcceptors = maps:get(acceptors, Opts, erlang:system_info(schedulers)),
             Settings = maps:get(settings, Opts, #{}),
+            EnableConnectProtocol = maps:get(enable_connect_protocol, Opts, false),
             TCPOpts = [
                 {reuseaddr, true},
                 {active, false},
@@ -366,6 +392,7 @@ start_server_tcp(Port, Opts) ->
                         listen_socket => ListenSocket,
                         handler => Handler,
                         settings => Settings,
+                        enable_connect_protocol => EnableConnectProtocol,
                         ref => Ref
                     },
                     Self = self(),
@@ -417,6 +444,7 @@ acceptor_loop(Owner, State) ->
     acceptor_loop_inner(Owner, State).
 
 acceptor_loop_inner(Owner, #{listen_socket := ListenSocket, handler := Handler, settings := Settings} = State) ->
+    EnableConnectProtocol = maps:get(enable_connect_protocol, State, false),
     case ssl:transport_accept(ListenSocket, infinity) of
         {ok, Socket} ->
             case ssl:handshake(Socket, 30000) of
@@ -429,7 +457,8 @@ acceptor_loop_inner(Owner, #{listen_socket := ListenSocket, handler := Handler, 
                             Pid = spawn_link(fun() ->
                                 receive
                                     {socket_ready, Sock} ->
-                                        handle_server_connection(Sock, Handler, Settings);
+                                        handle_server_connection(Sock, Handler, Settings,
+                                                                 ssl, EnableConnectProtocol);
                                     {socket_transfer_failed, _} ->
                                         ok
                                 end
@@ -460,11 +489,9 @@ acceptor_loop_inner(Owner, #{listen_socket := ListenSocket, handler := Handler, 
             acceptor_loop_inner(Owner, State)
     end.
 
-handle_server_connection(Socket, Handler, Settings) ->
-    handle_server_connection(Socket, Handler, Settings, ssl).
-
-handle_server_connection(Socket, Handler, Settings, Transport) ->
-    ConnOpts = #{settings => Settings},
+handle_server_connection(Socket, Handler, Settings, Transport, EnableConnectProtocol) ->
+    ConnOpts = #{settings => Settings,
+                 enable_connect_protocol => EnableConnectProtocol},
     TransferFn = case Transport of
         ssl -> fun ssl:controlling_process/2;
         gen_tcp -> fun gen_tcp:controlling_process/2
@@ -509,13 +536,15 @@ tcp_acceptor_loop(Owner, State) ->
     tcp_acceptor_loop_inner(Owner, State).
 
 tcp_acceptor_loop_inner(Owner, #{listen_socket := ListenSocket, handler := Handler, settings := Settings} = State) ->
+    EnableConnectProtocol = maps:get(enable_connect_protocol, State, false),
     case gen_tcp:accept(ListenSocket, infinity) of
         {ok, Socket} ->
             _ = inet:setopts(Socket, [{active, false}]),
             Pid = spawn_link(fun() ->
                 receive
                     {socket_ready, Sock} ->
-                        handle_server_connection(Sock, Handler, Settings, gen_tcp);
+                        handle_server_connection(Sock, Handler, Settings,
+                                                 gen_tcp, EnableConnectProtocol);
                     {socket_transfer_failed, _} ->
                         ok
                 end
