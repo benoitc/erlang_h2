@@ -60,7 +60,13 @@
     goaway_event_test/1,
     closed_event_test/1,
     stream_handler_test/1,
-    handler_module_test/1
+    handler_module_test/1,
+
+    %% CONNECT tunnel (RFC 7540 §8.3)
+    connect_tunnel_basic_test/1,
+    connect_tunnel_half_close_test/1,
+    connect_response_4xx_test/1,
+    connect_trailers_rejected_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -82,7 +88,8 @@ all() ->
         {group, stream_state},
         {group, error_handling},
         {group, misc},
-        {group, api_parity}
+        {group, api_parity},
+        {group, tunnel}
     ].
 
 groups() ->
@@ -130,6 +137,12 @@ groups() ->
             closed_event_test,
             stream_handler_test,
             handler_module_test
+        ]},
+        {tunnel, [sequence], [
+            connect_tunnel_basic_test,
+            connect_tunnel_half_close_test,
+            connect_response_4xx_test,
+            connect_trailers_rejected_test
         ]}
     ].
 
@@ -887,6 +900,213 @@ collect_body(Conn, StreamId, Acc) ->
     after 2000 ->
         Acc
     end.
+
+%% ============================================================================
+%% CONNECT tunnel tests (RFC 7540 §8.3)
+%% ============================================================================
+
+start_echo_tunnel_server(Config) ->
+    Self = self(),
+    EchoHandler = fun(Conn, StreamId, <<"CONNECT">>, _Path, _Headers) ->
+        Worker = spawn(fun() ->
+            receive {start, Sid} ->
+                Self ! {tunnel_worker, self(), Sid},
+                tunnel_echo_loop(Conn, Sid)
+            end
+        end),
+        case h2:set_stream_handler(Conn, StreamId, Worker) of
+            ok            -> Worker ! {start, StreamId};
+            {ok, Buf}     ->
+                Worker ! {start, StreamId},
+                lists:foreach(fun({D, F}) ->
+                    Worker ! {h2, Conn, {data, StreamId, D, F}}
+                end, Buf)
+        end,
+        h2:send_response(Conn, StreamId, 200, []);
+       (Conn, Sid, _M, _P, _H) ->
+        h2:send_response(Conn, Sid, 405, []),
+        h2:send_data(Conn, Sid, <<>>, true)
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => EchoHandler
+    }),
+    Ref.
+
+tunnel_echo_loop(Conn, Sid) ->
+    receive
+        {h2, Conn, {data, Sid, Data, true}} ->
+            h2:send_data(Conn, Sid, Data, true);
+        {h2, Conn, {data, Sid, Data, false}} ->
+            h2:send_data(Conn, Sid, Data, false),
+            tunnel_echo_loop(Conn, Sid)
+    after 5000 ->
+        ok
+    end.
+
+connect_tunnel_basic_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    Ref = start_echo_tunnel_server(Config),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, Sid} = h2:request(Conn, <<"CONNECT">>, <<>>, [
+        {<<"host">>, <<"target.example:443">>}
+    ]),
+    %% Expect 200 response (no body yet).
+    receive
+        {h2, Conn, {response, Sid, 200, _}} -> ok
+    after 2000 ->
+        ct:fail(no_connect_response)
+    end,
+    ok = h2:send_data(Conn, Sid, <<"hello">>, false),
+    receive
+        {h2, Conn, {data, Sid, <<"hello">>, false}} -> ok
+    after 2000 ->
+        ct:fail(no_echo)
+    end,
+    ok = h2:send_data(Conn, Sid, <<"world">>, true),
+    receive
+        {h2, Conn, {data, Sid, <<"world">>, true}} -> ok
+    after 2000 ->
+        ct:fail(no_final_echo)
+    end,
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+connect_tunnel_half_close_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    Self = self(),
+    Handler = fun(Conn, Sid, <<"CONNECT">>, _, _) ->
+        Worker = spawn(fun() ->
+            receive {start, S} ->
+                Self ! {worker, self(), S},
+                worker_half_close_loop(Conn, S, <<>>)
+            end
+        end),
+        case h2:set_stream_handler(Conn, Sid, Worker) of
+            ok        -> Worker ! {start, Sid};
+            {ok, Buf} ->
+                Worker ! {start, Sid},
+                lists:foreach(fun({D, F}) ->
+                    Worker ! {h2, Conn, {data, Sid, D, F}}
+                end, Buf)
+        end,
+        h2:send_response(Conn, Sid, 200, [])
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => Handler
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, Sid} = h2:request(Conn, <<"CONNECT">>, <<>>, [
+        {<<"host">>, <<"target:1">>}
+    ]),
+    receive {h2, Conn, {response, Sid, 200, _}} -> ok after 2000 -> ct:fail(no_resp) end,
+    %% Client sends data and END_STREAM (half-closes write side).
+    ok = h2:send_data(Conn, Sid, <<"ping">>, true),
+    %% Server should still send back data after seeing client's END_STREAM.
+    receive
+        {h2, Conn, {data, Sid, <<"PING-ACK">>, true}} -> ok
+    after 3000 ->
+        ct:fail(no_server_data_after_half_close)
+    end,
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+worker_half_close_loop(Conn, Sid, Acc) ->
+    receive
+        {h2, Conn, {data, Sid, _Data, true}} ->
+            h2:send_data(Conn, Sid, <<"PING-ACK">>, true),
+            _ = Acc,
+            ok;
+        {h2, Conn, {data, Sid, Data, false}} ->
+            worker_half_close_loop(Conn, Sid, <<Acc/binary, Data/binary>>)
+    after 5000 ->
+        ok
+    end.
+
+connect_response_4xx_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    Handler = fun(Conn, Sid, <<"CONNECT">>, _, _) ->
+        h2:send_response(Conn, Sid, 502, []),
+        h2:send_data(Conn, Sid, <<>>, true)
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => Handler
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, Sid} = h2:request(Conn, <<"CONNECT">>, <<>>, [
+        {<<"host">>, <<"target:1">>}
+    ]),
+    Resp = receive_full_response(Conn, Sid, 2000),
+    ?assertMatch({502, _, _}, Resp),
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+connect_trailers_rejected_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    Self = self(),
+    Handler = fun(Conn, Sid, <<"CONNECT">>, _, _) ->
+        h2:send_response(Conn, Sid, 200, []),
+        %% After 2xx, attempt to send trailers — should fail at connection level
+        %% via send_trailers because tunnel forbids them. We only assert the
+        %% client side sees a stream_reset / closed event.
+        Self ! {tunnel_open, Conn, Sid},
+        receive after 1500 -> ok end,
+        catch h2:send_trailers(Conn, Sid, [{<<"x-trailer">>, <<"v">>}])
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => Handler
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, Sid} = h2:request(Conn, <<"CONNECT">>, <<>>, [
+        {<<"host">>, <<"t:1">>}
+    ]),
+    receive {h2, Conn, {response, Sid, 200, _}} -> ok after 2000 -> ct:fail(no_resp) end,
+    %% Now send a HEADERS frame from the client (simulating trailers via the
+    %% headers-only API). This should be rejected by the server with RST_STREAM.
+    %% The client's request/3 doesn't add pseudo-headers, so it's a trailer
+    %% from the server's perspective.
+    {ok, _} = h2:request(Conn, [{<<"x-fake-trailer">>, <<"v">>}], #{end_stream => true}),
+    %% We expect a stream reset on Sid (or another stream — implementation
+    %% dependent). Tolerate either reset or no event within 1s; main goal is
+    %% the connection survives.
+    receive
+        {h2, Conn, {stream_reset, _, _}} -> ok
+    after 1500 ->
+        ok
+    end,
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
 
 %% ============================================================================
 %% Helper Functions

@@ -246,9 +246,13 @@ request(Conn, Headers, Opts) ->
     h2_connection:send_request_headers(Conn, Headers, EndStream).
 
 %% @doc Send an HTTP/2 request.
-%% For requests without a body (GET, HEAD, etc.), this sends HEADERS with END_STREAM.
+%% For body-less requests (GET, HEAD, etc.), sends HEADERS with END_STREAM.
+%% For CONNECT (RFC 7540 §8.3) leaves the stream open so the caller can
+%% send tunnel bytes via send_data.
 -spec request(connection(), binary(), binary(), headers()) ->
     {ok, stream_id()} | {error, term()}.
+request(Conn, <<"CONNECT">> = Method, Path, Headers) ->
+    h2_connection:send_request(Conn, Method, Path, Headers, false);
 request(Conn, Method, Path, Headers) ->
     h2_connection:send_request(Conn, Method, Path, Headers, true).
 

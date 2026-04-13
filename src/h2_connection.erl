@@ -51,7 +51,10 @@
     %% Optional pid to receive body data for this stream (set_stream_handler).
     handler :: pid() | undefined,
     %% Data buffered before a handler is registered.
-    recv_buffer = [] :: [{binary(), boolean()}]
+    recv_buffer = [] :: [{binary(), boolean()}],
+    %% RFC 7540 §8.3: stream is a CONNECT tunnel — DATA frames carry raw
+    %% bytes, END_STREAM is half-close, no trailers, no CL/TE on response.
+    tunnel = false :: boolean()
 }).
 
 %% Connection state
@@ -912,9 +915,16 @@ decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_conte
                         _ -> false
                     end
             end,
-            Validation = case IsInitialHeaders of
-                true -> validate_initial_headers(Mode, Headers);
-                false -> validate_trailers(Headers, EndStream)
+            %% RFC 7540 §8.3: HEADERS (trailers) are not allowed on a CONNECT
+            %% tunnel — reject as stream PROTOCOL_ERROR.
+            IsTunnel = case maps:find(StreamId, State1#state.streams) of
+                {ok, #stream{tunnel = T}} -> T;
+                _ -> false
+            end,
+            Validation = case {IsInitialHeaders, IsTunnel} of
+                {true, _}     -> validate_initial_headers(Mode, Headers);
+                {false, true} -> {error, protocol_error};
+                {false, false} -> validate_trailers(Headers, EndStream)
             end,
             case Validation of
                 ok ->
@@ -937,21 +947,21 @@ decode_and_process_headers_cont(StreamId, Headers, EndStream, #state{mode = Mode
     case Mode of
         server ->
                     %% This is a request
+                    {Method, Path, OtherHeaders} = extract_request_headers(Headers),
+                    IsTunnel = Method =:= <<"CONNECT">>,
+                    %% RFC 7540 §8.3: CONNECT streams stay "open" even when
+                    %% the client never sends END_STREAM with the HEADERS;
+                    %% we still honour END_STREAM-on-headers (uncommon for
+                    %% CONNECT) but mark the stream as a tunnel candidate.
                     Stream1 = Stream#stream{
                         state = case EndStream of true -> half_closed_remote; false -> open end,
-                        request_headers = Headers
+                        request_headers = Headers,
+                        tunnel = IsTunnel
                     },
                     State2 = put_stream(StreamId, Stream1, State1),
                     State3 = State2#state{last_peer_stream_id = max(StreamId, State2#state.last_peer_stream_id)},
 
-                    %% Notify owner
-                    {Method, Path, OtherHeaders} = extract_request_headers(Headers),
                     notify_owner({h2, self(), {request, StreamId, Method, Path, OtherHeaders}}, State3),
-
-                    case EndStream of
-                        true -> ok;
-                        false -> ok
-                    end,
                     {ok, connected, State3};
 
                 client ->
@@ -1309,21 +1319,24 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
         N when is_integer(N), ActiveStreams >= N ->
             {keep_state, State, [{reply, From, {error, max_streams_exceeded}}]};
         _ ->
-            %% Build pseudo-headers
-            Scheme = <<"https">>,  % Default to https
+            IsConnect = Method =:= <<"CONNECT">>,
             Authority = proplists:get_value(<<"host">>, Headers, <<>>),
-            AllHeaders = [
-                {<<":method">>, Method},
-                {<<":path">>, Path},
-                {<<":scheme">>, Scheme},
-                {<<":authority">>, Authority}
-                | lists:filter(fun({N1, _}) -> N1 =/= <<"host">> end, Headers)
-            ],
+            %% RFC 7540 §8.3: CONNECT MUST omit :scheme and :path; :authority required.
+            AllHeaders = case IsConnect of
+                true ->
+                    [{<<":method">>, Method},
+                     {<<":authority">>, Authority}
+                     | lists:filter(fun({N1, _}) -> N1 =/= <<"host">> end, Headers)];
+                false ->
+                    [{<<":method">>, Method},
+                     {<<":path">>, Path},
+                     {<<":scheme">>, <<"https">>},
+                     {<<":authority">>, Authority}
+                     | lists:filter(fun({N1, _}) -> N1 =/= <<"host">> end, Headers)]
+            end,
 
-            %% Encode headers
             {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
 
-            %% Create stream with appropriate state
             InitialWindow = h2_settings:get(initial_window_size, PeerSettings),
             RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
             StreamState = case EndStream of
@@ -1334,10 +1347,10 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
                 id = StreamId,
                 state = StreamState,
                 window_size = InitialWindow,
-                recv_window_size = RecvWindow
+                recv_window_size = RecvWindow,
+                tunnel = IsConnect
             },
 
-            %% Send HEADERS frame with END_STREAM flag as specified
             Frame = h2_frame:headers(StreamId, HeaderBlock, EndStream),
             send_frame(Frame, State),
 
@@ -1362,6 +1375,7 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
         N when is_integer(N), ActiveStreams >= N ->
             {keep_state, State, [{reply, From, {error, max_streams_exceeded}}]};
         _ ->
+            IsConnect = proplists:get_value(<<":method">>, Headers) =:= <<"CONNECT">>,
             {HeaderBlock, EncCtx1} = h2_hpack:encode(Headers, EncCtx),
             InitialWindow = h2_settings:get(initial_window_size, PeerSettings),
             RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
@@ -1370,7 +1384,8 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
                 id = StreamId,
                 state = StreamState,
                 window_size = InitialWindow,
-                recv_window_size = RecvWindow
+                recv_window_size = RecvWindow,
+                tunnel = IsConnect
             },
             Frame = h2_frame:headers(StreamId, HeaderBlock, EndStream),
             send_frame(Frame, State),
@@ -1387,25 +1402,32 @@ handle_send_request_headers(From, _Headers, _EndStream, State) ->
 handle_send_response(From, StreamId, Status, Headers, #state{mode = server, streams = Streams,
                                                               encode_context = EncCtx} = State) ->
     case maps:find(StreamId, Streams) of
-        {ok, #stream{state = StreamState} = Stream} when StreamState == open; StreamState == half_closed_remote ->
-            %% Build response headers
-            StatusBin = integer_to_binary(Status),
-            AllHeaders = [{<<":status">>, StatusBin} | Headers],
-
-            %% Encode headers
-            {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
-
-            %% Send HEADERS frame (without END_STREAM, will send data separately)
-            Frame = h2_frame:headers(StreamId, HeaderBlock, false),
-            send_frame(Frame, State),
-
-            Stream1 = Stream#stream{response_headers = AllHeaders},
-            State1 = State#state{
-                encode_context = EncCtx1,
-                streams = maps:put(StreamId, Stream1, Streams)
-            },
-
-            {keep_state, State1, [{reply, From, ok}]};
+        {ok, #stream{state = StreamState, tunnel = IsTunnel} = Stream}
+          when StreamState == open; StreamState == half_closed_remote ->
+            %% RFC 7540 §8.3: a tunnel response (CONNECT 2xx) MUST NOT carry
+            %% Content-Length or Transfer-Encoding headers.
+            case IsTunnel andalso Status >= 200 andalso Status < 300 andalso
+                 has_banned_tunnel_header(Headers) of
+                true ->
+                    {keep_state, State,
+                     [{reply, From, {error, banned_header_in_tunnel_response}}]};
+                false ->
+                    StatusBin = integer_to_binary(Status),
+                    AllHeaders = [{<<":status">>, StatusBin} | Headers],
+                    {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
+                    Frame = h2_frame:headers(StreamId, HeaderBlock, false),
+                    send_frame(Frame, State),
+                    %% Tunnel is "established" once a 2xx response goes out;
+                    %% non-2xx responses keep tunnel=false (and the stream
+                    %% behaves like a normal short response).
+                    NewTunnel = IsTunnel andalso Status >= 200 andalso Status < 300,
+                    Stream1 = Stream#stream{response_headers = AllHeaders, tunnel = NewTunnel},
+                    State1 = State#state{
+                        encode_context = EncCtx1,
+                        streams = maps:put(StreamId, Stream1, Streams)
+                    },
+                    {keep_state, State1, [{reply, From, ok}]}
+            end;
         {ok, _} ->
             {keep_state, State, [{reply, From, {error, invalid_stream_state}}]};
         error ->
@@ -1414,6 +1436,12 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
 
 handle_send_response(From, _StreamId, _Status, _Headers, State) ->
     {keep_state, State, [{reply, From, {error, not_server}}]}.
+
+%% RFC 7540 §8.3: forbidden on a 2xx CONNECT response.
+has_banned_tunnel_header(Headers) ->
+    lists:any(fun({Name, _}) ->
+        Name =:= <<"content-length">> orelse Name =:= <<"transfer-encoding">>
+    end, Headers).
 
 handle_send_data(From, StreamId, Data, EndStream, #state{streams = Streams, conn_window_size = ConnWindow,
                                                           peer_settings = PeerSettings} = State) ->
