@@ -1101,19 +1101,11 @@ connect_trailers_rejected_test(Config) ->
         {<<"host">>, <<"t:1">>}
     ]),
     receive {h2, Conn, {response, Sid, 200, _}} -> ok after 2000 -> ct:fail(no_resp) end,
-    %% Now send a HEADERS frame from the client (simulating trailers via the
-    %% headers-only API). This should be rejected by the server with RST_STREAM.
-    %% The client's request/3 doesn't add pseudo-headers, so it's a trailer
-    %% from the server's perspective.
-    {ok, _} = h2:request(Conn, [{<<"x-fake-trailer">>, <<"v">>}], #{end_stream => true}),
-    %% We expect a stream reset on Sid (or another stream — implementation
-    %% dependent). Tolerate either reset or no event within 1s; main goal is
-    %% the connection survives.
-    receive
-        {h2, Conn, {stream_reset, _, _}} -> ok
-    after 1500 ->
-        ok
-    end,
+    %% Trying to send a HEADERS block with no pseudo-headers (a trailer shape)
+    %% via the request API is caught client-side by outbound validation.
+    {error, protocol_error} = h2:request(Conn, [{<<"x-fake-trailer">>, <<"v">>}],
+                                         #{end_stream => true}),
+    %% Connection survives regardless.
     h2:close(Conn),
     h2:stop_server(Ref),
     drain_exits(),
@@ -1200,24 +1192,19 @@ parse_settings_payload(<<>>) -> [];
 parse_settings_payload(<<Id:16, Value:32, Rest/binary>>) ->
     [{Id, Value} | parse_settings_payload(Rest)].
 
-%% RFC 9113 §8.2: header values containing NUL/LF/CR are malformed.
-%% Server must respond with a stream-level PROTOCOL_ERROR.
+%% RFC 9113 §8.2: header values containing NUL/LF/CR are malformed. The
+%% client MUST refuse to send them; we enforce this on the send side.
 header_value_with_nul_rejected_test(Config) ->
     Port = ?config(port, Config),
     {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
-    {ok, Sid} = h2:request(Conn, [
+    Result = h2:request(Conn, [
         {<<":method">>, <<"GET">>},
         {<<":path">>, <<"/">>},
         {<<":scheme">>, <<"https">>},
         {<<":authority">>, <<"localhost">>},
         {<<"x-bad">>, <<"he", 0, "llo">>}
     ]),
-    receive
-        {h2, Conn, {stream_reset, Sid, protocol_error}} -> ok;
-        {h2, Conn, {stream_reset, Sid, _}} -> ok
-    after 2000 ->
-        ct:fail(no_rst)
-    end,
+    ?assertEqual({error, protocol_error}, Result),
     h2:close(Conn),
     drain_exits(),
     ok.

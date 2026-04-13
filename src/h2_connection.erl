@@ -1043,7 +1043,7 @@ decode_and_process_headers_cont(Kind, StreamId, Headers, EndStream, #state{mode 
         {client, initial} ->
             case parse_status(Headers) of
                 {ok, Status} ->
-                    IsHeadRequest = false,  %% we never send HEAD via high-level API yet
+                    IsHeadRequest = Stream#stream.request_method =:= <<"HEAD">>,
                     BodyForbidden = IsHeadRequest
                                     orelse Status =:= 204 orelse Status =:= 304,
                     case parse_content_length(Headers) of
@@ -1313,11 +1313,25 @@ extract_request_headers(Headers) ->
 %% response and must trigger a stream PROTOCOL_ERROR.
 parse_status(Headers) ->
     case proplists:get_value(<<":status">>, Headers) of
+        %% RFC 9113 §8.6: HTTP/2 MUST NOT accept 101 Switching Protocols.
+        <<"101">> -> malformed;
         <<D1, D2, D3>> when D1 >= $1, D1 =< $5, D2 >= $0, D2 =< $9, D3 >= $0, D3 =< $9 ->
             {ok, (D1 - $0) * 100 + (D2 - $0) * 10 + (D3 - $0)};
         _ ->
             malformed
     end.
+
+%% RFC 9113 §8.1.1, §8.2: validate every outbound header block.
+%% The existing Mode parameter of validate_initial_headers refers to the
+%% *receiver*'s role (server validates requests, client validates responses),
+%% so for outbound validation we flip: sending a request → server rules,
+%% sending a response → client rules.
+validate_outbound_request(Headers) ->
+    validate_initial_headers(server, Headers).
+
+validate_outbound_response(Headers) ->
+    %% Status 101 already rejected before calling.
+    validate_initial_headers(client, Headers).
 
 is_pseudo_header(<<$:, _/binary>>) -> true;
 is_pseudo_header(_) -> false.
@@ -1483,31 +1497,37 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
                      | lists:filter(fun({N1, _}) -> N1 =/= <<"host">> end, Headers)]
             end,
 
-            {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
+            case validate_outbound_request(AllHeaders) of
+                {error, _} = Err ->
+                    {keep_state, State, [{reply, From, Err}]};
+                ok ->
+                    {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
 
-            RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
-            StreamState = case EndStream of
-                true -> half_closed_local;
-                false -> open
-            end,
-            Stream = #stream{
-                id = StreamId,
-                state = StreamState,
-                window_size = InitialWindow,
-                recv_window_size = RecvWindow,
-                tunnel = IsConnect
-            },
+                    RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
+                    StreamState = case EndStream of
+                        true -> half_closed_local;
+                        false -> open
+                    end,
+                    Stream = #stream{
+                        id = StreamId,
+                        state = StreamState,
+                        window_size = InitialWindow,
+                        recv_window_size = RecvWindow,
+                        tunnel = IsConnect,
+                        request_method = Method
+                    },
 
-            Frame = h2_frame:headers(StreamId, HeaderBlock, EndStream),
-            send_frame(Frame, State),
+                    Frame = h2_frame:headers(StreamId, HeaderBlock, EndStream),
+                    send_frame(Frame, State),
 
-            State1 = State#state{
-                encode_context = EncCtx1,
-                streams = maps:put(StreamId, Stream, State#state.streams),
-                next_stream_id = StreamId + 2
-            },
+                    State1 = State#state{
+                        encode_context = EncCtx1,
+                        streams = maps:put(StreamId, Stream, State#state.streams),
+                        next_stream_id = StreamId + 2
+                    },
 
-            {keep_state, State1, [{reply, From, {ok, StreamId}}]}
+                    {keep_state, State1, [{reply, From, {ok, StreamId}}]}
+            end
     end;
 
 handle_send_request(From, _Method, _Path, _Headers, _EndStream, State) ->
@@ -1522,7 +1542,12 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
         N when is_integer(N), ActiveStreams >= N ->
             {keep_state, State, [{reply, From, {error, max_streams_exceeded}}]};
         _ ->
-            IsConnect = proplists:get_value(<<":method">>, Headers) =:= <<"CONNECT">>,
+            Method = proplists:get_value(<<":method">>, Headers),
+            IsConnect = Method =:= <<"CONNECT">>,
+            case validate_outbound_request(Headers) of
+                {error, _} = Err ->
+                    {keep_state, State, [{reply, From, Err}]};
+                ok ->
             {HeaderBlock, EncCtx1} = h2_hpack:encode(Headers, EncCtx),
             RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
             StreamState = case EndStream of true -> half_closed_local; false -> open end,
@@ -1531,7 +1556,8 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
                 state = StreamState,
                 window_size = InitialWindow,
                 recv_window_size = RecvWindow,
-                tunnel = IsConnect
+                tunnel = IsConnect,
+                request_method = Method
             },
             Frame = h2_frame:headers(StreamId, HeaderBlock, EndStream),
             send_frame(Frame, State),
@@ -1541,6 +1567,7 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
                 next_stream_id = StreamId + 2
             },
             {keep_state, State1, [{reply, From, {ok, StreamId}}]}
+            end
     end;
 handle_send_request_headers(From, _Headers, _EndStream, State) ->
     {keep_state, State, [{reply, From, {error, not_client}}]}.
@@ -1548,6 +1575,9 @@ handle_send_request_headers(From, _Headers, _EndStream, State) ->
 handle_send_response(From, StreamId, Status, Headers, #state{mode = server, streams = Streams,
                                                               encode_context = EncCtx} = State) ->
     case maps:find(StreamId, Streams) of
+        _ when Status =:= 101 ->
+            %% RFC 9113 §8.6: HTTP/2 MUST NOT generate 101 Switching Protocols.
+            {keep_state, State, [{reply, From, {error, status_101_forbidden}}]};
         {ok, #stream{state = StreamState, tunnel = IsTunnel} = Stream}
           when StreamState == open; StreamState == half_closed_remote ->
             %% RFC 7540 §8.3: a tunnel response (CONNECT 2xx) MUST NOT carry
@@ -1560,6 +1590,10 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
                 false ->
                     StatusBin = integer_to_binary(Status),
                     AllHeaders = [{<<":status">>, StatusBin} | Headers],
+                    case validate_outbound_response(AllHeaders) of
+                        {error, _} = Err ->
+                            {keep_state, State, [{reply, From, Err}]};
+                        ok ->
                     {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
                     Frame = h2_frame:headers(StreamId, HeaderBlock, false),
                     send_frame(Frame, State),
@@ -1573,6 +1607,7 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
                         streams = maps:put(StreamId, Stream1, Streams)
                     },
                     {keep_state, State1, [{reply, From, ok}]}
+                    end
             end;
         {ok, _} ->
             {keep_state, State, [{reply, From, {error, invalid_stream_state}}]};
@@ -1661,6 +1696,10 @@ handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams, encode_
             %% RFC 7540 §8.3: trailers are forbidden on a CONNECT tunnel.
             {keep_state, State, [{reply, From, {error, tunnel_no_trailers}}]};
         {ok, #stream{state = StreamState} = Stream} when StreamState == open; StreamState == half_closed_remote ->
+            case validate_trailers(Trailers, true) of
+                {error, _} = Err ->
+                    {keep_state, State, [{reply, From, Err}]};
+                ok ->
             %% Encode trailers
             {HeaderBlock, EncCtx1} = h2_hpack:encode(Trailers, EncCtx),
 
@@ -1687,6 +1726,7 @@ handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams, encode_
                     {keep_state, State2, [{reply, From, ok}]};
                 _ ->
                     {keep_state, State1, [{reply, From, ok}]}
+            end
             end;
         {ok, _} ->
             {keep_state, State, [{reply, From, {error, invalid_stream_state}}]};
