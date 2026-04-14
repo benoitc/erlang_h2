@@ -851,10 +851,14 @@ handle_frame(_StateName, {priority, _StreamId, _Exclusive, _DependsOn, _Weight},
     %% Priority is advisory, ignore
     {ok, connected, State};
 
+%% RFC 9113 §8.4: PUSH_PROMISE MUST only be sent by a server. A server
+%% receiving it is a connection PROTOCOL_ERROR.
+handle_frame(_StateName, {push_promise, _, _, _, _}, #state{mode = server} = State) ->
+    {error, protocol_error, State};
+%% Client side: we advertised enable_push=0 so a push is already a
+%% violation, but be lenient — reset the promised stream and keep the
+%% connection up (§6.6).
 handle_frame(_StateName, {push_promise, _StreamId, PromisedId, _HeaderBlock, _EndHeaders}, State) ->
-    %% RFC 9113 §6.6: a recipient that doesn't accept push MAY reset the
-    %% promised stream. Stream-scoped RST_STREAM keeps the connection alive
-    %% rather than forcing a GOAWAY on every unwanted push.
     send_rst_stream(PromisedId, refused_stream, State),
     {ok, connected, State};
 
