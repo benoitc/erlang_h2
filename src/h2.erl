@@ -166,8 +166,10 @@ connect_ssl(Host, Port, Opts, Timeout) ->
                     _ = ssl:close(Socket),
                     {error, {alpn_mismatch, Other}};
                 {error, protocol_not_negotiated} ->
-                    %% Continue anyway, assume h2
-                    start_connection(client, Socket, Opts);
+                    %% RFC 9113 §3.3: TLS endpoints MUST use ALPN to
+                    %% negotiate "h2". Don't fall back to assuming HTTP/2.
+                    _ = ssl:close(Socket),
+                    {error, alpn_not_negotiated};
                 {error, Reason} ->
                     _ = ssl:close(Socket),
                     {error, {alpn_error, Reason}}

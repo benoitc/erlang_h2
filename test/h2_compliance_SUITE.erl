@@ -109,7 +109,8 @@
     client_rejects_enable_push_one_test/1,
     head_response_with_content_length_accepted_test/1,
     body_forbidden_response_without_end_stream_rejected_test/1,
-    priority_wrong_length_is_stream_error_test/1
+    priority_wrong_length_is_stream_error_test/1,
+    connect_ssl_without_alpn_rejected_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -229,7 +230,8 @@ groups() ->
             client_rejects_enable_push_one_test,
             head_response_with_content_length_accepted_test,
             body_forbidden_response_without_end_stream_rejected_test,
-            priority_wrong_length_is_stream_error_test
+            priority_wrong_length_is_stream_error_test,
+            connect_ssl_without_alpn_rejected_test
         ]}
     ].
 
@@ -2207,6 +2209,31 @@ priority_wrong_length_is_stream_error_test(Config) ->
         Other            -> ct:fail({expected_stream_error, Other})
     end,
     ssl:close(Sock),
+    ok.
+
+%% RFC 9113 §3.3: over TLS, "h2" MUST be negotiated via ALPN. Our client
+%% must not assume HTTP/2 when ALPN was skipped.
+connect_ssl_without_alpn_rejected_test(Config) ->
+    %% Listen with TLS but advertise no ALPN protocols.
+    Opts = [
+        {certfile, ?config(cert_file, Config)},
+        {keyfile, ?config(key_file, Config)},
+        {versions, ['tlsv1.2', 'tlsv1.3']},
+        {reuseaddr, true},
+        {active, false},
+        {mode, binary}
+    ],
+    {ok, LS} = ssl:listen(0, Opts),
+    {ok, {_, Port}} = ssl:sockname(LS),
+    spawn_link(fun() ->
+        _ = (catch begin
+            {ok, Tr} = ssl:transport_accept(LS, 5000),
+            _ = ssl:handshake(Tr, 5000)
+        end)
+    end),
+    ?assertMatch({error, alpn_not_negotiated},
+                 h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]})),
+    ssl:close(LS),
     ok.
 
 wait_for_rst_or_goaway(Sock, Timeout) ->
