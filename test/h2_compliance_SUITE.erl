@@ -112,7 +112,8 @@
     priority_wrong_length_is_stream_error_test/1,
     connect_ssl_without_alpn_rejected_test/1,
     unknown_frame_type_is_ignored_test/1,
-    window_update_on_idle_stream_triggers_goaway_test/1
+    window_update_on_idle_stream_triggers_goaway_test/1,
+    goaway_closes_tcp_socket_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -235,7 +236,8 @@ groups() ->
             priority_wrong_length_is_stream_error_test,
             connect_ssl_without_alpn_rejected_test,
             unknown_frame_type_is_ignored_test,
-            window_update_on_idle_stream_triggers_goaway_test
+            window_update_on_idle_stream_triggers_goaway_test,
+            goaway_closes_tcp_socket_test
         ]}
     ].
 
@@ -2282,6 +2284,22 @@ wait_for_ping_ack(Sock, Timeout) ->
             end;
         {error, _} -> timeout
     end.
+
+%% RFC 9113 §5.4: after sending GOAWAY the endpoint MUST close the TCP
+%% connection. h2spec §5.4.1/1 otherwise times out waiting for close.
+goaway_closes_tcp_socket_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    %% Force a connection error: WINDOW_UPDATE on an idle stream id.
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:window_update(99, 1024))),
+    case wait_for_goaway(Sock, 3000) of
+        {ok, _ErrorCode} -> ok;
+        timeout          -> ct:fail(no_goaway)
+    end,
+    %% The server must close the socket — ssl:recv must return closed.
+    ?assertEqual({error, closed}, ssl:recv(Sock, 9, 3000)),
+    ssl:close(Sock),
+    ok.
 
 wait_for_rst_or_goaway(Sock, Timeout) ->
     case ssl:recv(Sock, 9, Timeout) of

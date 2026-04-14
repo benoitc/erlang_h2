@@ -594,8 +594,11 @@ goaway_received(EventType, Event, State) ->
 %% State: closing
 %% ============================================================================
 
-closing(enter, _OldState, State) ->
-    %% Start close timer
+closing(enter, _OldState, #state{socket = Socket, transport = Transport} = State) ->
+    %% We entered `closing` after sending GOAWAY for a connection error —
+    %% RFC 9113 §5.4: close the TCP/TLS connection ourselves rather than
+    %% waiting for the peer. Keep a safety timer in case close blocks.
+    _ = Transport:close(Socket),
     Timer = erlang:start_timer(?CLOSE_TIMEOUT_MS, self(), close_timeout),
     {keep_state, State#state{close_timer = Timer}};
 
@@ -815,6 +818,10 @@ handle_frame(_StateName, {rst_stream, StreamId, ErrorCode},
             {error, protocol_error, State}
     end;
 
+%% RFC 9113 §5.3.1: a stream cannot depend on itself — stream PROTOCOL_ERROR.
+handle_frame(_StateName, {priority, StreamId, _Exclusive, StreamId, _Weight}, State) ->
+    send_rst_stream(StreamId, protocol_error, State),
+    {ok, connected, State};
 handle_frame(_StateName, {priority, _StreamId, _Exclusive, _DependsOn, _Weight}, State) ->
     %% Priority is advisory, ignore
     {ok, connected, State};
