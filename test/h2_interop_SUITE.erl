@@ -198,9 +198,12 @@ timeout_cmd() ->
 
 run_h2spec(Cmd) ->
     Flat = lists:flatten(Cmd),
-    ct:log("~s", [Flat]),
+    ct:pal("h2spec command: ~s", [Flat]),
     Output = os:cmd(Flat ++ " ; echo __EXIT__=$?"),
-    ct:log("~s", [Output]),
+    %% ct:pal prints to both the CT HTML log and the runner's stdout, so
+    %% a failure in CI surfaces the full h2spec output without having to
+    %% download the CT artifact.
+    ct:pal("~ts", [unicode:characters_to_binary(Output)]),
     Failed = parse_h2spec_failed(Output),
     Exit   = parse_exit_code(Output),
     case {Failed, Exit} of
