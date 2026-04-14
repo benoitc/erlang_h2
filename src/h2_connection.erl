@@ -36,13 +36,16 @@
 -define(SETTINGS_TIMEOUT_MS, 5000).
 -define(CLOSE_TIMEOUT_MS, 5000).
 -define(GOAWAY_DRAIN_MS, 100).
-%% RFC 9113 §5.1 requires that post-close frames be classified as connection
-%% vs stream errors based on how the stream reached `closed`. We retain a
-%% bounded FIFO of closed streams so the lookup can consult real state
-%% instead of a stream-id heuristic. Anything older than this gets evicted
-%% and falls back to the (looser) heuristic — safe because well-behaved peers
-%% do not send frames on long-closed streams.
+%% RFC 9113 §5.1: post-close error classification needs to know whether the
+%% stream was closed via END_STREAM (connection-scoped error) or RST_STREAM
+%% (stream-scoped). We keep two layered caches so the lookup is exact for
+%% both recent and less-recent streams:
+%%   * full #stream record for the last ?CLOSED_STREAMS_LIMIT ids
+%%     (needed for body/trailers follow-up logic that depends on the record),
+%%   * a compact id → reason side map for the last ?CLOSED_REASONS_LIMIT ids.
+%% Beyond both bounds we fall back to a stream-id-range heuristic.
 -define(CLOSED_STREAMS_LIMIT, 100).
+-define(CLOSED_REASONS_LIMIT, 10000).
 %% RFC 9113 §10.5: mitigate PING and RST_STREAM floods. Counters reset every
 %% second; exceeding the limit triggers GOAWAY(ENHANCE_YOUR_CALM).
 -define(PING_FLOOD_LIMIT_PER_SEC, 20).
@@ -117,6 +120,10 @@
     %% When the limit is exceeded the oldest id is evicted from `streams`.
     closed_streams = queue:new() :: queue:queue(non_neg_integer()),
     closed_streams_count = 0 :: non_neg_integer(),
+    %% Longer-lived compact id → reason map. Survives eviction from `streams`.
+    closed_reasons = #{} :: #{non_neg_integer() => end_stream | rst},
+    closed_reasons_q = queue:new() :: queue:queue(non_neg_integer()),
+    closed_reasons_count = 0 :: non_neg_integer(),
     next_stream_id :: non_neg_integer(),  % 1 for client, 2 for server
     last_peer_stream_id = 0 :: non_neg_integer(),
 
@@ -831,8 +838,10 @@ handle_frame(_StateName, {rst_stream, StreamId, ErrorCode},
         {ok, State0} ->
             %% RFC 7540 §6.4 / §5.1: RST_STREAM on an "idle" stream (one that was
             %% never opened by either side) is a connection PROTOCOL_ERROR.
-            case maps:is_key(StreamId, Streams)
-                 orelse in_closed_stream_range(StreamId, State0) of
+            WasSeen = maps:is_key(StreamId, Streams)
+                 orelse recently_closed_reason(StreamId, State0) =/= unknown
+                 orelse in_closed_stream_range(StreamId, State0),
+            case WasSeen of
                 true ->
                     notify_stream(StreamId, {stream_reset, StreamId,
                                              h2_error:name(ErrorCode)}, State0),
@@ -988,7 +997,21 @@ handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, _Priority, #state{m
             send_rst_stream(StreamId, stream_closed, State),
             {ok, connected, State};
         error ->
-            %% New stream - validate stream ID
+            %% No active record. If the id was closed recently (record
+            %% evicted but reason retained), apply the spec-correct
+            %% classification before treating it as a new stream.
+            case recently_closed_reason(StreamId, State) of
+                end_stream ->
+                    {error, stream_closed, State};
+                rst ->
+                    send_rst_stream(StreamId, stream_closed, State),
+                    {ok, connected, State};
+                unknown ->
+                    handle_headers_new(StreamId, HeaderBlock, EndStream, EndHeaders, Mode, State)
+            end
+    end.
+
+handle_headers_new(StreamId, HeaderBlock, EndStream, EndHeaders, Mode, State) ->
             case validate_stream_id(StreamId, Mode, State) of
                 ok ->
                     %% RFC 9113 §5.1.2: reject peer-initiated streams that
@@ -1011,8 +1034,7 @@ handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, _Priority, #state{m
                     end;
                 {error, ErrorCode} ->
                     {error, ErrorCode, State}
-            end
-    end.
+            end.
 
 %% RFC 9113 §5.1.2: counts streams this endpoint accepted from the peer that
 %% are still in open / half_closed_* (the three states that count toward the
@@ -1765,15 +1787,30 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
                     send_rst_stream(StreamId, stream_closed, State0a),
                     {ok, connected, State0a};
                 error ->
-                    case in_closed_stream_range(StreamId, State0a) of
-                        true ->
+                    case recently_closed_reason(StreamId, State0a) of
+                        end_stream ->
+                            %% Exact: peer END_STREAM then more DATA → conn error.
+                            {error, stream_closed, State0a};
+                        rst ->
                             send_rst_stream(StreamId, stream_closed, State0a),
                             {ok, connected, State0a};
-                        false ->
-                            {error, protocol_error, State0a}
+                        unknown ->
+                            case in_closed_stream_range(StreamId, State0a) of
+                                true ->
+                                    send_rst_stream(StreamId, stream_closed, State0a),
+                                    {ok, connected, State0a};
+                                false ->
+                                    {error, protocol_error, State0a}
+                            end
                     end
             end
     end.
+
+%% Exact lookup for recently-closed streams. Returns `unknown` for ids
+%% beyond the closed_reasons retention window; callers fall back to
+%% `in_closed_stream_range/2`.
+recently_closed_reason(StreamId, #state{closed_reasons = Reasons}) ->
+    maps:get(StreamId, Reasons, unknown).
 
 %% Fallback heuristic for stream ids evicted from the closed-streams FIFO.
 %% Treats both peer-initiated ids (up to last_peer_stream_id) and our own
@@ -2367,7 +2404,10 @@ put_stream(StreamId, Stream, #state{streams = Streams} = State) ->
 %% error. The FIFO is capped so memory stays bounded.
 close_stream(StreamId, Reason, #state{streams = Streams,
                                        closed_streams = Q,
-                                       closed_streams_count = N} = State) ->
+                                       closed_streams_count = N,
+                                       closed_reasons = Reasons,
+                                       closed_reasons_q = RQ,
+                                       closed_reasons_count = RN} = State) ->
     Streams1 = case maps:find(StreamId, Streams) of
         {ok, Stream} ->
             maps:put(StreamId, Stream#stream{state = closed,
@@ -2379,13 +2419,26 @@ close_stream(StreamId, Reason, #state{streams = Streams,
     Q1 = queue:in(StreamId, Q),
     N1 = N + 1,
     {Streams2, Q2, N2} = evict_old_closed(Streams1, Q1, N1),
-    State#state{streams = Streams2, closed_streams = Q2, closed_streams_count = N2}.
+    Reasons1 = maps:put(StreamId, Reason, Reasons),
+    RQ1 = queue:in(StreamId, RQ),
+    RN1 = RN + 1,
+    {Reasons2, RQ2, RN2} = evict_old_reasons(Reasons1, RQ1, RN1),
+    State#state{streams = Streams2,
+                closed_streams = Q2, closed_streams_count = N2,
+                closed_reasons = Reasons2,
+                closed_reasons_q = RQ2, closed_reasons_count = RN2}.
 
 evict_old_closed(Streams, Q, N) when N =< ?CLOSED_STREAMS_LIMIT ->
     {Streams, Q, N};
 evict_old_closed(Streams, Q, N) ->
     {{value, OldId}, Q1} = queue:out(Q),
     evict_old_closed(maps:remove(OldId, Streams), Q1, N - 1).
+
+evict_old_reasons(Reasons, Q, N) when N =< ?CLOSED_REASONS_LIMIT ->
+    {Reasons, Q, N};
+evict_old_reasons(Reasons, Q, N) ->
+    {{value, OldId}, Q1} = queue:out(Q),
+    evict_old_reasons(maps:remove(OldId, Reasons), Q1, N - 1).
 
 count_active_streams(#state{streams = Streams}) ->
     maps:fold(fun(_Id, #stream{state = S}, Acc) ->
