@@ -344,6 +344,11 @@ decode_literal(Bin, Prefix, Ctx) ->
             Err
     end.
 
+%% Truncated input — caller supplied a header block that ended before the
+%% string literal was complete (RFC 7541 §5.2). Return a tagged error
+%% instead of crashing with function_clause.
+decode_string(<<>>) ->
+    {error, incomplete_string};
 decode_string(<<2#1:1, _/bits>> = Bin) ->
     %% Huffman encoded
     case decode_integer(Bin, 7) of
