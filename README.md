@@ -171,6 +171,87 @@ ok = h2:send_data(Conn, Sid, FrameBytes, false).
 
 If the peer never advertised the setting, `h2:request/3` returns `{error, extended_connect_disabled}`. Server handlers see `:protocol` in the request `Headers` argument. Tunnel semantics (no body length, no trailers) apply once the 2xx is sent.
 
+## Using with Ranch
+
+The built-in `h2:start_server/2` runs its own acceptor pool. To plug into an existing Ranch listener instead, use `h2_connection` directly — it's a normal `gen_statem` you hand a socket to. A minimal Ranch protocol module:
+
+```erlang
+-module(h2_ranch_protocol).
+-behaviour(ranch_protocol).
+-export([start_link/3]).
+
+start_link(Ref, Transport, Opts) ->
+    {ok, spawn_link(fun() -> init(Ref, Transport, Opts) end)}.
+
+init(Ref, Transport, #{handler := Handler} = Opts) ->
+    {ok, Socket}  = ranch:handshake(Ref),
+    TransportMod  = case Transport of ranch_ssl -> ssl; ranch_tcp -> gen_tcp end,
+    ConnOpts      = #{settings => maps:get(settings, Opts, #{}),
+                      enable_connect_protocol => maps:get(enable_connect_protocol, Opts, false)},
+    {ok, Conn}    = h2_connection:start_link(server, Socket, self(), ConnOpts),
+    ok            = TransportMod:controlling_process(Socket, Conn),
+    _             = h2_connection:activate(Conn),
+    server_loop(Conn, Handler).
+
+server_loop(Conn, Handler) ->
+    receive
+        {h2, Conn, {request, Sid, M, P, H}} ->
+            spawn(fun() -> Handler(Conn, Sid, M, P, H) end),
+            server_loop(Conn, Handler);
+        {h2, Conn, {closed, _}} -> ok;
+        _                        -> server_loop(Conn, Handler)
+    end.
+```
+
+Wire it up:
+
+```erlang
+{ok, _} = ranch:start_listener(my_h2, ranch_ssl,
+    #{socket_opts => [{port, 8443},
+                      {certfile, "cert.pem"}, {keyfile, "key.pem"},
+                      {alpn_preferred_protocols, [<<"h2">>]}]},
+    h2_ranch_protocol,
+    #{handler => fun my_app:handle/5}).
+```
+
+Ranch owns draining, acceptor-pool sizing, and metrics; `h2_connection` handles h2 semantics. Public primitives used: `h2_connection:start_link/4` and `h2_connection:activate/1`.
+
+## Coexisting with HTTP/1.1
+
+This library is HTTP/2-only. Where you need HTTP/1.1 too, the pattern is always "different library, same socket boundary".
+
+**Client fallback.** `h2:connect/2,3` surfaces ALPN mismatches explicitly — no silent fall-through to assumed-h2 (RFC 9113 §3.3):
+
+```erlang
+case h2:connect(Host, 443) of
+    {ok, Conn}                               -> h2_flow(Conn);
+    {error, {alpn_mismatch, <<"http/1.1">>}} -> http1_flow(Host);
+    {error, alpn_not_negotiated}             -> http1_flow(Host);
+    Err                                      -> Err
+end.
+```
+
+**Dual-stack server.** Advertise both protocols on the listener and dispatch by ALPN result. With the Ranch snippet above:
+
+```erlang
+init(Ref, ranch_ssl, Opts) ->
+    {ok, Socket} = ranch:handshake(Ref),
+    case ssl:negotiated_protocol(Socket) of
+        {ok, <<"h2">>}       -> start_h2(Socket, Opts);
+        {ok, <<"http/1.1">>} -> start_http1(Socket, Opts);   %% e.g. cowboy / elli
+        _                    -> ssl:close(Socket)
+    end.
+```
+
+Listener `alpn_preferred_protocols` becomes `[<<"h2">>, <<"http/1.1">>]`. One port, TLS picks per connection.
+
+**Cleartext `Upgrade: h2c` from HTTP/1.1.** Deprecated by RFC 9113 and not supported. Use prior-knowledge h2c instead — both peers agree out of band that the connection is plaintext h2:
+
+```erlang
+{ok, Conn}   = h2:connect(Host, Port, #{transport => tcp}).
+{ok, Server} = h2:start_server(Port, #{transport => tcp, handler => Handler}).
+```
+
 ## Modules
 
 | Module | Purpose |
