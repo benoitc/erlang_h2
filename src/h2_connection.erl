@@ -323,9 +323,9 @@ init({Mode, Socket, Owner, Opts}) ->
     EncodeCtx = h2_hpack:new_context(h2_settings:get(header_table_size, PeerSettings)),
     DecodeCtx = h2_hpack:new_context(h2_settings:get(header_table_size, LocalSettings)),
 
-    %% Initialize flow control
-    InitialWindow = h2_settings:get(initial_window_size, PeerSettings),
-    RecvWindow = h2_settings:get(initial_window_size, LocalSettings),
+    %% RFC 9113 §6.9.2: SETTINGS_INITIAL_WINDOW_SIZE only affects stream
+    %% flow-control windows; the connection window is fixed at 65535 octets
+    %% and only changes via WINDOW_UPDATE frames.
 
     State = #state{
         mode = Mode,
@@ -340,8 +340,8 @@ init({Mode, Socket, Owner, Opts}) ->
         encode_context = EncodeCtx,
         decode_context = DecodeCtx,
         next_stream_id = case Mode of client -> 1; server -> 2 end,
-        conn_window_size = InitialWindow,
-        recv_conn_window_size = RecvWindow,
+        conn_window_size = ?DEFAULT_INITIAL_WINDOW_SIZE,
+        recv_conn_window_size = ?DEFAULT_INITIAL_WINDOW_SIZE,
         scheme = Scheme,
         enable_connect_protocol = EnableConnectProtocol
     },
@@ -1710,14 +1710,15 @@ in_closed_stream_range(StreamId, #state{mode = Mode, last_peer_stream_id = LastP
 
 %% Connection-level WINDOW_UPDATE refill. Called for every DATA frame,
 %% including those on closed/unknown streams — per RFC 9113 §5.1 the
-%% connection window is consumed regardless of stream state.
-maybe_send_conn_window_update(_DataSize, #state{recv_conn_window_size = ConnWindow,
-                                                 local_settings = Settings} = State) ->
-    InitialWindow = h2_settings:get(initial_window_size, Settings),
-    Threshold = InitialWindow div 2,
+%% connection window is consumed regardless of stream state. The refill
+%% target is the fixed connection window default (RFC 9113 §6.9.2), not
+%% SETTINGS_INITIAL_WINDOW_SIZE, which only adjusts stream windows.
+maybe_send_conn_window_update(_DataSize, #state{recv_conn_window_size = ConnWindow} = State) ->
+    Target = ?DEFAULT_INITIAL_WINDOW_SIZE,
+    Threshold = Target div 2,
     case ConnWindow < Threshold of
         true ->
-            ConnIncrement = InitialWindow - ConnWindow,
+            ConnIncrement = Target - ConnWindow,
             send_frame(h2_frame:window_update(0, ConnIncrement), State),
             State#state{recv_conn_window_size = ConnWindow + ConnIncrement};
         false ->
