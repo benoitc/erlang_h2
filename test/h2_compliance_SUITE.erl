@@ -116,7 +116,9 @@
     goaway_closes_tcp_socket_test/1,
     iws_exceeds_max_triggers_flow_control_error_test/1,
     priority_self_dependency_is_stream_error_test/1,
-    headers_priority_self_dependency_is_stream_error_test/1
+    headers_priority_self_dependency_is_stream_error_test/1,
+    send_request_without_host_omits_authority_test/1,
+    send_connect_without_host_rejected_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -243,7 +245,9 @@ groups() ->
             goaway_closes_tcp_socket_test,
             iws_exceeds_max_triggers_flow_control_error_test,
             priority_self_dependency_is_stream_error_test,
-            headers_priority_self_dependency_is_stream_error_test
+            headers_priority_self_dependency_is_stream_error_test,
+            send_request_without_host_omits_authority_test,
+            send_connect_without_host_rejected_test
         ]}
     ].
 
@@ -2276,6 +2280,14 @@ window_update_on_idle_stream_triggers_goaway_test(Config) ->
     ssl:close(Sock),
     ok.
 
+read_headers_block(S) ->
+    {ok, <<Len:24, Type:8, _Flags:8, _:1, _:31>>} = ssl:recv(S, 9, 5000),
+    {ok, Body} = case Len of 0 -> {ok, <<>>}; _ -> ssl:recv(S, Len, 5000) end,
+    case Type of
+        16#1 -> Body;   %% HEADERS
+        _    -> read_headers_block(S)
+    end.
+
 wait_for_ping_ack(Sock, Timeout) ->
     case ssl:recv(Sock, 9, Timeout) of
         {ok, <<Len:24, Type:8, Flags:8, _:32>>} ->
@@ -2362,6 +2374,49 @@ headers_priority_self_dependency_is_stream_error_test(Config) ->
         Other            -> ct:fail({expected_rst, Other})
     end,
     ssl:close(Sock),
+    ok.
+
+%% RFC 9113 §8.3.1: :authority is optional for non-CONNECT methods. When
+%% the caller omits host, we should omit :authority entirely rather than
+%% send an empty string.
+send_request_without_host_omits_authority_test(Config) ->
+    {ok, LS, Port} = raw_tls_listen(Config),
+    Parent = self(),
+    spawn_link(fun() ->
+        {ok, S} = raw_tls_accept(LS),
+        Block = read_headers_block(S),
+        {ok, Decoded, _} = h2_hpack:decode(Block, h2_hpack:new_context()),
+        Parent ! {headers, Decoded},
+        timer:sleep(200),
+        ssl:close(S)
+    end),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, _Sid} = h2:request(Conn, <<"GET">>, <<"/">>, []),
+    receive
+        {headers, H} ->
+            ?assertEqual(undefined, proplists:get_value(<<":authority">>, H))
+    after 3000 ->
+        ct:fail(no_headers)
+    end,
+    h2:close(Conn),
+    ssl:close(LS),
+    drain_exits(),
+    ok.
+
+%% RFC 7540 §8.3: CONNECT MUST carry :authority. Reject at the API layer
+%% rather than ship a malformed request with :authority = "".
+send_connect_without_host_rejected_test(Config) ->
+    {ok, LS, Port} = raw_tls_listen(Config),
+    spawn_link(fun() ->
+        {ok, _S} = raw_tls_accept(LS),
+        timer:sleep(500)
+    end),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    ?assertMatch({error, missing_authority},
+                 h2:request(Conn, <<"CONNECT">>, <<>>, [])),
+    h2:close(Conn),
+    ssl:close(LS),
+    drain_exits(),
     ok.
 
 wait_for_rst_or_goaway(Sock, Timeout) ->

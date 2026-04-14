@@ -1795,20 +1795,27 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
             {keep_state, State, [{reply, From, {error, max_streams_exceeded}}]};
         _ ->
             IsConnect = Method =:= <<"CONNECT">>,
-            Authority = proplists:get_value(<<"host">>, Headers, <<>>),
-            %% RFC 7540 §8.3: CONNECT MUST omit :scheme and :path; :authority required.
-            AllHeaders = case IsConnect of
-                true ->
-                    [{<<":method">>, Method},
-                     {<<":authority">>, Authority}
-                     | lists:filter(fun({N1, _}) -> N1 =/= <<"host">> end, Headers)];
-                false ->
-                    [{<<":method">>, Method},
-                     {<<":path">>, Path},
-                     {<<":scheme">>, Scheme},
-                     {<<":authority">>, Authority}
-                     | lists:filter(fun({N1, _}) -> N1 =/= <<"host">> end, Headers)]
-            end,
+            Host = proplists:get_value(<<"host">>, Headers),
+            %% RFC 7540 §8.3: CONNECT MUST omit :scheme/:path; :authority required.
+            %% For non-CONNECT, RFC 9113 §8.3.1 makes :authority optional — omit
+            %% it rather than injecting an empty string when host is missing.
+            case {IsConnect, Host} of
+                {true, undefined} ->
+                    {keep_state, State, [{reply, From, {error, missing_authority}}]};
+                _ ->
+                    PseudoBase = [{<<":method">>, Method}],
+                    Pseudo1 = case IsConnect of
+                        true  -> PseudoBase;
+                        false -> PseudoBase
+                                 ++ [{<<":path">>, Path},
+                                     {<<":scheme">>, Scheme}]
+                    end,
+                    Pseudo = case Host of
+                        undefined -> Pseudo1;
+                        _         -> Pseudo1 ++ [{<<":authority">>, Host}]
+                    end,
+                    AllHeaders = Pseudo
+                                 ++ lists:filter(fun({N1, _}) -> N1 =/= <<"host">> end, Headers),
 
             case validate_outbound_request(AllHeaders) of
                 {error, _} = Err ->
@@ -1847,6 +1854,7 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
 
                     {keep_state, State1, [{reply, From, {ok, StreamId}}]}
                     end
+            end
             end
     end;
 
