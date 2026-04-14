@@ -105,7 +105,8 @@
     rst_closed_stream_headers_triggers_rst_test/1,
     rst_closed_stream_data_triggers_rst_test/1,
     closed_stream_continuation_triggers_goaway_test/1,
-    max_concurrent_streams_refuses_excess_test/1
+    max_concurrent_streams_refuses_excess_test/1,
+    client_rejects_enable_push_one_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -221,7 +222,8 @@ groups() ->
             rst_closed_stream_headers_triggers_rst_test,
             rst_closed_stream_data_triggers_rst_test,
             closed_stream_continuation_triggers_goaway_test,
-            max_concurrent_streams_refuses_excess_test
+            max_concurrent_streams_refuses_excess_test,
+            client_rejects_enable_push_one_test
         ]}
     ].
 
@@ -2104,6 +2106,36 @@ max_concurrent_streams_refuses_excess_test(Config) ->
     end,
     ssl:close(Sock),
     h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% RFC 9113 §6.5.2: a client that receives SETTINGS_ENABLE_PUSH with any
+%% value other than 0 MUST treat it as a connection PROTOCOL_ERROR.
+client_rejects_enable_push_one_test(Config) ->
+    {ok, LS, Port} = raw_tls_listen(Config),
+    Parent = self(),
+    spawn_link(fun() ->
+        {ok, Tr} = ssl:transport_accept(LS, 5000),
+        {ok, S}  = ssl:handshake(Tr, 5000),
+        _ = ssl:recv(S, byte_size(<<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>), 5000),
+        %% Send SETTINGS with enable_push=1 — forbidden toward a client.
+        ok = ssl:send(S, h2_frame:encode(h2_frame:settings([{enable_push, 1}]))),
+        Result = wait_for_goaway(S, 3000),
+        Parent ! {goaway_result, Result},
+        ssl:close(S)
+    end),
+    %% Our client connects; it must reject peer SETTINGS → GOAWAY.
+    _ = (catch h2:connect("localhost", Port,
+                           #{ssl_opts => [{verify, verify_none}]})),
+    receive
+        {goaway_result, {ok, ErrorCode}} ->
+            ?assertEqual(1, ErrorCode);  %% PROTOCOL_ERROR
+        {goaway_result, Other} ->
+            ct:fail({no_goaway, Other})
+    after 5000 ->
+        ct:fail(server_timeout)
+    end,
+    ssl:close(LS),
     drain_exits(),
     ok.
 

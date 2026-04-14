@@ -822,11 +822,12 @@ handle_frame(_StateName, {push_promise, _StreamId, _PromisedId, _HeaderBlock, _E
 %% Internal: Settings Handling
 %% ============================================================================
 
-handle_settings(Settings, #state{peer_settings = OldSettings} = State) ->
-    %% Decode and validate settings
+handle_settings(Settings, #state{mode = Mode, peer_settings = OldSettings} = State) ->
+    %% Decode and validate settings. Validation is mode-aware so a client
+    %% receiving SETTINGS_ENABLE_PUSH=1 can reject per RFC 9113 §6.5.2.
     case h2_settings:decode(encode_settings_list(Settings)) of
         {ok, NewSettings} ->
-            case h2_settings:validate(NewSettings) of
+            case h2_settings:validate(NewSettings, Mode) of
                 ok ->
                     %% Merge and apply
                     MergedSettings = h2_settings:merge(OldSettings, NewSettings),

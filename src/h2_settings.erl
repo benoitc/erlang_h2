@@ -8,7 +8,7 @@
 
 -export([default/0, encode/1, decode/1]).
 -export([get/2, set/3, merge/2]).
--export([validate/1]).
+-export([validate/1, validate/2]).
 
 -include("h2.hrl").
 
@@ -114,45 +114,58 @@ decode_value(max_concurrent_streams, 16#ffffffff) -> unlimited;
 decode_value(max_header_list_size, 16#ffffffff) -> unlimited;
 decode_value(_, Value) -> Value.
 
-%% @doc Validate settings values.
+%% @doc Validate settings values (mode-agnostic).
 %% Returns ok if valid, or {error, {setting, Reason}} if invalid.
 -spec validate(settings()) -> ok | {error, term()}.
 validate(Settings) ->
-    validate_settings(maps:to_list(Settings)).
+    validate_settings(maps:to_list(Settings), any).
 
-validate_settings([]) ->
+%% @doc Validate settings values from the perspective of `Mode`. The mode
+%% matters for RFC 9113 §6.5.2 — a client that receives
+%% SETTINGS_ENABLE_PUSH with any value other than 0 MUST treat this as a
+%% connection PROTOCOL_ERROR. Servers enforce only the 0|1 range.
+-spec validate(settings(), client | server | any) -> ok | {error, term()}.
+validate(Settings, Mode) ->
+    validate_settings(maps:to_list(Settings), Mode).
+
+validate_settings([], _Mode) ->
     ok;
-validate_settings([{enable_push, V}|Rest]) when V == 0; V == 1 ->
-    validate_settings(Rest);
-validate_settings([{enable_push, V}|_]) ->
+%% RFC 9113 §6.5.2: clients MUST reject enable_push != 0.
+validate_settings([{enable_push, 0}|Rest], Mode) ->
+    validate_settings(Rest, Mode);
+validate_settings([{enable_push, 1}|_], client) ->
+    {error, {enable_push, {forbidden_for_client, 1}}};
+validate_settings([{enable_push, 1}|Rest], Mode) ->
+    validate_settings(Rest, Mode);
+validate_settings([{enable_push, V}|_], _Mode) ->
     {error, {enable_push, {invalid_value, V}}};
-validate_settings([{enable_connect_protocol, V}|Rest]) when V == 0; V == 1 ->
-    validate_settings(Rest);
-validate_settings([{enable_connect_protocol, V}|_]) ->
+validate_settings([{enable_connect_protocol, V}|Rest], Mode) when V == 0; V == 1 ->
+    validate_settings(Rest, Mode);
+validate_settings([{enable_connect_protocol, V}|_], _Mode) ->
     {error, {enable_connect_protocol, {invalid_value, V}}};
-validate_settings([{initial_window_size, V}|_]) when V > ?MAX_WINDOW_SIZE ->
+validate_settings([{initial_window_size, V}|_], _Mode) when V > ?MAX_WINDOW_SIZE ->
     {error, {initial_window_size, {exceeds_max, V}}};
-validate_settings([{initial_window_size, V}|Rest]) when is_integer(V), V >= 0 ->
-    validate_settings(Rest);
-validate_settings([{max_frame_size, V}|_]) when V < ?MIN_FRAME_SIZE ->
+validate_settings([{initial_window_size, V}|Rest], Mode) when is_integer(V), V >= 0 ->
+    validate_settings(Rest, Mode);
+validate_settings([{max_frame_size, V}|_], _Mode) when V < ?MIN_FRAME_SIZE ->
     {error, {max_frame_size, {below_min, V}}};
-validate_settings([{max_frame_size, V}|_]) when V > ?MAX_FRAME_SIZE ->
+validate_settings([{max_frame_size, V}|_], _Mode) when V > ?MAX_FRAME_SIZE ->
     {error, {max_frame_size, {exceeds_max, V}}};
-validate_settings([{max_frame_size, V}|Rest]) when is_integer(V) ->
-    validate_settings(Rest);
-validate_settings([{header_table_size, V}|Rest]) when is_integer(V), V >= 0 ->
-    validate_settings(Rest);
-validate_settings([{max_concurrent_streams, unlimited}|Rest]) ->
-    validate_settings(Rest);
-validate_settings([{max_concurrent_streams, V}|Rest]) when is_integer(V), V >= 0 ->
-    validate_settings(Rest);
-validate_settings([{max_header_list_size, unlimited}|Rest]) ->
-    validate_settings(Rest);
-validate_settings([{max_header_list_size, V}|Rest]) when is_integer(V), V >= 0 ->
-    validate_settings(Rest);
-validate_settings([{_, _}|Rest]) ->
+validate_settings([{max_frame_size, V}|Rest], Mode) when is_integer(V) ->
+    validate_settings(Rest, Mode);
+validate_settings([{header_table_size, V}|Rest], Mode) when is_integer(V), V >= 0 ->
+    validate_settings(Rest, Mode);
+validate_settings([{max_concurrent_streams, unlimited}|Rest], Mode) ->
+    validate_settings(Rest, Mode);
+validate_settings([{max_concurrent_streams, V}|Rest], Mode) when is_integer(V), V >= 0 ->
+    validate_settings(Rest, Mode);
+validate_settings([{max_header_list_size, unlimited}|Rest], Mode) ->
+    validate_settings(Rest, Mode);
+validate_settings([{max_header_list_size, V}|Rest], Mode) when is_integer(V), V >= 0 ->
+    validate_settings(Rest, Mode);
+validate_settings([{_, _}|Rest], Mode) ->
     %% Unknown settings are ignored
-    validate_settings(Rest).
+    validate_settings(Rest, Mode).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
