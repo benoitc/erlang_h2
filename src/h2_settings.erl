@@ -173,7 +173,7 @@ validate_settings([{_, _}|Rest], Mode) ->
 default_test() ->
     D = default(),
     ?assertEqual(4096, maps:get(header_table_size, D)),
-    ?assertEqual(1, maps:get(enable_push, D)),
+    ?assertEqual(0, maps:get(enable_push, D)),
     ?assertEqual(unlimited, maps:get(max_concurrent_streams, D)),
     ?assertEqual(65535, maps:get(initial_window_size, D)),
     ?assertEqual(16384, maps:get(max_frame_size, D)),

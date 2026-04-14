@@ -831,9 +831,12 @@ handle_frame(_StateName, {priority, _StreamId, _Exclusive, _DependsOn, _Weight},
     %% Priority is advisory, ignore
     {ok, connected, State};
 
-handle_frame(_StateName, {push_promise, _StreamId, _PromisedId, _HeaderBlock, _EndHeaders}, State) ->
-    %% We don't support server push, send GOAWAY
-    {error, protocol_error, State};
+handle_frame(_StateName, {push_promise, _StreamId, PromisedId, _HeaderBlock, _EndHeaders}, State) ->
+    %% RFC 9113 §6.6: a recipient that doesn't accept push MAY reset the
+    %% promised stream. Stream-scoped RST_STREAM keeps the connection alive
+    %% rather than forcing a GOAWAY on every unwanted push.
+    send_rst_stream(PromisedId, refused_stream, State),
+    {ok, connected, State};
 
 %% RFC 9113 §4.1: frames of unknown type MUST be ignored and discarded.
 handle_frame(_StateName, {unknown_frame, _Type, _Flags, _StreamId, _Payload}, State) ->

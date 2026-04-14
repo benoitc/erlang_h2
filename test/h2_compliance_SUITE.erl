@@ -118,7 +118,9 @@
     priority_self_dependency_is_stream_error_test/1,
     headers_priority_self_dependency_is_stream_error_test/1,
     send_request_without_host_omits_authority_test/1,
-    send_connect_without_host_rejected_test/1
+    send_connect_without_host_rejected_test/1,
+    server_advertises_enable_push_zero_test/1,
+    push_promise_gets_stream_reset_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -247,7 +249,9 @@ groups() ->
             priority_self_dependency_is_stream_error_test,
             headers_priority_self_dependency_is_stream_error_test,
             send_request_without_host_omits_authority_test,
-            send_connect_without_host_rejected_test
+            send_connect_without_host_rejected_test,
+            server_advertises_enable_push_zero_test,
+            push_promise_gets_stream_reset_test
         ]}
     ].
 
@@ -2279,6 +2283,61 @@ window_update_on_idle_stream_triggers_goaway_test(Config) ->
     end,
     ssl:close(Sock),
     ok.
+
+%% Server should advertise SETTINGS_ENABLE_PUSH=0 since we never produce push.
+server_advertises_enable_push_zero_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    Settings = read_server_settings(Sock, 3000),
+    %% enable_push is id 0x2
+    ?assertEqual(0, proplists:get_value(16#2, Settings, 0)),
+    ssl:close(Sock),
+    ok.
+
+%% RFC 9113 §6.6: a client that doesn't accept push resets the promised
+%% stream instead of GOAWAY-ing the connection.
+push_promise_gets_stream_reset_test(Config) ->
+    {ok, LS, Port} = raw_tls_listen(Config),
+    spawn_link(fun() ->
+        {ok, S} = raw_tls_accept(LS),
+        %% Send PUSH_PROMISE from server → client for promised stream 2.
+        Hdrs = [{<<":method">>, <<"GET">>}, {<<":scheme">>, <<"https">>},
+                {<<":path">>, <<"/">>}, {<<":authority">>, <<"l">>}],
+        {Block, _} = h2_hpack:encode(Hdrs, h2_hpack:new_context()),
+        Payload = <<0:1, 2:31, Block/binary>>,
+        Len = byte_size(Payload),
+        Frame = <<Len:24, 5:8, 16#4:8, 0:1, 1:31, Payload/binary>>,
+        ok = ssl:send(S, Frame),
+        timer:sleep(500),
+        ssl:close(S)
+    end),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    %% Connection stays alive — no {closed, ...} event should fire briefly.
+    receive
+        {h2, Conn, {closed, _}} -> ct:fail(connection_closed_on_push)
+    after 500 ->
+        ok
+    end,
+    h2:close(Conn),
+    ssl:close(LS),
+    drain_exits(),
+    ok.
+
+read_server_settings(Sock, Timeout) ->
+    case ssl:recv(Sock, 9, Timeout) of
+        {ok, <<Len:24, 4:8, 0:8, _:32>>} when Len > 0 ->
+            {ok, Payload} = ssl:recv(Sock, Len, Timeout),
+            parse_settings_payload(Payload, []);
+        {ok, <<Len:24, _:8, _:8, _:32>>} ->
+            _ = case Len of 0 -> ok; _ -> ssl:recv(Sock, Len, Timeout) end,
+            read_server_settings(Sock, Timeout);
+        {error, _} -> []
+    end.
+
+parse_settings_payload(<<>>, Acc) ->
+    lists:reverse(Acc);
+parse_settings_payload(<<Id:16, V:32, Rest/binary>>, Acc) ->
+    parse_settings_payload(Rest, [{Id, V} | Acc]).
 
 read_headers_block(S) ->
     {ok, <<Len:24, Type:8, _Flags:8, _:1, _:31>>} = ssl:recv(S, 9, 5000),

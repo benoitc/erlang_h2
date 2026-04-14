@@ -41,7 +41,9 @@
 
 %% Default Settings Values
 -define(DEFAULT_HEADER_TABLE_SIZE,      4096).
--define(DEFAULT_ENABLE_PUSH,            1).
+%% RFC 9113 §6.5.2: endpoints that do not produce server push SHOULD
+%% advertise 0. We reject inbound PUSH_PROMISE; advertise 0.
+-define(DEFAULT_ENABLE_PUSH,            0).
 -define(DEFAULT_MAX_CONCURRENT_STREAMS, unlimited).
 -define(DEFAULT_INITIAL_WINDOW_SIZE,    65535).
 -define(DEFAULT_MAX_FRAME_SIZE,         16384).
