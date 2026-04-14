@@ -851,16 +851,13 @@ handle_frame(_StateName, {priority, _StreamId, _Exclusive, _DependsOn, _Weight},
     %% Priority is advisory, ignore
     {ok, connected, State};
 
-%% RFC 9113 §8.4: PUSH_PROMISE MUST only be sent by a server. A server
-%% receiving it is a connection PROTOCOL_ERROR.
-handle_frame(_StateName, {push_promise, _, _, _, _}, #state{mode = server} = State) ->
+%% RFC 9113 §8.4: PUSH_PROMISE MUST only be sent by a server — a server
+%% receiving it is a connection PROTOCOL_ERROR. On the client side we
+%% advertise SETTINGS_ENABLE_PUSH=0, so the peer MUST NOT send
+%% PUSH_PROMISE at all; if it does, §6.5.2 requires a connection
+%% PROTOCOL_ERROR.
+handle_frame(_StateName, {push_promise, _, _, _, _}, State) ->
     {error, protocol_error, State};
-%% Client side: we advertised enable_push=0 so a push is already a
-%% violation, but be lenient — reset the promised stream and keep the
-%% connection up (§6.6).
-handle_frame(_StateName, {push_promise, _StreamId, PromisedId, _HeaderBlock, _EndHeaders}, State) ->
-    send_rst_stream(PromisedId, refused_stream, State),
-    {ok, connected, State};
 
 %% RFC 9113 §4.1: frames of unknown type MUST be ignored and discarded.
 handle_frame(_StateName, {unknown_frame, _Type, _Flags, _StreamId, _Payload}, State) ->

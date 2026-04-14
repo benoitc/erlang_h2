@@ -2296,13 +2296,13 @@ server_advertises_enable_push_zero_test(Config) ->
     ssl:close(Sock),
     ok.
 
-%% RFC 9113 §6.6: a client that doesn't accept push resets the promised
-%% stream instead of GOAWAY-ing the connection.
+%% RFC 9113 §6.5.2: a client that advertised SETTINGS_ENABLE_PUSH=0
+%% MUST treat an incoming PUSH_PROMISE as a connection PROTOCOL_ERROR.
 push_promise_gets_stream_reset_test(Config) ->
     {ok, LS, Port} = raw_tls_listen(Config),
+    Parent = self(),
     spawn_link(fun() ->
         {ok, S} = raw_tls_accept(LS),
-        %% Send PUSH_PROMISE from server → client for promised stream 2.
         Hdrs = [{<<":method">>, <<"GET">>}, {<<":scheme">>, <<"https">>},
                 {<<":path">>, <<"/">>}, {<<":authority">>, <<"l">>}],
         {Block, _} = h2_hpack:encode(Hdrs, h2_hpack:new_context()),
@@ -2310,17 +2310,19 @@ push_promise_gets_stream_reset_test(Config) ->
         Len = byte_size(Payload),
         Frame = <<Len:24, 5:8, 16#4:8, 0:1, 1:31, Payload/binary>>,
         ok = ssl:send(S, Frame),
-        timer:sleep(500),
+        Parent ! {goaway_result, wait_for_goaway(S, 3000)},
         ssl:close(S)
     end),
     {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
-    %% Connection stays alive — no {closed, ...} event should fire briefly.
     receive
-        {h2, Conn, {closed, _}} -> ct:fail(connection_closed_on_push)
-    after 500 ->
-        ok
+        {goaway_result, {ok, ErrorCode}} ->
+            ?assertEqual(1, ErrorCode);  %% PROTOCOL_ERROR
+        {goaway_result, Other} ->
+            ct:fail({no_goaway, Other})
+    after 5000 ->
+        ct:fail(server_timeout)
     end,
-    h2:close(Conn),
+    catch h2:close(Conn),
     ssl:close(LS),
     drain_exits(),
     ok.
