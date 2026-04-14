@@ -120,8 +120,8 @@ decode_value(_, Value) -> Value.
 validate(Settings) ->
     validate_settings(maps:to_list(Settings), any).
 
-%% @doc Validate settings values from the perspective of `Mode`. The mode
-%% matters for RFC 9113 §6.5.2 — a client that receives
+%% @doc Validate settings values from the perspective of the given mode.
+%% Matters for RFC 9113 §6.5.2 -- a client that receives
 %% SETTINGS_ENABLE_PUSH with any value other than 0 MUST treat this as a
 %% connection PROTOCOL_ERROR. Servers enforce only the 0|1 range.
 -spec validate(settings(), client | server | any) -> ok | {error, term()}.
