@@ -906,9 +906,14 @@ handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, _Priority, #state{m
                     State2 = State1#state{expecting_continuation = {StreamId, EndStream}},
                     {ok, connected, State2}
             end;
+        {ok, #stream{state = closed}} ->
+            %% RFC 9113 §5.1: a stream closed via END_STREAM accepts only
+            %% PRIORITY; HEADERS arriving on it is a CONNECTION error
+            %% STREAM_CLOSED (not a stream-scoped RST).
+            {error, stream_closed, State};
         {ok, _Stream} ->
-            %% RFC 7540 §6.2: HEADERS MUST NOT be sent on a half-closed-remote
-            %% or closed stream → stream error STREAM_CLOSED.
+            %% RFC 9113 §5.1 (half_closed_remote): HEADERS in this state is a
+            %% stream error STREAM_CLOSED.
             send_rst_stream(StreamId, stream_closed, State),
             {ok, connected, State};
         error ->
@@ -1603,7 +1608,12 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
                                     {ok, connected, State3}
                             end
                     end;
+                {ok, #stream{state = closed}} ->
+                    %% RFC 9113 §5.1: DATA on a stream closed via END_STREAM
+                    %% is a CONNECTION error STREAM_CLOSED.
+                    {error, stream_closed, State0a};
                 {ok, _} ->
+                    %% half_closed_remote etc.: stream-scoped STREAM_CLOSED.
                     send_rst_stream(StreamId, stream_closed, State0a),
                     {ok, connected, State0a};
                 error ->

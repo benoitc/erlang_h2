@@ -99,7 +99,9 @@
     authority_userinfo_rejected_outbound_test/1,
     authority_userinfo_rejected_inbound_test/1,
     extended_connect_bad_protocol_token_rejected_test/1,
-    connect_non_2xx_trailers_allowed_test/1
+    connect_non_2xx_trailers_allowed_test/1,
+    closed_stream_headers_triggers_goaway_test/1,
+    closed_stream_data_triggers_goaway_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -209,7 +211,9 @@ groups() ->
             authority_userinfo_rejected_outbound_test,
             authority_userinfo_rejected_inbound_test,
             extended_connect_bad_protocol_token_rejected_test,
-            connect_non_2xx_trailers_allowed_test
+            connect_non_2xx_trailers_allowed_test,
+            closed_stream_headers_triggers_goaway_test,
+            closed_stream_data_triggers_goaway_test
         ]}
     ].
 
@@ -1932,6 +1936,84 @@ raw_h2_client(Port) ->
     _ = read_first_settings(Sock),
     ok = ssl:send(Sock, h2_frame:encode(h2_frame:settings_ack())),
     {ok, Sock}.
+
+%% RFC 9113 §5.1: a stream closed via END_STREAM accepts only PRIORITY; any
+%% other frame is a CONNECTION error STREAM_CLOSED. Before the fix the server
+%% replied with a stream-scoped RST_STREAM.
+closed_stream_headers_triggers_goaway_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"localhost">>}
+    ],
+    {Block, Ctx1} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    %% Open + close stream 1 via END_STREAM.
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    %% Wait for the server's response + END_STREAM on stream 1.
+    ok = drain_until_end_stream(Sock, 1, 3000),
+    %% Send a second HEADERS on the now-closed stream. Spec mandates GOAWAY.
+    {Block2, _} = h2_hpack:encode(Headers, Ctx1),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block2, true))),
+    case wait_for_goaway(Sock, 3000) of
+        {ok, ErrorCode} -> ?assertEqual(5, ErrorCode);  %% STREAM_CLOSED
+        timeout         -> ct:fail(no_goaway)
+    end,
+    ssl:close(Sock),
+    ok.
+
+%% Same as above but the second frame is DATA.
+closed_stream_data_triggers_goaway_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"localhost">>}
+    ],
+    {Block, _Ctx1} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    ok = drain_until_end_stream(Sock, 1, 3000),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:data(1, <<"junk">>, false))),
+    case wait_for_goaway(Sock, 3000) of
+        {ok, ErrorCode} -> ?assertEqual(5, ErrorCode);  %% STREAM_CLOSED
+        timeout         -> ct:fail(no_goaway)
+    end,
+    ssl:close(Sock),
+    ok.
+
+%% Read frames until we see a DATA or HEADERS frame with END_STREAM on StreamId.
+drain_until_end_stream(Sock, StreamId, Timeout) ->
+    case ssl:recv(Sock, 9, Timeout) of
+        {ok, <<Len:24, Type:8, Flags:8, _:1, Sid:31>>} ->
+            _ = case Len of 0 -> <<>>; _ -> {ok, _} = ssl:recv(Sock, Len, Timeout) end,
+            EndStream = (Flags band 16#1) =:= 1,
+            IsData = Type =:= 16#0 orelse Type =:= 16#1,
+            case IsData andalso EndStream andalso Sid =:= StreamId of
+                true  -> ok;
+                false -> drain_until_end_stream(Sock, StreamId, Timeout)
+            end;
+        {error, _} -> timeout
+    end.
+
+wait_for_goaway(Sock, Timeout) ->
+    case ssl:recv(Sock, 9, Timeout) of
+        {ok, <<Len:24, Type:8, _Flags:8, _:1, _Sid:31>>} ->
+            Payload = case Len of
+                0 -> <<>>;
+                _ -> {ok, P} = ssl:recv(Sock, Len, Timeout), P
+            end,
+            case {Type, Payload} of
+                {16#7, <<_LastStream:32, ErrorCode:32, _/binary>>} ->
+                    {ok, ErrorCode};
+                _ ->
+                    wait_for_goaway(Sock, Timeout)
+            end;
+        {error, _} -> timeout
+    end.
 
 %% ---- Raw TLS fake-server helpers (for client-side behaviour tests) -------
 
