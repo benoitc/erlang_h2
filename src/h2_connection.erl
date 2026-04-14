@@ -1277,11 +1277,27 @@ finalize_client_initial(StreamId, true, _ExpectedCL, false, State) ->
 
 %% ---- Shared helpers ---------------------------------------------------------
 
-deliver_trailers(StreamId, Stream, Headers, State, NotifyFun) ->
-    Stream1 = Stream#stream{state = closed},
+%% RFC 9113 §5.1: trailers carry END_STREAM from the peer. That half-closes
+%% the peer's side — the new state depends on whether we've already sent
+%% END_STREAM ourselves:
+%%   open              → half_closed_remote
+%%   half_closed_local → closed
+%% Closing prematurely (as we used to) makes the owner's reply on a still-
+%% open server stream fail with invalid_stream_state.
+deliver_trailers(StreamId, #stream{state = StreamState} = Stream, Headers,
+                  State, NotifyFun) ->
+    NewState = case StreamState of
+        open              -> half_closed_remote;
+        half_closed_local -> closed;
+        _                 -> closed
+    end,
+    Stream1 = Stream#stream{state = NewState},
     State1  = put_stream(StreamId, Stream1, State),
     NotifyFun(StreamId, {trailers, StreamId, Headers}, State1),
-    {ok, connected, close_stream(StreamId, end_stream, State1)}.
+    case NewState of
+        closed -> {ok, connected, close_stream(StreamId, end_stream, State1)};
+        _      -> {ok, connected, State1}
+    end.
 
 %% Uniform 3-arity shim so `deliver_trailers` can dispatch either fan-out style.
 notify_owner_stream(_StreamId, Event, State) ->

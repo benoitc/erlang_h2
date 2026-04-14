@@ -1,9 +1,13 @@
 %% @doc HTTP/2 Interop Test Suite
 %%
 %% Drives our h2 server from h2spec to surface bugs only visible to a
-%% third-party peer. Library-level conformance lives in `h2_compliance_SUITE`,
-%% which exercises the same code paths with raw `ssl` + `h2_frame` +
-%% `h2_hpack`; this suite is strictly for external-peer interop.
+%% third-party peer. Library-level conformance lives in `h2_compliance_SUITE`;
+%% this suite is strictly for external-peer interop.
+%%
+%% Groups:
+%%   * `h2spec`        — generic + HPACK sections over TLS (ALPN).
+%%   * `h2spec_h2c`    — same generic + HPACK over plain TCP (prior knowledge).
+%%   * `h2spec_strict` — strict mode, small window / frame size, over TLS.
 %%
 %% Install h2spec (macOS): `brew install summerwind/h2spec/h2spec`
 %% Install h2spec (Linux): download the release tarball from
@@ -20,7 +24,11 @@
 
 -export([
     h2spec_generic_test/1,
-    h2spec_hpack_test/1
+    h2spec_hpack_test/1,
+    h2spec_h2c_generic_test/1,
+    h2spec_h2c_hpack_test/1,
+    h2spec_small_window_test/1,
+    h2spec_strict_test/1
 ]).
 
 %% ============================================================================
@@ -28,14 +36,17 @@
 %% ============================================================================
 
 suite() ->
-    %% h2spec_generic_test can take ~30 s on a slow runner.
-    [{timetrap, {seconds, 120}}].
+    [{timetrap, {seconds, 180}}].
 
 all() ->
-    [{group, h2spec}].
+    [{group, h2spec}, {group, h2spec_h2c}, {group, h2spec_strict}].
 
 groups() ->
-    [{h2spec, [sequence], [h2spec_generic_test, h2spec_hpack_test]}].
+    [
+        {h2spec,        [sequence], [h2spec_generic_test, h2spec_hpack_test]},
+        {h2spec_h2c,    [sequence], [h2spec_h2c_generic_test, h2spec_h2c_hpack_test]},
+        {h2spec_strict, [sequence], [h2spec_small_window_test, h2spec_strict_test]}
+    ].
 
 init_per_suite(Config) ->
     ok = application:ensure_started(crypto),
@@ -59,14 +70,7 @@ init_per_testcase(TestCase, Config) ->
             Handler = fun(Conn, StreamId, Method, Path, Headers) ->
                 handle_interop_request(Conn, StreamId, Method, Path, Headers)
             end,
-            ServerOpts = #{
-                cert    => ?config(cert_file, Config),
-                key     => ?config(key_file, Config),
-                handler => Handler,
-                %% Advertise a concrete cap so h2spec §5.1.2 can actually
-                %% verify enforcement instead of looping until its own timeout.
-                settings => #{max_concurrent_streams => 100}
-            },
+            ServerOpts = server_opts(TestCase, Handler, Config),
             case h2:start_server(0, ServerOpts) of
                 {ok, ServerRef} ->
                     Port = h2:server_port(ServerRef),
@@ -76,8 +80,26 @@ init_per_testcase(TestCase, Config) ->
             end
     end.
 
-tool_for(h2spec_generic_test) -> require("h2spec");
-tool_for(h2spec_hpack_test)   -> require("h2spec").
+%% TLS variants use the cert/key; h2c variants use TCP (`transport => tcp`).
+%% Strict/small-window variant advertises a tiny peer window + frame size
+%% to force fragmentation and flow-control exercise.
+server_opts(TC, Handler, Config) ->
+    Base = #{handler => Handler,
+             settings => #{max_concurrent_streams => 100}},
+    Tls = Base#{cert => ?config(cert_file, Config),
+                key  => ?config(key_file, Config)},
+    case TC of
+        h2spec_h2c_generic_test -> Base#{transport => tcp};
+        h2spec_h2c_hpack_test   -> Base#{transport => tcp};
+        h2spec_small_window_test ->
+            Tls#{settings => #{max_concurrent_streams => 100,
+                               initial_window_size    => 1024,
+                               max_frame_size         => 16384}};
+        h2spec_strict_test -> Tls;
+        _                  -> Tls
+    end.
+
+tool_for(_) -> require("h2spec").
 
 require(Name) ->
     case os:find_executable(Name) of
@@ -117,25 +139,50 @@ handle_interop_request(Conn, StreamId, _Method, _Path, _Headers) ->
     h2:send_data(Conn, StreamId, <<"ok">>, true).
 
 %% ============================================================================
-%% h2spec tests
+%% h2spec invocations
 %% ============================================================================
 
-%% First-pass observe mode: no --strict flag; any failures surface in ct:log
-%% with the full output so they can be triaged and either fixed or added to a
-%% skip list.
 h2spec_generic_test(Config) ->
     Port = ?config(port, Config),
-    Cmd = io_lib:format(
+    run_h2spec(io_lib:format(
         "~s 90 h2spec -h 127.0.0.1 -p ~p -t -k -o 5",
-        [timeout_cmd(), Port]),
-    run_h2spec(lists:flatten(Cmd)).
+        [timeout_cmd(), Port])).
 
 h2spec_hpack_test(Config) ->
     Port = ?config(port, Config),
-    Cmd = io_lib:format(
+    run_h2spec(io_lib:format(
         "~s 60 h2spec hpack -h 127.0.0.1 -p ~p -t -k -o 5",
-        [timeout_cmd(), Port]),
-    run_h2spec(lists:flatten(Cmd)).
+        [timeout_cmd(), Port])).
+
+%% h2c: plaintext (prior-knowledge), same test sections. Exercises the TCP
+%% acceptor path and the preface handling without TLS/ALPN in the way.
+h2spec_h2c_generic_test(Config) ->
+    Port = ?config(port, Config),
+    run_h2spec(io_lib:format(
+        "~s 90 h2spec -h 127.0.0.1 -p ~p -o 5",
+        [timeout_cmd(), Port])).
+
+h2spec_h2c_hpack_test(Config) ->
+    Port = ?config(port, Config),
+    run_h2spec(io_lib:format(
+        "~s 60 h2spec hpack -h 127.0.0.1 -p ~p -o 5",
+        [timeout_cmd(), Port])).
+
+%% Small window + small frame size: forces flow-control fragmentation +
+%% many WINDOW_UPDATE refills on the same test cases.
+h2spec_small_window_test(Config) ->
+    Port = ?config(port, Config),
+    run_h2spec(io_lib:format(
+        "~s 90 h2spec -h 127.0.0.1 -p ~p -t -k -o 5",
+        [timeout_cmd(), Port])).
+
+%% Strict mode: spec-ambiguous behaviours are treated as failures. Separate
+%% from the main run so a new ambiguity regression is visible on its own.
+h2spec_strict_test(Config) ->
+    Port = ?config(port, Config),
+    run_h2spec(io_lib:format(
+        "~s 90 h2spec --strict -h 127.0.0.1 -p ~p -t -k -o 5",
+        [timeout_cmd(), Port])).
 
 %% Wall-clock cap on the h2spec invocation — if a case hangs, the suite
 %% still progresses. Linux has `timeout`; macOS via coreutils has `gtimeout`.
@@ -150,8 +197,9 @@ timeout_cmd() ->
     end.
 
 run_h2spec(Cmd) ->
-    ct:log("~s", [Cmd]),
-    Output = os:cmd(Cmd ++ " ; echo __EXIT__=$?"),
+    Flat = lists:flatten(Cmd),
+    ct:log("~s", [Flat]),
+    Output = os:cmd(Flat ++ " ; echo __EXIT__=$?"),
     ct:log("~s", [Output]),
     Failed = parse_h2spec_failed(Output),
     Exit   = parse_exit_code(Output),
@@ -162,8 +210,7 @@ run_h2spec(Cmd) ->
     end.
 
 %% h2spec ends its output with "<N> tests, <P> passed, <S> skipped, <F> failed".
-%% Output is converted to UTF-8 bytes because `os:cmd` returns codepoints
-%% (h2spec uses ✓ / ✗ glyphs).
+%% `os:cmd` returns codepoints (h2spec uses ✓ / ✗); convert to UTF-8 bytes.
 parse_h2spec_failed(Output) ->
     Bin = unicode:characters_to_binary(Output),
     case re:run(Bin, "(\\d+)\\s+failed", [{capture, [1], binary}]) of
