@@ -114,7 +114,9 @@
     unknown_frame_type_is_ignored_test/1,
     window_update_on_idle_stream_triggers_goaway_test/1,
     goaway_closes_tcp_socket_test/1,
-    iws_exceeds_max_triggers_flow_control_error_test/1
+    iws_exceeds_max_triggers_flow_control_error_test/1,
+    priority_self_dependency_is_stream_error_test/1,
+    headers_priority_self_dependency_is_stream_error_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -239,7 +241,9 @@ groups() ->
             unknown_frame_type_is_ignored_test,
             window_update_on_idle_stream_triggers_goaway_test,
             goaway_closes_tcp_socket_test,
-            iws_exceeds_max_triggers_flow_control_error_test
+            iws_exceeds_max_triggers_flow_control_error_test,
+            priority_self_dependency_is_stream_error_test,
+            headers_priority_self_dependency_is_stream_error_test
         ]}
     ].
 
@@ -2316,6 +2320,46 @@ iws_exceeds_max_triggers_flow_control_error_test(Config) ->
     case wait_for_goaway(Sock, 3000) of
         {ok, ErrorCode} -> ?assertEqual(3, ErrorCode);  %% FLOW_CONTROL_ERROR
         timeout         -> ct:fail(no_goaway)
+    end,
+    ssl:close(Sock),
+    ok.
+
+%% RFC 9113 §5.3.1: a stream cannot depend on itself — stream PROTOCOL_ERROR.
+priority_self_dependency_is_stream_error_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    %% PRIORITY frame on stream 1 with DependsOn=1, Weight=16 (encoded as 15+1).
+    Payload = <<0:1, 1:31, 15:8>>,
+    Frame = <<(byte_size(Payload)):24, 2:8, 0:8, 0:1, 1:31, Payload/binary>>,
+    ok = ssl:send(Sock, Frame),
+    case wait_for_rst_or_goaway(Sock, 3000) of
+        {rst, ErrorCode} -> ?assertEqual(1, ErrorCode);  %% PROTOCOL_ERROR
+        Other            -> ct:fail({expected_rst, Other})
+    end,
+    ssl:close(Sock),
+    ok.
+
+%% Same check for HEADERS carrying an inline priority block.
+headers_priority_self_dependency_is_stream_error_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"localhost">>}
+    ],
+    {Block, _} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    %% HEADERS with PRIORITY flag (0x20) + END_HEADERS (0x4) + END_STREAM (0x1).
+    %% Priority payload: Exclusive=0, StreamDep=1, Weight=15 (= 16).
+    Priority = <<0:1, 1:31, 15:8>>,
+    Payload  = <<Priority/binary, Block/binary>>,
+    Flags    = 16#20 bor 16#4 bor 16#1,
+    Frame    = <<(byte_size(Payload)):24, 1:8, Flags:8, 0:1, 1:31, Payload/binary>>,
+    ok = ssl:send(Sock, Frame),
+    case wait_for_rst_or_goaway(Sock, 3000) of
+        {rst, ErrorCode} -> ?assertEqual(1, ErrorCode);
+        Other            -> ct:fail({expected_rst, Other})
     end,
     ssl:close(Sock),
     ok.

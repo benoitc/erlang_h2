@@ -796,6 +796,11 @@ handle_frame(_StateName, {window_update, StreamId, Increment}, #state{streams = 
 handle_frame(_StateName, {headers, StreamId, HeaderBlock, EndStream, EndHeaders}, State) ->
     handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, undefined, State);
 
+%% RFC 9113 §5.3.1: HEADERS with inline priority cannot depend on itself.
+handle_frame(_StateName, {headers, StreamId, _HeaderBlock, _EndStream, _EndHeaders,
+                           {_Exclusive, StreamId, _Weight}}, State) ->
+    send_rst_stream(StreamId, protocol_error, State),
+    {ok, connected, State};
 handle_frame(_StateName, {headers, StreamId, HeaderBlock, EndStream, EndHeaders, Priority}, State) ->
     handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, Priority, State);
 
