@@ -15,7 +15,7 @@ Add to `rebar.config`:
 
 ```erlang
 {deps, [
-    {h2, "0.2.0", {git, "https://github.com/benoitc/erlang_h2.git", {tag, "0.2.0"}}}
+    {h2, "0.3.0", {git, "https://github.com/benoitc/erlang_h2.git", {tag, "0.3.0"}}}
 ]}.
 ```
 
@@ -269,7 +269,7 @@ Listener `alpn_preferred_protocols` becomes `[<<"h2">>, <<"http/1.1">>]`. One po
 ```bash
 rebar3 compile
 rebar3 eunit          # 310 tests + 800 PropEr properties
-rebar3 ct             # 72 compliance + API-parity + tunnel cases
+rebar3 ct             # 81 compliance + 6 h2spec interop cases
 rebar3 dialyzer       # clean
 rebar3 xref           # clean
 rebar3 ex_doc         # HTML docs

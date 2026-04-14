@@ -1,6 +1,6 @@
 {application, h2,
  [{description, "HTTP/2 protocol library for Erlang"},
-  {vsn, "0.2.0"},
+  {vsn, "0.3.0"},
   {registered, []},
   {applications,
    [kernel,

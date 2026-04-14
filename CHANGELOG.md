@@ -4,41 +4,67 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-15
+
+Third review pass + h2spec interop; behaviour-visible spec fixes across the whole state machine. No breaking API change, but callers that matched on specific error atoms may see different values on edge cases (ALPN, ENABLE_PUSH, IWS).
+
 ### Added
-- Extended CONNECT (RFC 8441): server opt-in via `h2:start_server(Port, #{enable_connect_protocol => true, ...})` advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL=1`. Client uses `h2:request(Conn, Headers, #{protocol => <<"websocket">>})`. New errors: `{error, extended_connect_disabled}` (peer never advertised the setting), `{error, extended_connect_method}` (`:protocol` requires `:method=CONNECT`). Inbound: server rejects `:protocol` with stream `PROTOCOL_ERROR` if it has not opted in.
-- `h2:start_server` now honors `transport => tcp` (cleartext h2c prior-knowledge listener with gen_tcp acceptor pool).
-- `h2:connect/3` top-level `verify` and `cacerts` options are merged into SSL options (typespec no longer lies).
+- External interop suite `test/h2_interop_SUITE.erl` drives the server from [h2spec](https://github.com/summerwind/h2spec). Six groups: TLS generic/HPACK, h2c plaintext generic/HPACK, small-window (forced flow-control fragmentation), `--strict` mode. 146/146 generic+HPACK cases pass. Skips cleanly when `h2spec` is not on `$PATH`.
+- `.github/workflows/interop.yml`: CI runs h2spec v2.6.0 on every push/PR; logs uploaded on failure.
+- `.github/workflows/ci.yml`: now runs `h2_compliance_SUITE` in addition to eunit; CT logs uploaded on failure.
+- PING/RST_STREAM flood mitigation (RFC 9113 §10.5): per-second counters per connection, GOAWAY(ENHANCE_YOUR_CALM) on overflow.
+- Extended CONNECT (RFC 8441): server opt-in via `h2:start_server(Port, #{enable_connect_protocol => true, ...})` advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL=1`. Client uses `h2:request(Conn, Headers, #{protocol => <<"websocket">>})`. New errors: `{error, extended_connect_disabled}`, `{error, extended_connect_method}`. Inbound: server rejects `:protocol` with stream `PROTOCOL_ERROR` if it has not opted in.
+- `h2:start_server` honors `transport => tcp` (cleartext h2c prior-knowledge listener with gen_tcp acceptor pool).
+- `h2:connect/3` top-level `verify` and `cacerts` options merged into SSL options.
 - Owner event `{h2, Conn, {informational, StreamId, Status, Headers}}` for 1xx interim responses (excluding 101).
 - Send-side header validation runs before HPACK encode on `send_request`, `send_request_headers`, `send_response`, and `send_trailers`.
-- CT `compliance_v2` group: 22 new cases covering second-look audit findings and Extended CONNECT.
+- README: "Using with Ranch" and "Coexisting with HTTP/1.1" sections with code sketches.
 
 ### Changed
-- Owner event `{h2, Conn, {goaway, LastStreamId}}` is now `{goaway, LastStreamId, ErrorCode}` (was always documented as 3-tuple).
+- `SETTINGS_ENABLE_PUSH` default is now **0** (was 1). Server advertises 0; inbound PUSH_PROMISE on either side is a connection PROTOCOL_ERROR (RFC 9113 §6.5.2 / §8.4).
+- TLS `connect/2,3` requires ALPN `h2`. Previously fell through silently on `protocol_not_negotiated`; now returns `{error, alpn_not_negotiated}` (§3.3).
+- Connection-level receive window fixed at 65535 regardless of `SETTINGS_INITIAL_WINDOW_SIZE` (§6.9.2). IWS now only adjusts stream windows.
+- Request builder no longer injects `:authority = ""` when the caller omits `host`. Non-CONNECT requests without host now send no `:authority`; CONNECT without host returns `{error, missing_authority}` (§8.3.1).
+- Trailers from the peer transition the stream to `half_closed_remote` (was `closed`), so a handler mid-response isn't surprised by `invalid_stream_state` when the peer pipelines body+trailers (§5.1).
+- `closing` state proactively closes the TCP/TLS socket on entry (§5.4) instead of waiting up to 5 s for the peer.
+- Closed-stream error classification: closed-reason retained in a compact id → reason side map bounded at 10 000 entries. Late DATA/HEADERS on a recently-closed stream is scoped exactly (connection vs stream) regardless of whether the full record has been evicted from the 100-entry window.
+- Owner event `{h2, Conn, {goaway, LastStreamId}}` is now `{goaway, LastStreamId, ErrorCode}`.
 - Per-stream events (`data`, `trailers`, `stream_reset`) routed to the registered stream handler when set; connection owner receives them only as fallback.
-- HEADERS frames whose encoded block exceeds peer `SETTINGS_MAX_FRAME_SIZE` are automatically split into HEADERS + CONTINUATION chain (RFC 9113 §4.2).
-- Body-less responses (HEAD / 204 / 304) emit a trailing `{data, Sid, <<>>, true}` event so callers waiting for end-of-stream don't hang (matches quic_h3).
+- HEADERS whose encoded block exceeds peer `SETTINGS_MAX_FRAME_SIZE` are split into HEADERS + CONTINUATION chain (§4.2).
+- Body-less responses (HEAD / 204 / 304) emit a trailing `{data, Sid, <<>>, true}` event so callers waiting for end-of-stream don't hang.
 - HPACK: Huffman encode/decode tables precomputed once via `persistent_term` + `-on_load`; dynamic table caches length and uses a single `lists:reverse` on eviction.
-- CONTINUATION accumulator uses `iodata()` instead of per-frame binary concatenation.
-- Cached `peer_max_frame_size` / `peer_initial_window_size` / `peer_max_concurrent_streams` on the connection state record.
 
 ### Fixed
-- 1xx interim responses with `END_STREAM` or `Content-Length` now stream-RST with `PROTOCOL_ERROR` (RFC 9113 §8.1, RFC 9110 §15.2). Previously accepted silently.
-- CONNECT tunnel flag is no longer pre-set on the request; the stream becomes a tunnel only when the 2xx response is sent (server) or received (client). Non-2xx CONNECT responses now correctly permit trailers and enforce body rules (RFC 7540 §8.3).
-- `:authority` containing userinfo (`user@host`) is rejected with `PROTOCOL_ERROR` on both inbound and outbound paths (RFC 9113 §8.3.1). `check_authority_host` also now runs for CONNECT requests.
-- Extended CONNECT `:protocol` value validated as an RFC 7230 token; non-token values (whitespace, control bytes, etc.) → stream `PROTOCOL_ERROR` (RFC 8441 §4).
-- `SETTINGS_ENABLE_PUSH` is now always advertised as 0 (RFC 9113 §6.5.2). Was incorrectly sending 1 while rejecting PUSH_PROMISE.
-- `:scheme` pseudo-header now follows the actual transport (`http` on TCP, `https` on TLS). Previously hardcoded to `https`.
+- HEADERS/DATA on a stream closed via END_STREAM: connection STREAM_CLOSED (was stream-scoped RST) (§5.1).
+- HEADERS/DATA on a stream closed via RST_STREAM: stream-scoped STREAM_CLOSED (was connection-scoped).
+- CONTINUATION without an outstanding pending HEADERS: connection PROTOCOL_ERROR (§6.10).
+- PRIORITY self-dependency on both the PRIORITY frame and inline HEADERS priority: stream PROTOCOL_ERROR (§5.3.1).
+- PRIORITY frame with length != 5: stream FRAME_SIZE_ERROR (was connection) (§6.3).
+- WINDOW_UPDATE on an idle stream: connection PROTOCOL_ERROR (was silently ignored) (§5.1).
+- Unknown frame types: ignored per §4.1 (previously function_clause-crashed the connection).
+- Inbound `MAX_CONCURRENT_STREAMS` enforced: peer HEADERS over our advertised limit now get `RST_STREAM(REFUSED_STREAM)` (§5.1.2).
+- `SETTINGS_ENABLE_PUSH=1` received as client: connection PROTOCOL_ERROR (§6.5.2).
+- `SETTINGS_INITIAL_WINDOW_SIZE` above 2³¹−1: connection FLOW_CONTROL_ERROR (was PROTOCOL_ERROR) (§6.9.2).
+- Body-less responses (HEAD/204/304): accept `content-length > 0` with `END_STREAM` (RFC 9110 §9.3.2); reject when `END_STREAM` is absent on the header block.
+- `in_closed_stream_range` was asymmetric in client mode (only matched peer-initiated ids); now mirrors server mode.
+- HPACK decoder: truncated literal returns `{error, incomplete_string}` instead of `function_clause`.
+- 1xx interim responses with `END_STREAM` or `Content-Length` → stream `PROTOCOL_ERROR` (§8.1, RFC 9110 §15.2).
+- CONNECT tunnel flag no longer pre-set on the request; the stream becomes a tunnel only when the 2xx response is sent/received. Non-2xx CONNECT responses permit trailers and enforce body rules (RFC 7540 §8.3).
+- `:authority` containing userinfo (`user@host`) rejected with `PROTOCOL_ERROR` on both inbound and outbound paths (§8.3.1); `check_authority_host` runs for CONNECT requests too.
+- Extended CONNECT `:protocol` value validated as an RFC 7230 token (RFC 8441 §4).
+- `:scheme` pseudo-header follows the actual transport (`http` on TCP, `https` on TLS).
 - `:method = CONNECT` outbound: trailers rejected with `{error, tunnel_no_trailers}`.
-- `WINDOW_UPDATE` with increment 0 on a non-zero stream is now a stream-level RST_STREAM with `PROTOCOL_ERROR` (§6.9.1). Was a connection GOAWAY.
-- `:status` parsing: malformed values trigger stream `PROTOCOL_ERROR` instead of crashing the gen_statem via `binary_to_integer`.
+- `WINDOW_UPDATE` with increment 0 on a non-zero stream → stream RST_STREAM(`PROTOCOL_ERROR`) (§6.9.1).
+- `:status` parsing: malformed values trigger stream `PROTOCOL_ERROR` instead of crashing the gen_statem.
 - `:status = 101` rejected on both send and receive (§8.6).
-- Padding counted against receive flow control (§6.1). Decoder returns the full padded payload size; windows charged correctly.
-- Connection-level receive window consumed on DATA for closed or unknown streams (§5.1). Previously the peer could overshoot our advertised window via post-reset DATA.
+- Padding counted against receive flow control (§6.1). Connection-level receive window consumed on DATA for closed or unknown streams (§5.1).
 - `Content-Length` enforcement (§8.1.1): duplicate/mismatched/non-numeric/negative values → `PROTOCOL_ERROR`; DATA overshoot or END_STREAM mismatch → stream RST.
-- Body forbidden on HEAD requests (client-side), 204, and 304 — enforced via `body_forbidden` stream flag.
 - Server-side request trailers: trailing HEADERS without END_STREAM → `PROTOCOL_ERROR`.
 - Field name validation tightened to RFC 7230 `tchar` (rejects SP, HTAB, colon in regular headers, other controls, DEL, non-ASCII). Field values: leading/trailing SP/HTAB rejected in addition to NUL/CR/LF.
-- `SETTINGS_MAX_HEADER_LIST_SIZE` now enforced in both directions: outbound exceed → `{error, header_list_too_large}`; inbound exceed → stream `PROTOCOL_ERROR`.
+- `SETTINGS_MAX_HEADER_LIST_SIZE` enforced in both directions: outbound exceed → `{error, header_list_too_large}`; inbound exceed → stream `PROTOCOL_ERROR`.
+
+### Docs
+- `docs/features.md`: PRIORITY metadata is parsed and self-dep rejected, but no scheduler is implemented (RFC 9218 supersedes RFC 7540 priorities).
 
 ## [0.2.0] - 2026-04-13
 
