@@ -1738,18 +1738,18 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
             end
     end.
 
+%% Fallback heuristic for stream ids evicted from the closed-streams FIFO.
+%% Treats both peer-initiated ids (up to last_peer_stream_id) and our own
+%% ids (strictly below next_stream_id) as "was opened at some point" —
+%% symmetric for client and server modes.
 in_closed_stream_range(StreamId, #state{mode = Mode, last_peer_stream_id = LastPeer,
                                          next_stream_id = NextLocal}) ->
-    case Mode of
-        client ->
-            %% Peer-initiated (server) streams are even.
-            StreamId rem 2 =:= 0 andalso StreamId =< LastPeer;
-        server ->
-            %% Peer-initiated (client) streams are odd; also allow our own
-            %% (even) ids strictly below NextLocal as recently-closed.
-            (StreamId rem 2 =:= 1 andalso StreamId =< LastPeer)
-            orelse (StreamId rem 2 =:= 0 andalso StreamId < NextLocal)
-    end.
+    {PeerParity, LocalParity} = case Mode of
+        client -> {0, 1};  %% peer (server) = even; we = odd
+        server -> {1, 0}   %% peer (client) = odd;  we = even
+    end,
+    (StreamId rem 2 =:= PeerParity andalso StreamId =< LastPeer)
+    orelse (StreamId rem 2 =:= LocalParity andalso StreamId < NextLocal).
 
 %% Connection-level WINDOW_UPDATE refill. Called for every DATA frame,
 %% including those on closed/unknown streams — per RFC 9113 §5.1 the
