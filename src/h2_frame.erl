@@ -57,7 +57,11 @@
     {ping_ack, Data :: binary()} |
     {goaway, LastStreamId :: non_neg_integer(), ErrorCode :: non_neg_integer(), DebugData :: binary()} |
     {window_update, StreamId :: non_neg_integer(), Increment :: pos_integer()} |
-    {continuation, StreamId :: non_neg_integer(), HeaderBlock :: binary(), EndHeaders :: boolean()}.
+    {continuation, StreamId :: non_neg_integer(), HeaderBlock :: binary(), EndHeaders :: boolean()} |
+    %% RFC 9113 §4.1: unknown frame types MUST be ignored and discarded.
+    %% Surfaced to the connection layer so the decoder remains total.
+    {unknown_frame, Type :: non_neg_integer(), Flags :: non_neg_integer(),
+     StreamId :: non_neg_integer(), Payload :: binary()}.
 
 -export_type([frame_type/0, frame/0, frame_data/0]).
 

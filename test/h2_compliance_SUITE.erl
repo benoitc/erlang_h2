@@ -110,7 +110,9 @@
     head_response_with_content_length_accepted_test/1,
     body_forbidden_response_without_end_stream_rejected_test/1,
     priority_wrong_length_is_stream_error_test/1,
-    connect_ssl_without_alpn_rejected_test/1
+    connect_ssl_without_alpn_rejected_test/1,
+    unknown_frame_type_is_ignored_test/1,
+    window_update_on_idle_stream_triggers_goaway_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -231,7 +233,9 @@ groups() ->
             head_response_with_content_length_accepted_test,
             body_forbidden_response_without_end_stream_rejected_test,
             priority_wrong_length_is_stream_error_test,
-            connect_ssl_without_alpn_rejected_test
+            connect_ssl_without_alpn_rejected_test,
+            unknown_frame_type_is_ignored_test,
+            window_update_on_idle_stream_triggers_goaway_test
         ]}
     ].
 
@@ -2235,6 +2239,49 @@ connect_ssl_without_alpn_rejected_test(Config) ->
                  h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]})),
     ssl:close(LS),
     ok.
+
+%% RFC 9113 §4.1: a frame of unknown type MUST be ignored and discarded.
+%% The server then continues processing normally — a PING round-trips.
+unknown_frame_type_is_ignored_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    %% Frame type 0xFA is undefined. Send it on stream 0 with 4 bytes.
+    Bad = <<4:24, 16#FA:8, 0:8, 0:1, 0:31, 0,0,0,0>>,
+    ok = ssl:send(Sock, Bad),
+    %% Follow with a PING — if the unknown frame was ignored, we get a PING ACK.
+    PingData = <<1,2,3,4,5,6,7,8>>,
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:ping(PingData))),
+    ?assertEqual({ok, PingData}, wait_for_ping_ack(Sock, 3000)),
+    ssl:close(Sock),
+    ok.
+
+%% RFC 9113 §5.1: a frame other than HEADERS/PRIORITY on an idle stream is a
+%% connection PROTOCOL_ERROR.
+window_update_on_idle_stream_triggers_goaway_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:window_update(99, 1024))),
+    case wait_for_goaway(Sock, 3000) of
+        {ok, ErrorCode} -> ?assertEqual(1, ErrorCode);  %% PROTOCOL_ERROR
+        timeout         -> ct:fail(no_goaway)
+    end,
+    ssl:close(Sock),
+    ok.
+
+wait_for_ping_ack(Sock, Timeout) ->
+    case ssl:recv(Sock, 9, Timeout) of
+        {ok, <<Len:24, Type:8, Flags:8, _:32>>} ->
+            Payload = case Len of
+                0 -> <<>>;
+                _ -> {ok, P} = ssl:recv(Sock, Len, Timeout), P
+            end,
+            IsPingAck = Type =:= 16#6 andalso (Flags band 16#1) =:= 1,
+            case IsPingAck of
+                true  -> {ok, Payload};
+                false -> wait_for_ping_ack(Sock, Timeout)
+            end;
+        {error, _} -> timeout
+    end.
 
 wait_for_rst_or_goaway(Sock, Timeout) ->
     case ssl:recv(Sock, 9, Timeout) of

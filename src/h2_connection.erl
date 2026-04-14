@@ -781,8 +781,13 @@ handle_frame(_StateName, {window_update, StreamId, Increment}, #state{streams = 
                     {ok, connected, State2}
             end;
         error ->
-            %% Ignore window update for unknown/closed stream
-            {ok, connected, State}
+            %% RFC 9113 §5.1: a frame other than HEADERS/PRIORITY on an idle
+            %% stream is a connection PROTOCOL_ERROR. An "evicted closed"
+            %% stream just gets ignored (loose end-of-lifecycle).
+            case in_closed_stream_range(StreamId, State) of
+                true  -> {ok, connected, State};
+                false -> {error, protocol_error, State}
+            end
     end;
 
 handle_frame(_StateName, {headers, StreamId, HeaderBlock, EndStream, EndHeaders}, State) ->
@@ -816,7 +821,11 @@ handle_frame(_StateName, {priority, _StreamId, _Exclusive, _DependsOn, _Weight},
 
 handle_frame(_StateName, {push_promise, _StreamId, _PromisedId, _HeaderBlock, _EndHeaders}, State) ->
     %% We don't support server push, send GOAWAY
-    {error, protocol_error, State}.
+    {error, protocol_error, State};
+
+%% RFC 9113 §4.1: frames of unknown type MUST be ignored and discarded.
+handle_frame(_StateName, {unknown_frame, _Type, _Flags, _StreamId, _Payload}, State) ->
+    {ok, connected, State}.
 
 %% ============================================================================
 %% Internal: Settings Handling
