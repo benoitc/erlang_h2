@@ -113,7 +113,8 @@
     connect_ssl_without_alpn_rejected_test/1,
     unknown_frame_type_is_ignored_test/1,
     window_update_on_idle_stream_triggers_goaway_test/1,
-    goaway_closes_tcp_socket_test/1
+    goaway_closes_tcp_socket_test/1,
+    iws_exceeds_max_triggers_flow_control_error_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -237,7 +238,8 @@ groups() ->
             connect_ssl_without_alpn_rejected_test,
             unknown_frame_type_is_ignored_test,
             window_update_on_idle_stream_triggers_goaway_test,
-            goaway_closes_tcp_socket_test
+            goaway_closes_tcp_socket_test,
+            iws_exceeds_max_triggers_flow_control_error_test
         ]}
     ].
 
@@ -2298,6 +2300,23 @@ goaway_closes_tcp_socket_test(Config) ->
     end,
     %% The server must close the socket — ssl:recv must return closed.
     ?assertEqual({error, closed}, ssl:recv(Sock, 9, 3000)),
+    ssl:close(Sock),
+    ok.
+
+%% RFC 9113 §6.9.2: a SETTINGS_INITIAL_WINDOW_SIZE value above 2^31-1 is a
+%% connection FLOW_CONTROL_ERROR, not PROTOCOL_ERROR.
+iws_exceeds_max_triggers_flow_control_error_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    %% SETTINGS frame: one entry, IWS = 0x80000000 (2^31, above max 2^31-1).
+    Payload = <<4:16, 16#80000000:32>>,
+    Len = byte_size(Payload),
+    Frame = <<Len:24, 4:8, 0:8, 0:1, 0:31, Payload/binary>>,
+    ok = ssl:send(Sock, Frame),
+    case wait_for_goaway(Sock, 3000) of
+        {ok, ErrorCode} -> ?assertEqual(3, ErrorCode);  %% FLOW_CONTROL_ERROR
+        timeout         -> ct:fail(no_goaway)
+    end,
     ssl:close(Sock),
     ok.
 

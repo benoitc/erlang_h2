@@ -858,6 +858,10 @@ handle_settings(Settings, #state{mode = Mode, peer_settings = OldSettings} = Sta
                         {error, ErrCode} ->
                             {error, ErrCode, State}
                     end;
+                %% RFC 9113 §6.9.2: IWS above 2^31-1 is FLOW_CONTROL_ERROR,
+                %% not PROTOCOL_ERROR.
+                {error, {initial_window_size, _}} ->
+                    {error, flow_control_error, State};
                 {error, _Reason} ->
                     {error, protocol_error, State}
             end;
