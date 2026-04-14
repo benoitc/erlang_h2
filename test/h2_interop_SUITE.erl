@@ -62,7 +62,10 @@ init_per_testcase(TestCase, Config) ->
             ServerOpts = #{
                 cert    => ?config(cert_file, Config),
                 key     => ?config(key_file, Config),
-                handler => Handler
+                handler => Handler,
+                %% Advertise a concrete cap so h2spec §5.1.2 can actually
+                %% verify enforcement instead of looping until its own timeout.
+                settings => #{max_concurrent_streams => 100}
             },
             case h2:start_server(0, ServerOpts) of
                 {ok, ServerRef} ->
@@ -123,14 +126,28 @@ handle_interop_request(Conn, StreamId, _Method, _Path, _Headers) ->
 h2spec_generic_test(Config) ->
     Port = ?config(port, Config),
     Cmd = io_lib:format(
-        "h2spec -h 127.0.0.1 -p ~p -t -k -o 10", [Port]),
+        "~s 90 h2spec -h 127.0.0.1 -p ~p -t -k -o 5",
+        [timeout_cmd(), Port]),
     run_h2spec(lists:flatten(Cmd)).
 
 h2spec_hpack_test(Config) ->
     Port = ?config(port, Config),
     Cmd = io_lib:format(
-        "h2spec hpack -h 127.0.0.1 -p ~p -t -k -o 10", [Port]),
+        "~s 60 h2spec hpack -h 127.0.0.1 -p ~p -t -k -o 5",
+        [timeout_cmd(), Port]),
     run_h2spec(lists:flatten(Cmd)).
+
+%% Wall-clock cap on the h2spec invocation — if a case hangs, the suite
+%% still progresses. Linux has `timeout`; macOS via coreutils has `gtimeout`.
+timeout_cmd() ->
+    case os:find_executable("timeout") of
+        false ->
+            case os:find_executable("gtimeout") of
+                false -> "";
+                _     -> "gtimeout"
+            end;
+        _ -> "timeout"
+    end.
 
 run_h2spec(Cmd) ->
     ct:log("~s", [Cmd]),
