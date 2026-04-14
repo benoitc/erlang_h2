@@ -108,7 +108,8 @@
     max_concurrent_streams_refuses_excess_test/1,
     client_rejects_enable_push_one_test/1,
     head_response_with_content_length_accepted_test/1,
-    body_forbidden_response_without_end_stream_rejected_test/1
+    body_forbidden_response_without_end_stream_rejected_test/1,
+    priority_wrong_length_is_stream_error_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -227,7 +228,8 @@ groups() ->
             max_concurrent_streams_refuses_excess_test,
             client_rejects_enable_push_one_test,
             head_response_with_content_length_accepted_test,
-            body_forbidden_response_without_end_stream_rejected_test
+            body_forbidden_response_without_end_stream_rejected_test,
+            priority_wrong_length_is_stream_error_test
         ]}
     ].
 
@@ -2190,6 +2192,21 @@ body_forbidden_response_without_end_stream_rejected_test(Config) ->
     h2:close(Conn),
     ssl:close(LS),
     drain_exits(),
+    ok.
+
+%% RFC 9113 §6.3: a PRIORITY frame with a length other than 5 octets is a
+%% *stream* error FRAME_SIZE_ERROR — RST_STREAM, not GOAWAY.
+priority_wrong_length_is_stream_error_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    %% Hand-craft PRIORITY(type=2) on stream 1 with a 4-byte payload (should be 5).
+    Bad = <<4:24, 2:8, 0:8, 0:1, 1:31, 0,0,0,0>>,
+    ok = ssl:send(Sock, Bad),
+    case wait_for_rst_or_goaway(Sock, 3000) of
+        {rst, ErrorCode} -> ?assertEqual(6, ErrorCode);  %% FRAME_SIZE_ERROR
+        Other            -> ct:fail({expected_stream_error, Other})
+    end,
+    ssl:close(Sock),
     ok.
 
 wait_for_rst_or_goaway(Sock, Timeout) ->

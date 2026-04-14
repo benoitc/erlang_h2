@@ -313,8 +313,10 @@ decode_frame(?PRIORITY, _Flags, 0, _Payload) ->
     {error, protocol_error};  %% PRIORITY MUST have non-zero stream ID
 decode_frame(?PRIORITY, _Flags, StreamId, <<E:1, DependsOn:31, Weight:8>>) ->
     {ok, {priority, StreamId, E =:= 1, DependsOn, Weight + 1}};
-decode_frame(?PRIORITY, _Flags, _StreamId, _Payload) ->
-    {error, frame_size_error};
+%% RFC 9113 §6.3: PRIORITY frame with length != 5 is a *stream* error
+%% FRAME_SIZE_ERROR, not a connection error.
+decode_frame(?PRIORITY, _Flags, StreamId, _Payload) ->
+    {error, {stream_error, StreamId, frame_size_error}};
 
 decode_frame(?RST_STREAM, _Flags, 0, _Payload) ->
     {error, protocol_error};  %% RST_STREAM MUST have non-zero stream ID
