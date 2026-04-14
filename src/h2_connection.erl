@@ -36,6 +36,13 @@
 -define(SETTINGS_TIMEOUT_MS, 5000).
 -define(CLOSE_TIMEOUT_MS, 5000).
 -define(GOAWAY_DRAIN_MS, 100).
+%% RFC 9113 §5.1 requires that post-close frames be classified as connection
+%% vs stream errors based on how the stream reached `closed`. We retain a
+%% bounded FIFO of closed streams so the lookup can consult real state
+%% instead of a stream-id heuristic. Anything older than this gets evicted
+%% and falls back to the (looser) heuristic — safe because well-behaved peers
+%% do not send frames on long-closed streams.
+-define(CLOSED_STREAMS_LIMIT, 100).
 
 %% Stream states per RFC 7540 Section 5.1
 -record(stream, {
@@ -70,7 +77,11 @@
     request_method :: undefined | binary(),
     %% RFC 8441: Extended CONNECT protocol token (e.g. <<"websocket">>).
     %% Set when the request carries a `:protocol` pseudo-header.
-    protocol :: undefined | binary()
+    protocol :: undefined | binary(),
+    %% RFC 9113 §5.1: how this stream reached `closed`. Determines whether
+    %% later frames on it are a connection error (end_stream) or a stream
+    %% error (rst). undefined while not closed.
+    closed_reason :: undefined | end_stream | rst
 }).
 
 %% Connection state
@@ -98,6 +109,10 @@
 
     %% Streams
     streams = #{} :: #{non_neg_integer() => #stream{}},
+    %% FIFO of closed stream ids in close order, bounded by ?CLOSED_STREAMS_LIMIT.
+    %% When the limit is exceeded the oldest id is evicted from `streams`.
+    closed_streams = queue:new() :: queue:queue(non_neg_integer()),
+    closed_streams_count = 0 :: non_neg_integer(),
     next_stream_id :: non_neg_integer(),  % 1 for client, 2 for server
     last_peer_stream_id = 0 :: non_neg_integer(),
 
@@ -662,7 +677,7 @@ process_frames(StateName, #state{buffer = Buffer, local_settings = Local} = Stat
             %% Frame-level decode error scoped to a single stream
             %% (e.g. WINDOW_UPDATE 0 on a non-zero stream id).
             send_rst_stream(StreamId, ErrorCode, State),
-            State1 = close_stream(StreamId, State),
+            State1 = close_stream(StreamId, rst, State),
             process_frames(StateName, State1#state{buffer = Rest});
         {error, Reason} ->
             State1 = send_goaway_frame(State#state.last_peer_stream_id, Reason, State),
@@ -757,7 +772,7 @@ handle_frame(_StateName, {window_update, StreamId, Increment}, #state{streams = 
             if
                 NewWindow > ?MAX_WINDOW_SIZE ->
                     send_rst_stream(StreamId, flow_control_error, State),
-                    State1 = close_stream(StreamId, State),
+                    State1 = close_stream(StreamId, rst, State),
                     {ok, connected, State1};
                 true ->
                     Stream1 = Stream#stream{window_size = NewWindow},
@@ -789,7 +804,7 @@ handle_frame(_StateName, {rst_stream, StreamId, ErrorCode},
     case maps:is_key(StreamId, Streams) orelse in_closed_stream_range(StreamId, State) of
         true ->
             notify_stream(StreamId, {stream_reset, StreamId, h2_error:name(ErrorCode)}, State),
-            State1 = close_stream(StreamId, State),
+            State1 = close_stream(StreamId, rst, State),
             {ok, connected, State1};
         false ->
             {error, protocol_error, State}
@@ -906,11 +921,17 @@ handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, _Priority, #state{m
                     State2 = State1#state{expecting_continuation = {StreamId, EndStream}},
                     {ok, connected, State2}
             end;
-        {ok, #stream{state = closed}} ->
+        {ok, #stream{state = closed, closed_reason = end_stream}} ->
             %% RFC 9113 §5.1: a stream closed via END_STREAM accepts only
             %% PRIORITY; HEADERS arriving on it is a CONNECTION error
-            %% STREAM_CLOSED (not a stream-scoped RST).
+            %% STREAM_CLOSED.
             {error, stream_closed, State};
+        {ok, #stream{state = closed, closed_reason = rst}} ->
+            %% RFC 9113 §5.1: after RST_STREAM, further frames on the stream
+            %% are a stream error STREAM_CLOSED (peer/self may have in-flight
+            %% frames; don't tear down the connection).
+            send_rst_stream(StreamId, stream_closed, State),
+            {ok, connected, State};
         {ok, _Stream} ->
             %% RFC 9113 §5.1 (half_closed_remote): HEADERS in this state is a
             %% stream error STREAM_CLOSED.
@@ -935,10 +956,19 @@ handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, _Priority, #state{m
             end
     end.
 
+%% RFC 9113 §6.10: CONTINUATION is only valid immediately after a
+%% HEADERS/PUSH_PROMISE/CONTINUATION without END_HEADERS on the same stream.
+%% Anything else is a connection PROTOCOL_ERROR, including CONTINUATION on a
+%% closed stream.
+handle_continuation(_StreamId, _HeaderBlock, _EndHeaders,
+                    #state{expecting_continuation = undefined} = State) ->
+    {error, protocol_error, State};
 handle_continuation(StreamId, HeaderBlock, EndHeaders,
                     #state{streams = Streams,
                            expecting_continuation = Expecting} = State) ->
     case maps:find(StreamId, Streams) of
+        {ok, #stream{state = closed}} ->
+            {error, protocol_error, State};
         {ok, #stream{header_buffer = Buffer} = Stream} ->
             NewBuffer = [Buffer, HeaderBlock],
             case EndHeaders of
@@ -947,10 +977,7 @@ handle_continuation(StreamId, HeaderBlock, EndHeaders,
                     State1 = put_stream(StreamId, Stream1, State),
                     %% Restore the original END_STREAM flag captured when
                     %% HEADERS arrived; clear expecting_continuation.
-                    EndStream = case Expecting of
-                        {_, E} -> E;
-                        _ -> false
-                    end,
+                    {_, EndStream} = Expecting,
                     State2 = State1#state{expecting_continuation = undefined},
                     decode_and_process_headers(StreamId, iolist_to_binary(NewBuffer), EndStream, State2);
                 false ->
@@ -971,7 +998,7 @@ decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_conte
                 {error, _} ->
                     send_rst_stream(StreamId, protocol_error, State1),
                     State2 = case maps:is_key(StreamId, State1#state.streams) of
-                        true -> close_stream(StreamId, State1);
+                        true -> close_stream(StreamId, rst, State1);
                         false -> State1
                     end,
                     {ok, connected, State2};
@@ -1004,7 +1031,7 @@ decode_and_process_headers_validated(Mode, StreamId, Headers, EndStream, State1)
                 {error, ValidErr} ->
                     send_rst_stream(StreamId, ValidErr, State1),
                     State2 = case maps:is_key(StreamId, State1#state.streams) of
-                        true -> close_stream(StreamId, State1);
+                        true -> close_stream(StreamId, rst, State1);
                         false -> State1
                     end,
                     {ok, connected, State2}
@@ -1143,7 +1170,7 @@ finalize_client_initial(StreamId, true, ExpectedCL, State)
 %% DATA event so clients waiting on end-of-stream don't hang. Matches quic_h3.
 finalize_client_initial(StreamId, true, _ExpectedCL, State) ->
     notify_stream(StreamId, {data, StreamId, <<>>, true}, State),
-    {ok, connected, close_stream(StreamId, State)}.
+    {ok, connected, close_stream(StreamId, end_stream, State)}.
 
 %% ---- Shared helpers ---------------------------------------------------------
 
@@ -1151,7 +1178,7 @@ deliver_trailers(StreamId, Stream, Headers, State, NotifyFun) ->
     Stream1 = Stream#stream{state = closed},
     State1  = put_stream(StreamId, Stream1, State),
     NotifyFun(StreamId, {trailers, StreamId, Headers}, State1),
-    {ok, connected, close_stream(StreamId, State1)}.
+    {ok, connected, close_stream(StreamId, end_stream, State1)}.
 
 %% Uniform 3-arity shim so `deliver_trailers` can dispatch either fan-out style.
 notify_owner_stream(_StreamId, Event, State) ->
@@ -1178,7 +1205,7 @@ stream_reject(StreamId, ErrorCode, State) ->
 
 stream_reject_and_close(StreamId, ErrorCode, State) ->
     send_rst_stream(StreamId, ErrorCode, State),
-    {ok, connected, close_stream(StreamId, State)}.
+    {ok, connected, close_stream(StreamId, rst, State)}.
 
 %% RFC 9113 §8.1.1: Content-Length parser. Multiple headers with the same
 %% value collapse into one; mismatched values are malformed. Non-numeric or
@@ -1570,11 +1597,11 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
                     if
                         FlowControlled > StreamWindow ->
                             send_rst_stream(StreamId, flow_control_error, State0a),
-                            State1 = close_stream(StreamId, State0a),
+                            State1 = close_stream(StreamId, rst, State0a),
                             {ok, connected, State1};
                         BodyViolation ->
                             send_rst_stream(StreamId, protocol_error, State0a),
-                            State1 = close_stream(StreamId, State0a),
+                            State1 = close_stream(StreamId, rst, State0a),
                             {ok, connected, State1};
                         true ->
                             NewStreamWindow = StreamWindow - FlowControlled,
@@ -1602,16 +1629,21 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
 
                             case EndStream andalso Stream2#stream.state == closed of
                                 true ->
-                                    State4 = close_stream(StreamId, State3),
+                                    State4 = close_stream(StreamId, end_stream, State3),
                                     {ok, connected, State4};
                                 false ->
                                     {ok, connected, State3}
                             end
                     end;
-                {ok, #stream{state = closed}} ->
+                {ok, #stream{state = closed, closed_reason = end_stream}} ->
                     %% RFC 9113 §5.1: DATA on a stream closed via END_STREAM
                     %% is a CONNECTION error STREAM_CLOSED.
                     {error, stream_closed, State0a};
+                {ok, #stream{state = closed, closed_reason = rst}} ->
+                    %% RFC 9113 §5.1: after RST_STREAM, further DATA is a
+                    %% stream error STREAM_CLOSED.
+                    send_rst_stream(StreamId, stream_closed, State0a),
+                    {ok, connected, State0a};
                 {ok, _} ->
                     %% half_closed_remote etc.: stream-scoped STREAM_CLOSED.
                     send_rst_stream(StreamId, stream_closed, State0a),
@@ -1936,13 +1968,20 @@ handle_send_data(From, StreamId, Data, EndStream, #state{streams = Streams, conn
                         conn_window_size = NewConnWindow,
                         streams = maps:put(StreamId, Stream1, Streams)
                     },
-
+                    %% If we just fully closed the stream, record its close
+                    %% reason so later frames on this id get classified
+                    %% correctly per RFC 9113 §5.1.
+                    State2 = case Stream1#stream.state =:= closed
+                                 andalso StreamState =:= half_closed_remote of
+                        true  -> close_stream(StreamId, end_stream, State1);
+                        false -> State1
+                    end,
                     %% If there's more data, try to send it
                     case Remaining of
                         <<>> ->
-                            {keep_state, State1, [{reply, From, ok}]};
+                            {keep_state, State2, [{reply, From, ok}]};
                         _ ->
-                            handle_send_data(From, StreamId, Remaining, EndStream, State1)
+                            handle_send_data(From, StreamId, Remaining, EndStream, State2)
                     end
             end;
         {ok, _} ->
@@ -1986,7 +2025,7 @@ handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams, encode_
 
             case Stream1#stream.state of
                 closed ->
-                    State2 = close_stream(StreamId, State1),
+                    State2 = close_stream(StreamId, end_stream, State1),
                     {keep_state, State2, [{reply, From, ok}]};
                 _ ->
                     {keep_state, State1, [{reply, From, ok}]}
@@ -2003,7 +2042,7 @@ handle_cancel_stream(From, StreamId, ErrorCode, #state{streams = Streams} = Stat
     case maps:find(StreamId, Streams) of
         {ok, #stream{state = StreamState}} when StreamState =/= closed ->
             send_rst_stream(StreamId, ErrorCode, State),
-            State1 = close_stream(StreamId, State),
+            State1 = close_stream(StreamId, rst, State),
             {keep_state, State1, [{reply, From, ok}]};
         {ok, _} ->
             {keep_state, State, [{reply, From, {error, stream_closed}}]};
@@ -2147,8 +2186,32 @@ get_or_create_stream(StreamId, #state{streams = Streams,
 put_stream(StreamId, Stream, #state{streams = Streams} = State) ->
     State#state{streams = maps:put(StreamId, Stream, Streams)}.
 
-close_stream(StreamId, #state{streams = Streams} = State) ->
-    State#state{streams = maps:remove(StreamId, Streams)}.
+%% Mark a stream closed with an explicit reason and retain its record so
+%% later frames can be classified correctly per RFC 9113 §5.1.
+%% Reason: `end_stream` (natural close) → post-close frames are a connection
+%% error; `rst` (peer or local RST_STREAM) → post-close frames are a stream
+%% error. The FIFO is capped so memory stays bounded.
+close_stream(StreamId, Reason, #state{streams = Streams,
+                                       closed_streams = Q,
+                                       closed_streams_count = N} = State) ->
+    Streams1 = case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            maps:put(StreamId, Stream#stream{state = closed,
+                                             closed_reason = Reason},
+                     Streams);
+        error ->
+            Streams
+    end,
+    Q1 = queue:in(StreamId, Q),
+    N1 = N + 1,
+    {Streams2, Q2, N2} = evict_old_closed(Streams1, Q1, N1),
+    State#state{streams = Streams2, closed_streams = Q2, closed_streams_count = N2}.
+
+evict_old_closed(Streams, Q, N) when N =< ?CLOSED_STREAMS_LIMIT ->
+    {Streams, Q, N};
+evict_old_closed(Streams, Q, N) ->
+    {{value, OldId}, Q1} = queue:out(Q),
+    evict_old_closed(maps:remove(OldId, Streams), Q1, N - 1).
 
 count_active_streams(#state{streams = Streams}) ->
     maps:fold(fun(_Id, #stream{state = S}, Acc) ->

@@ -101,7 +101,10 @@
     extended_connect_bad_protocol_token_rejected_test/1,
     connect_non_2xx_trailers_allowed_test/1,
     closed_stream_headers_triggers_goaway_test/1,
-    closed_stream_data_triggers_goaway_test/1
+    closed_stream_data_triggers_goaway_test/1,
+    rst_closed_stream_headers_triggers_rst_test/1,
+    rst_closed_stream_data_triggers_rst_test/1,
+    closed_stream_continuation_triggers_goaway_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -213,7 +216,10 @@ groups() ->
             extended_connect_bad_protocol_token_rejected_test,
             connect_non_2xx_trailers_allowed_test,
             closed_stream_headers_triggers_goaway_test,
-            closed_stream_data_triggers_goaway_test
+            closed_stream_data_triggers_goaway_test,
+            rst_closed_stream_headers_triggers_rst_test,
+            rst_closed_stream_data_triggers_rst_test,
+            closed_stream_continuation_triggers_goaway_test
         ]}
     ].
 
@@ -1984,6 +1990,92 @@ closed_stream_data_triggers_goaway_test(Config) ->
     end,
     ssl:close(Sock),
     ok.
+
+%% After RST_STREAM from the client, the server MUST treat HEADERS on that
+%% stream as a stream error (RST_STREAM), not a connection error.
+rst_closed_stream_headers_triggers_rst_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"localhost">>}
+    ],
+    {Block, Ctx1} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    %% Close the stream ourselves with RST_STREAM.
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:rst_stream(1, 8))),
+    %% Now send HEADERS on the rst-closed stream — expect RST_STREAM.
+    {Block2, _} = h2_hpack:encode(Headers, Ctx1),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block2, true))),
+    case wait_for_rst_or_goaway(Sock, 3000) of
+        {rst, ErrorCode} -> ?assertEqual(5, ErrorCode);  %% STREAM_CLOSED
+        {goaway, _}      -> ct:fail(expected_stream_error_got_connection);
+        timeout          -> ct:fail(no_rst_stream)
+    end,
+    ssl:close(Sock),
+    ok.
+
+rst_closed_stream_data_triggers_rst_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"localhost">>}
+    ],
+    {Block, _} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:rst_stream(1, 8))),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:data(1, <<"junk">>, false))),
+    case wait_for_rst_or_goaway(Sock, 3000) of
+        {rst, ErrorCode} -> ?assertEqual(5, ErrorCode);
+        {goaway, _}      -> ct:fail(expected_stream_error_got_connection);
+        timeout          -> ct:fail(no_rst_stream)
+    end,
+    ssl:close(Sock),
+    ok.
+
+%% CONTINUATION without a preceding non-END_HEADERS HEADERS frame is a
+%% connection PROTOCOL_ERROR per RFC 9113 §6.10, even (especially) on a
+%% closed stream — h2spec §5.1/13.
+closed_stream_continuation_triggers_goaway_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"localhost">>}
+    ],
+    {Block, Ctx1} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    ok = drain_until_end_stream(Sock, 1, 3000),
+    {Block2, _} = h2_hpack:encode(Headers, Ctx1),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:continuation(1, Block2, true))),
+    case wait_for_goaway(Sock, 3000) of
+        {ok, _ErrorCode} -> ok;  %% STREAM_CLOSED or PROTOCOL_ERROR both acceptable
+        timeout          -> ct:fail(no_goaway)
+    end,
+    ssl:close(Sock),
+    ok.
+
+wait_for_rst_or_goaway(Sock, Timeout) ->
+    case ssl:recv(Sock, 9, Timeout) of
+        {ok, <<Len:24, Type:8, _Flags:8, _:1, _Sid:31>>} ->
+            Payload = case Len of
+                0 -> <<>>;
+                _ -> {ok, P} = ssl:recv(Sock, Len, Timeout), P
+            end,
+            case {Type, Payload} of
+                {16#3, <<ErrorCode:32>>}                   -> {rst, ErrorCode};
+                {16#7, <<_Last:32, ErrorCode:32, _/binary>>} -> {goaway, ErrorCode};
+                _ -> wait_for_rst_or_goaway(Sock, Timeout)
+            end;
+        {error, _} -> timeout
+    end.
 
 %% Read frames until we see a DATA or HEADERS frame with END_STREAM on StreamId.
 drain_until_end_stream(Sock, StreamId, Timeout) ->
