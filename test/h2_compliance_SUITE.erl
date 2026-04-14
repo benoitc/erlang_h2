@@ -106,7 +106,9 @@
     rst_closed_stream_data_triggers_rst_test/1,
     closed_stream_continuation_triggers_goaway_test/1,
     max_concurrent_streams_refuses_excess_test/1,
-    client_rejects_enable_push_one_test/1
+    client_rejects_enable_push_one_test/1,
+    head_response_with_content_length_accepted_test/1,
+    body_forbidden_response_without_end_stream_rejected_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -223,7 +225,9 @@ groups() ->
             rst_closed_stream_data_triggers_rst_test,
             closed_stream_continuation_triggers_goaway_test,
             max_concurrent_streams_refuses_excess_test,
-            client_rejects_enable_push_one_test
+            client_rejects_enable_push_one_test,
+            head_response_with_content_length_accepted_test,
+            body_forbidden_response_without_end_stream_rejected_test
         ]}
     ].
 
@@ -2135,6 +2139,55 @@ client_rejects_enable_push_one_test(Config) ->
     after 5000 ->
         ct:fail(server_timeout)
     end,
+    ssl:close(LS),
+    drain_exits(),
+    ok.
+
+%% RFC 9110 §9.3.2: a HEAD response MAY carry content-length indicating the
+%% size of the would-be GET body. Our client must accept it alongside
+%% END_STREAM without treating it as a body-length mismatch.
+head_response_with_content_length_accepted_test(Config) ->
+    {ok, LS, Port} = raw_tls_listen(Config),
+    Parent = self(),
+    spawn_link(fun() ->
+        {ok, S} = raw_tls_accept(LS),
+        fake_server_await_headers(S),
+        Hdrs = [{<<":status">>, <<"200">>}, {<<"content-length">>, <<"1234">>}],
+        {Block, _} = h2_hpack:encode(Hdrs, h2_hpack:new_context()),
+        ok = ssl:send(S, h2_frame:encode(h2_frame:headers(1, Block, true))),
+        Parent ! done_sending,
+        timer:sleep(500),
+        ssl:close(S)
+    end),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, Sid} = h2:request(Conn, <<"HEAD">>, <<"/">>, [{<<"host">>, <<"l">>}]),
+    Resp = receive_full_response(Conn, Sid, 3000),
+    ?assertMatch({200, _, <<>>}, Resp),
+    h2:close(Conn),
+    ssl:close(LS),
+    drain_exits(),
+    ok.
+
+%% RFC 9110 §15.4: a 204 response terminates at the header block. A header
+%% block without END_STREAM is malformed and the client must reject the
+%% stream rather than leave it open accepting later frames.
+body_forbidden_response_without_end_stream_rejected_test(Config) ->
+    {ok, LS, Port} = raw_tls_listen(Config),
+    spawn_link(fun() ->
+        {ok, S} = raw_tls_accept(LS),
+        fake_server_await_headers(S),
+        Hdrs = [{<<":status">>, <<"204">>}],
+        {Block, _} = h2_hpack:encode(Hdrs, h2_hpack:new_context()),
+        %% HEADERS without END_STREAM — not allowed for 204.
+        ok = ssl:send(S, h2_frame:encode(h2_frame:headers(1, Block, false))),
+        timer:sleep(500),
+        ssl:close(S)
+    end),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, Sid} = h2:request(Conn, <<"GET">>, <<"/">>, [{<<"host">>, <<"l">>}]),
+    Result = receive_full_response(Conn, Sid, 3000),
+    ?assertMatch({error, {stream_reset, _}}, Result),
+    h2:close(Conn),
     ssl:close(LS),
     drain_exits(),
     ok.

@@ -1192,19 +1192,34 @@ handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State) ->
             },
             State1 = put_stream(StreamId, Stream1, State),
             notify_owner({h2, self(), {response, StreamId, Status, strip_pseudo(Headers)}}, State1),
-            finalize_client_initial(StreamId, EndStream, ExpectedCL, State1)
+            finalize_client_initial(StreamId, EndStream, ExpectedCL, BodyForbidden, State1)
     end.
 
-%% Body continues arriving as DATA frames.
-finalize_client_initial(_StreamId, false, _ExpectedCL, State) ->
+%% RFC 9110 §9.3.2 / §15.4: HEAD, 204, 304 responses have no body — any
+%% DATA frames after the header block are a protocol violation. If
+%% END_STREAM is absent on the header block, the response is malformed
+%% and the stream must not be left open for later frames.
+finalize_client_initial(StreamId, false, _ExpectedCL, true, State) ->
+    notify_stream(StreamId, {stream_reset, StreamId, protocol_error}, State),
+    stream_reject_and_close(StreamId, protocol_error, State);
+%% Body-less response with END_STREAM — the response is complete. A
+%% non-zero content-length on HEAD is allowed (RFC 9110 §9.3.2, it
+%% indicates what the GET response size would be) — do not reject it.
+finalize_client_initial(StreamId, true, _ExpectedCL, true, State) ->
+    notify_stream(StreamId, {data, StreamId, <<>>, true}, State),
+    {ok, connected, close_stream(StreamId, end_stream, State)};
+%% Body-allowed response: body continues arriving as DATA frames.
+finalize_client_initial(_StreamId, false, _ExpectedCL, false, State) ->
     {ok, connected, State};
-%% END_STREAM with CL>0 is a malformed response.
-finalize_client_initial(StreamId, true, ExpectedCL, State)
+%% Body-allowed response with END_STREAM and a declared content-length > 0
+%% is malformed: the body can't be both empty and non-empty.
+finalize_client_initial(StreamId, true, ExpectedCL, false, State)
   when ExpectedCL =/= undefined, ExpectedCL > 0 ->
     stream_reject_and_close(StreamId, protocol_error, State);
-%% Body-less response (HEAD / 204 / 304 / empty): emit a trailing empty
-%% DATA event so clients waiting on end-of-stream don't hang. Matches quic_h3.
-finalize_client_initial(StreamId, true, _ExpectedCL, State) ->
+%% Body-allowed response with END_STREAM and either no content-length or
+%% content-length=0: emit the trailing empty DATA event so owners waiting
+%% on end-of-stream don't hang. Matches quic_h3.
+finalize_client_initial(StreamId, true, _ExpectedCL, false, State) ->
     notify_stream(StreamId, {data, StreamId, <<>>, true}, State),
     {ok, connected, close_stream(StreamId, end_stream, State)}.
 
@@ -1907,14 +1922,36 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
                             {keep_state, State, [{reply, From, SErr}]};
                         ok ->
                     {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
-                    send_header_block(StreamId, HeaderBlock, false, State),
+                    %% RFC 9110 §9.3.2 / §15.4: body-forbidden responses
+                    %% (HEAD / 204 / 304) terminate at the header block —
+                    %% end the stream here so later send_data is a no-op
+                    %% on the wire and the peer's stream state matches ours.
+                    BodyForbidden = ReqMethod =:= <<"HEAD">>
+                                    orelse Status =:= 204 orelse Status =:= 304,
+                    send_header_block(StreamId, HeaderBlock, BodyForbidden, State),
                     NewTunnel = IsConnectRequest andalso IsSuccess,
-                    Stream1 = Stream#stream{response_headers = AllHeaders, tunnel = NewTunnel},
+                    NewState = case BodyForbidden of
+                        true ->
+                            case StreamState of
+                                open -> half_closed_local;
+                                half_closed_remote -> closed
+                            end;
+                        false ->
+                            StreamState
+                    end,
+                    Stream1 = Stream#stream{response_headers = AllHeaders,
+                                            tunnel = NewTunnel,
+                                            body_forbidden = BodyForbidden,
+                                            state = NewState},
                     State1 = State#state{
                         encode_context = EncCtx1,
                         streams = maps:put(StreamId, Stream1, Streams)
                     },
-                    {keep_state, State1, [{reply, From, ok}]}
+                    State2 = case NewState of
+                        closed -> close_stream(StreamId, end_stream, State1);
+                        _      -> State1
+                    end,
+                    {keep_state, State2, [{reply, From, ok}]}
                     end
                     end
             end;
