@@ -120,7 +120,8 @@
     send_request_without_host_omits_authority_test/1,
     send_connect_without_host_rejected_test/1,
     server_advertises_enable_push_zero_test/1,
-    push_promise_gets_stream_reset_test/1
+    push_promise_gets_stream_reset_test/1,
+    ping_flood_triggers_enhance_your_calm_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -251,7 +252,8 @@ groups() ->
             send_request_without_host_omits_authority_test,
             send_connect_without_host_rejected_test,
             server_advertises_enable_push_zero_test,
-            push_promise_gets_stream_reset_test
+            push_promise_gets_stream_reset_test,
+            ping_flood_triggers_enhance_your_calm_test
         ]}
     ].
 
@@ -2338,6 +2340,21 @@ parse_settings_payload(<<>>, Acc) ->
     lists:reverse(Acc);
 parse_settings_payload(<<Id:16, V:32, Rest/binary>>, Acc) ->
     parse_settings_payload(Rest, [{Id, V} | Acc]).
+
+%% RFC 9113 §10.5: a flood of PING frames must trigger GOAWAY(ENHANCE_YOUR_CALM).
+%% The limit is 20/sec; send 40 back-to-back.
+ping_flood_triggers_enhance_your_calm_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    %% PING payload must be 8 bytes.
+    PingFrame = h2_frame:encode(h2_frame:ping(<<0,0,0,0,0,0,0,0>>)),
+    [ssl:send(Sock, PingFrame) || _ <- lists:seq(1, 40)],
+    case wait_for_goaway(Sock, 3000) of
+        {ok, ErrorCode} -> ?assertEqual(11, ErrorCode);  %% ENHANCE_YOUR_CALM
+        timeout         -> ct:fail(no_goaway)
+    end,
+    ssl:close(Sock),
+    ok.
 
 read_headers_block(S) ->
     {ok, <<Len:24, Type:8, _Flags:8, _:1, _:31>>} = ssl:recv(S, 9, 5000),

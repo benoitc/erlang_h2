@@ -43,6 +43,10 @@
 %% and falls back to the (looser) heuristic — safe because well-behaved peers
 %% do not send frames on long-closed streams.
 -define(CLOSED_STREAMS_LIMIT, 100).
+%% RFC 9113 §10.5: mitigate PING and RST_STREAM floods. Counters reset every
+%% second; exceeding the limit triggers GOAWAY(ENHANCE_YOUR_CALM).
+-define(PING_FLOOD_LIMIT_PER_SEC, 20).
+-define(RST_FLOOD_LIMIT_PER_SEC, 100).
 
 %% Stream states per RFC 7540 Section 5.1
 -record(stream, {
@@ -147,7 +151,12 @@
 
     %% RFC 8441: when true, server advertises SETTINGS_ENABLE_CONNECT_PROTOCOL=1
     %% and accepts requests with the `:protocol` pseudo-header. Server-side opt-in.
-    enable_connect_protocol = false :: boolean()
+    enable_connect_protocol = false :: boolean(),
+
+    %% RFC 9113 §10.5 flood counters. `{BucketSec, Count}`; BucketSec is
+    %% `erlang:monotonic_time(second)` for the current second.
+    ping_flood = {0, 0} :: {integer(), non_neg_integer()},
+    rst_flood  = {0, 0} :: {integer(), non_neg_integer()}
 }).
 
 %% ============================================================================
@@ -738,10 +747,14 @@ handle_frame(_StateName, {settings_ack}, State) ->
     {ok, connected, State};
 
 handle_frame(_StateName, {ping, Data}, State) ->
-    %% Respond with PING ACK
-    Frame = h2_frame:ping_ack(Data),
-    send_frame(Frame, State),
-    {ok, connected, State};
+    case bump_flood_counter(ping, State) of
+        {ok, State1} ->
+            Frame = h2_frame:ping_ack(Data),
+            send_frame(Frame, State1),
+            {ok, connected, State1};
+        flood ->
+            {error, enhance_your_calm, State}
+    end;
 
 handle_frame(_StateName, {ping_ack, _Data}, State) ->
     %% PING response received
@@ -812,15 +825,22 @@ handle_frame(_StateName, {data, StreamId, Data, EndStream, FlowControlled}, Stat
 
 handle_frame(_StateName, {rst_stream, StreamId, ErrorCode},
              #state{streams = Streams} = State) ->
-    %% RFC 7540 §6.4 / §5.1: RST_STREAM on an "idle" stream (one that was
-    %% never opened by either side) is a connection PROTOCOL_ERROR.
-    case maps:is_key(StreamId, Streams) orelse in_closed_stream_range(StreamId, State) of
-        true ->
-            notify_stream(StreamId, {stream_reset, StreamId, h2_error:name(ErrorCode)}, State),
-            State1 = close_stream(StreamId, rst, State),
-            {ok, connected, State1};
-        false ->
-            {error, protocol_error, State}
+    case bump_flood_counter(rst, State) of
+        flood ->
+            {error, enhance_your_calm, State};
+        {ok, State0} ->
+            %% RFC 7540 §6.4 / §5.1: RST_STREAM on an "idle" stream (one that was
+            %% never opened by either side) is a connection PROTOCOL_ERROR.
+            case maps:is_key(StreamId, Streams)
+                 orelse in_closed_stream_range(StreamId, State0) of
+                true ->
+                    notify_stream(StreamId, {stream_reset, StreamId,
+                                             h2_error:name(ErrorCode)}, State0),
+                    State1 = close_stream(StreamId, rst, State0),
+                    {ok, connected, State1};
+                false ->
+                    {error, protocol_error, State0}
+            end
     end;
 
 %% RFC 9113 §5.3.1: a stream cannot depend on itself — stream PROTOCOL_ERROR.
@@ -1742,6 +1762,33 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
 %% Treats both peer-initiated ids (up to last_peer_stream_id) and our own
 %% ids (strictly below next_stream_id) as "was opened at some point" —
 %% symmetric for client and server modes.
+%% RFC 9113 §10.5: per-connection flood counters. Bucket-per-second; when
+%% the count within the current second exceeds the limit, the caller emits
+%% GOAWAY(ENHANCE_YOUR_CALM).
+bump_flood_counter(Kind, State) ->
+    Now = erlang:monotonic_time(second),
+    {Bucket, Count} = case Kind of
+        ping -> State#state.ping_flood;
+        rst  -> State#state.rst_flood
+    end,
+    {NewBucket, NewCount} = case Bucket =:= Now of
+        true  -> {Bucket, Count + 1};
+        false -> {Now, 1}
+    end,
+    Limit = case Kind of
+        ping -> ?PING_FLOOD_LIMIT_PER_SEC;
+        rst  -> ?RST_FLOOD_LIMIT_PER_SEC
+    end,
+    case NewCount > Limit of
+        true  -> flood;
+        false ->
+            State1 = case Kind of
+                ping -> State#state{ping_flood = {NewBucket, NewCount}};
+                rst  -> State#state{rst_flood  = {NewBucket, NewCount}}
+            end,
+            {ok, State1}
+    end.
+
 in_closed_stream_range(StreamId, #state{mode = Mode, last_peer_stream_id = LastPeer,
                                          next_stream_id = NextLocal}) ->
     {PeerParity, LocalParity} = case Mode of
