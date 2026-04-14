@@ -90,7 +90,7 @@ Identical shape to `quic_h3` so application code that dispatches on protocol eve
 ## Intentionally out of scope
 
 - **Server push (§8.2)** — deprecated by browsers, removed from HTTP/3.
-- **Stream priorities (§5.3)** — deprecated by RFC 9218 (Extensible Priorities); not implemented and not announced.
+- **Stream priorities (§5.3)** — deprecated by RFC 9218 (Extensible Priorities). PRIORITY frames and the PRIORITY block on HEADERS are parsed and self-dependency is rejected (§5.3.1), but the priority signal is otherwise ignored; no scheduler applies it.
 - **HTTP/2 cleartext upgrade (§3.2)** — this release is ALPN-only. Starting an h2 connection over prior knowledge TCP is supported (`transport => tcp`), but `Upgrade: h2c` from an HTTP/1.1 request is not.
 - **Alt-Svc advertisement** — library concern, leave to the caller.
 - **WebTransport (RFC 9220)** — separate framing/setting; deferred.
@@ -112,5 +112,6 @@ Useful to know when extending or debugging:
 ## Testing
 
 - `rebar3 eunit` — 310 unit tests and 800 PropEr properties across frame/HPACK/settings/varint.
-- `rebar3 ct` — 54 Common Test cases: RFC compliance, client/server round-trips, CONNECT and Extended CONNECT tunnels, API-parity with `quic_h3`, malformed-message enforcement, flow-control accounting, error paths.
+- `rebar3 ct --suite=test/h2_compliance_SUITE` — 81 Common Test cases: RFC compliance, client/server round-trips, CONNECT and Extended CONNECT tunnels, API-parity with `quic_h3`, malformed-message enforcement, flow-control accounting, error paths.
+- `rebar3 ct --suite=test/h2_interop_SUITE` — external interop via h2spec (generic + HPACK).
 - `rebar3 dialyzer` / `rebar3 xref` — clean.
