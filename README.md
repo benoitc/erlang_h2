@@ -188,11 +188,31 @@ If the peer never advertised the setting, `h2:request/3` returns `{error, extend
 ```bash
 rebar3 compile
 rebar3 eunit          # 310 tests + 800 PropEr properties
-rebar3 ct             # 54 compliance + API-parity + tunnel cases
+rebar3 ct             # 72 compliance + API-parity + tunnel cases
 rebar3 dialyzer       # clean
 rebar3 xref           # clean
 rebar3 ex_doc         # HTML docs
 ```
+
+## Interop
+
+External-peer interop tests live in `test/h2_interop_SUITE.erl` and drive
+the server from [h2spec](https://github.com/summerwind/h2spec). Install
+h2spec locally, then:
+
+```bash
+# macOS
+brew install summerwind/h2spec/h2spec
+# Linux: download a release tarball from
+# https://github.com/summerwind/h2spec/releases
+
+rebar3 ct --suite=test/h2_interop_SUITE
+```
+
+Without h2spec on `PATH` the suite skips cleanly. The generic and HPACK
+groups are run in observe mode — failures are logged with full output for
+triage rather than treated as hard failures. Library-level conformance
+(which does not need h2spec) stays in `h2_compliance_SUITE`.
 
 ## Status
 

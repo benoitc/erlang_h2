@@ -54,4 +54,10 @@ jobs:
           otp-version: '26'
           rebar3-version: '3.23'
       - run: rebar3 eunit
+      - run: rebar3 ct --suite=test/h2_compliance_SUITE
       - run: rebar3 cover
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ct-logs
+          path: _build/test/logs
