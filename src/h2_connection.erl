@@ -941,20 +941,55 @@ handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, _Priority, #state{m
             %% New stream - validate stream ID
             case validate_stream_id(StreamId, Mode, State) of
                 ok ->
-                    case EndHeaders of
+                    %% RFC 9113 §5.1.2: reject peer-initiated streams that
+                    %% would exceed our advertised SETTINGS_MAX_CONCURRENT_STREAMS.
+                    case peer_stream_limit_exceeded(Mode, State) of
                         true ->
-                            decode_and_process_headers(StreamId, HeaderBlock, EndStream, State);
+                            send_rst_stream(StreamId, refused_stream, State),
+                            {ok, connected, State};
                         false ->
-                            Stream = get_or_create_stream(StreamId, State),
-                            Stream1 = Stream#stream{header_buffer = HeaderBlock},
-                            State1 = put_stream(StreamId, Stream1, State),
-                            State2 = State1#state{expecting_continuation = {StreamId, EndStream}},
-                            {ok, connected, State2}
+                            case EndHeaders of
+                                true ->
+                                    decode_and_process_headers(StreamId, HeaderBlock, EndStream, State);
+                                false ->
+                                    Stream = get_or_create_stream(StreamId, State),
+                                    Stream1 = Stream#stream{header_buffer = HeaderBlock},
+                                    State1 = put_stream(StreamId, Stream1, State),
+                                    State2 = State1#state{expecting_continuation = {StreamId, EndStream}},
+                                    {ok, connected, State2}
+                            end
                     end;
                 {error, ErrorCode} ->
                     {error, ErrorCode, State}
             end
     end.
+
+%% RFC 9113 §5.1.2: counts streams this endpoint accepted from the peer that
+%% are still in open / half_closed_* (the three states that count toward the
+%% limit). Idle, reserved, and closed do not count. We only check the local
+%% setting because exceeding it is what the spec scopes to REFUSED_STREAM.
+peer_stream_limit_exceeded(Mode, #state{local_settings = Settings} = State) ->
+    case h2_settings:get(max_concurrent_streams, Settings) of
+        unlimited -> false;
+        N when is_integer(N) ->
+            count_peer_active_streams(Mode, State) >= N
+    end.
+
+count_peer_active_streams(Mode, #state{streams = Streams}) ->
+    IsPeerInitiated = fun(Id) ->
+        case Mode of
+            server -> Id rem 2 =:= 1;  %% peer = client (odd ids)
+            client -> Id rem 2 =:= 0   %% peer = server (even ids, e.g. push)
+        end
+    end,
+    maps:fold(fun(Id, #stream{state = S}, Acc) ->
+        case IsPeerInitiated(Id)
+             andalso (S =:= open orelse S =:= half_closed_local
+                      orelse S =:= half_closed_remote) of
+            true  -> Acc + 1;
+            false -> Acc
+        end
+    end, 0, Streams).
 
 %% RFC 9113 §6.10: CONTINUATION is only valid immediately after a
 %% HEADERS/PUSH_PROMISE/CONTINUATION without END_HEADERS on the same stream.

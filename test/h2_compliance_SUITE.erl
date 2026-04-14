@@ -104,7 +104,8 @@
     closed_stream_data_triggers_goaway_test/1,
     rst_closed_stream_headers_triggers_rst_test/1,
     rst_closed_stream_data_triggers_rst_test/1,
-    closed_stream_continuation_triggers_goaway_test/1
+    closed_stream_continuation_triggers_goaway_test/1,
+    max_concurrent_streams_refuses_excess_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -219,7 +220,8 @@ groups() ->
             closed_stream_data_triggers_goaway_test,
             rst_closed_stream_headers_triggers_rst_test,
             rst_closed_stream_data_triggers_rst_test,
-            closed_stream_continuation_triggers_goaway_test
+            closed_stream_continuation_triggers_goaway_test,
+            max_concurrent_streams_refuses_excess_test
         ]}
     ].
 
@@ -2060,6 +2062,49 @@ closed_stream_continuation_triggers_goaway_test(Config) ->
         timeout          -> ct:fail(no_goaway)
     end,
     ssl:close(Sock),
+    ok.
+
+%% RFC 9113 §5.1.2: a peer that exceeds our advertised
+%% SETTINGS_MAX_CONCURRENT_STREAMS must get a stream error
+%% (REFUSED_STREAM) on the offending HEADERS.
+max_concurrent_streams_refuses_excess_test(Config) ->
+    %% Stop the shared server and bring up one that advertises max=1 and
+    %% keeps the handler pending so stream 1 stays open.
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef    -> h2:stop_server(OldRef)
+    end,
+    Handler = fun(_Conn, _Sid, _, _, _) ->
+        timer:sleep(1000)
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert     => ?config(cert_file, Config),
+        key      => ?config(key_file, Config),
+        handler  => Handler,
+        settings => #{max_concurrent_streams => 1}
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Sock} = raw_h2_client(Port),
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"localhost">>}
+    ],
+    Ctx0 = h2_hpack:new_context(),
+    {Block1, Ctx1} = h2_hpack:encode(Headers, Ctx0),
+    %% Stream 1 open (no END_STREAM): counts toward the limit.
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block1, false))),
+    {Block3, _} = h2_hpack:encode(Headers, Ctx1),
+    %% Stream 3 would push us over max=1 → expect RST_STREAM(REFUSED_STREAM=7).
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(3, Block3, true))),
+    case wait_for_rst_or_goaway(Sock, 3000) of
+        {rst, ErrorCode} -> ?assertEqual(7, ErrorCode);
+        Other            -> ct:fail({expected_rst_refused, Other})
+    end,
+    ssl:close(Sock),
+    h2:stop_server(Ref),
+    drain_exits(),
     ok.
 
 wait_for_rst_or_goaway(Sock, Timeout) ->
