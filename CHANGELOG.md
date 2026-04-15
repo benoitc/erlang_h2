@@ -19,6 +19,7 @@ Listener robustness + TLS regression guard. The server listener no longer dies w
 ### Fixed
 - `wait_connected/1,2` callers and the `{h2, Conn, connected}` owner event are now fired inline from `handle_frame` when the first SETTINGS ack transitions the connection to `connected`. Previously, if the same socket read buffer also contained a frame that caused a connection error, `gen_statem` would enter `closing` before the `connected` state-enter callback ran and waiters would only see the teardown reply.
 - `closing` state-enter now replies to any still-queued `wait_connected/1,2` callers with `{error, ErrorCode}` instead of leaving them to time out.
+- `closing` state-enter now half-closes the write side (`shutdown(write)`) and keeps reading to drain the recv buffer before the final close. A full `close()` with unread peer data was causing Linux to emit RST instead of FIN, which masked our GOAWAY on the h2spec oversized-frame case (`4.2 / 2: Sends a large size DATA frame that exceeds SETTINGS_MAX_FRAME_SIZE`).
 
 ## [0.3.0] - 2026-04-15
 
