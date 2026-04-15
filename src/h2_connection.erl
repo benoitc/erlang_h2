@@ -619,9 +619,15 @@ goaway_received(EventType, Event, State) ->
 
 closing(enter, _OldState, #state{socket = Socket, transport = Transport, waiters = Waiters, goaway_error = ErrorCode} = State) ->
     %% We entered `closing` after sending GOAWAY for a connection error.
-    %% RFC 9113 §5.4: close the TCP/TLS connection ourselves rather than
-    %% waiting for the peer. Keep a safety timer in case close blocks.
-    _ = Transport:close(Socket),
+    %% Half-close the write side so the queued GOAWAY is flushed and the
+    %% peer observes a clean FIN; then keep reading to drain any in-flight
+    %% payload still sitting in the kernel recv buffer. A full close() with
+    %% unread data is what makes Linux send RST instead of FIN, and that is
+    %% what was masking our GOAWAY on the h2spec oversized-frame case
+    %% (RFC 9113 §4.2, §5.4). terminate/3 does the final close once the
+    %% peer closes its end or the safety timer fires.
+    _ = shutdown_write(Transport, Socket),
+    _ = set_active(Transport, Socket),
     Timer = erlang:start_timer(?CLOSE_TIMEOUT_MS, self(), close_timeout),
     Replies = [{reply, From, {error, ErrorCode}} || From <- Waiters],
     {keep_state, State#state{close_timer = Timer, waiters = []}, Replies};
@@ -2575,6 +2581,11 @@ set_active(gen_tcp, Socket) ->
     inet:setopts(Socket, [{active, once}]);
 set_active(ssl, Socket) ->
     ssl:setopts(Socket, [{active, once}]).
+
+shutdown_write(gen_tcp, Socket) ->
+    gen_tcp:shutdown(Socket, write);
+shutdown_write(ssl, Socket) ->
+    ssl:shutdown(Socket, write).
 
 %% Stop the gen_statem with Reason, replying {error, Reason} to any waiters
 %% that called wait_connected before we reached the connected state.
