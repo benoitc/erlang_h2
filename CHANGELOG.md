@@ -4,6 +4,22 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-15
+
+Listener robustness + TLS regression guard. The server listener no longer dies when the process that called `h2:start_server/2` exits, which broke test helpers and init callbacks spinning up short-lived listeners.
+
+### Added
+- `h2_app` / `h2_sup` / `h2_listener`: `h2` is now a proper OTP application with a top-level `simple_one_for_one` supervisor for per-server listeners. Server listeners live under the application supervision tree instead of being linked to the caller of `h2:start_server/2`.
+- CT regression `tls_transport_tag_detected_test` in `h2_compliance_SUITE`: asserts `h2_connection` classifies the TLS socket as `ssl` (not `gen_tcp`) after connect, so any future drift in OTP's `sslsocket` tuple shape is caught early.
+
+### Changed
+- **Breaking:** `h2:start_server/2` now requires the `h2` application to be started (`application:ensure_started(h2)`). Previously it worked from any process; now it registers a child under `h2_sup`.
+- `h2:stop_server/1` sends a stop message to the listener process and lets it shut down the acceptor pool and close the listen socket under OTP supervision.
+
+### Fixed
+- `wait_connected/1,2` callers and the `{h2, Conn, connected}` owner event are now fired inline from `handle_frame` when the first SETTINGS ack transitions the connection to `connected`. Previously, if the same socket read buffer also contained a frame that caused a connection error, `gen_statem` would enter `closing` before the `connected` state-enter callback ran and waiters would only see the teardown reply.
+- `closing` state-enter now replies to any still-queued `wait_connected/1,2` callers with `{error, ErrorCode}` instead of leaving them to time out.
+
 ## [0.3.0] - 2026-04-15
 
 Third review pass + h2spec interop; behaviour-visible spec fixes across the whole state machine. No breaking API change, but callers that matched on specific error atoms may see different values on edge cases (ALPN, ENABLE_PUSH, IWS).

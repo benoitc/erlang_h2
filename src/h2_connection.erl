@@ -145,6 +145,7 @@
 
     %% Callers waiting for connected state
     waiters = [] :: [gen_statem:from()],
+    connected_notified = false :: boolean(),
 
     %% RFC 7540 §6.10: once HEADERS/PUSH_PROMISE/CONTINUATION without
     %% END_HEADERS arrives, the only frame we may accept until
@@ -472,17 +473,23 @@ settings(EventType, Event, State) ->
 %% State: connected
 %% ============================================================================
 
-connected(enter, _OldState, #state{settings_timer = Timer, waiters = Waiters} = State) ->
+connected(enter, _OldState, #state{settings_timer = Timer, waiters = Waiters,
+                                    connected_notified = Notified} = State) ->
     %% Cancel settings timer if still running
     case Timer of
         undefined -> ok;
         _ -> _ = erlang:cancel_timer(Timer), ok
     end,
-    %% Notify owner that connection is ready
-    notify_owner({h2, self(), connected}, State),
-    %% Reply to all waiters
-    Replies = [{reply, From, ok} || From <- Waiters],
-    {keep_state, State#state{settings_timer = undefined, waiters = []}, Replies};
+    case Notified of
+        true ->
+            %% notify_connected/1 already fired inline from handle_frame
+            {keep_state, State#state{settings_timer = undefined}};
+        false ->
+            notify_owner({h2, self(), connected}, State),
+            Replies = [{reply, From, ok} || From <- Waiters],
+            {keep_state, State#state{settings_timer = undefined, waiters = [],
+                                      connected_notified = true}, Replies}
+    end;
 
 connected(info, {tcp, Socket, Data}, #state{socket = Socket} = State) ->
     handle_data(connected, Data, State);
@@ -610,13 +617,14 @@ goaway_received(EventType, Event, State) ->
 %% State: closing
 %% ============================================================================
 
-closing(enter, _OldState, #state{socket = Socket, transport = Transport} = State) ->
-    %% We entered `closing` after sending GOAWAY for a connection error —
+closing(enter, _OldState, #state{socket = Socket, transport = Transport, waiters = Waiters, goaway_error = ErrorCode} = State) ->
+    %% We entered `closing` after sending GOAWAY for a connection error.
     %% RFC 9113 §5.4: close the TCP/TLS connection ourselves rather than
     %% waiting for the peer. Keep a safety timer in case close blocks.
     _ = Transport:close(Socket),
     Timer = erlang:start_timer(?CLOSE_TIMEOUT_MS, self(), close_timeout),
-    {keep_state, State#state{close_timer = Timer}};
+    Replies = [{reply, From, {error, ErrorCode}} || From <- Waiters],
+    {keep_state, State#state{close_timer = Timer, waiters = []}, Replies};
 
 closing(info, {tcp_closed, Socket}, #state{socket = Socket} = State) ->
     {stop, {shutdown, tcp_closed}, State};
@@ -748,7 +756,11 @@ handle_frame(_StateName, {settings_ack}, #state{pending_settings = [Pending|Rest
         true -> connected;
         false -> settings
     end,
-    {ok, NewStateName, State2};
+    State3 = case NewStateName of
+        connected -> notify_connected(State2);
+        _ -> State2
+    end,
+    {ok, NewStateName, State3};
 handle_frame(_StateName, {settings_ack}, State) ->
     %% Unexpected ACK - ignore
     {ok, connected, State};
@@ -2569,6 +2581,21 @@ set_active(ssl, Socket) ->
 stop_and_notify_waiters(Reason, #state{waiters = Waiters} = State) ->
     Replies = [{reply, From, {error, peel_reason(Reason)}} || From <- Waiters],
     {stop_and_reply, Reason, Replies, State#state{waiters = []}}.
+
+%% Reply `ok` to any queued wait_connected callers and fire the owner
+%% notification. Called inline when a frame causes the transition to
+%% `connected` so the reply isn't lost if the very next frame in the same
+%% buffer triggers a connection error before gen_statem enters the state.
+notify_connected(#state{connected_notified = true} = State) ->
+    State;
+notify_connected(#state{waiters = Waiters, settings_timer = Timer} = State) ->
+    case Timer of
+        undefined -> ok;
+        _ -> _ = erlang:cancel_timer(Timer), ok
+    end,
+    notify_owner({h2, self(), connected}, State),
+    [gen_statem:reply(From, ok) || From <- Waiters],
+    State#state{waiters = [], settings_timer = undefined, connected_notified = true}.
 
 peel_reason({shutdown, R}) -> R;
 peel_reason(R) -> R.

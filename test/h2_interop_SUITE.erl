@@ -53,6 +53,7 @@ init_per_suite(Config) ->
     ok = application:ensure_started(asn1),
     ok = application:ensure_started(public_key),
     ok = application:ensure_started(ssl),
+    ok = application:ensure_started(h2),
     CertDir = ?config(priv_dir, Config),
     {CertFile, KeyFile} = generate_test_certs(CertDir),
     [{cert_file, CertFile}, {key_file, KeyFile} | Config].

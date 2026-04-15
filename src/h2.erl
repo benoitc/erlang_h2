@@ -358,14 +358,20 @@ start_server_ssl(Port, Opts) ->
                         enable_connect_protocol => EnableConnectProtocol,
                         ref => Ref
                     },
-                    Self = self(),
-                    AcceptorPids = [spawn_link(fun() ->
-                        acceptor_loop(Self, ServerState)
-                    end) || _ <- lists:seq(1, NumAcceptors)],
-                    ManagerPid = spawn_link(fun() ->
-                        server_manager_loop(ListenSocket, AcceptorPids, Ref)
-                    end),
-                    {ok, {ManagerPid, Ref, BoundPort}};
+                    case h2_sup:start_listener(#{
+                        transport => ssl,
+                        listen_socket => ListenSocket,
+                        acceptor_count => NumAcceptors,
+                        ref => Ref,
+                        acceptor_fun => fun(S) -> acceptor_loop(S) end,
+                        server_state => ServerState
+                    }) of
+                        {ok, ListenerPid} ->
+                            {ok, {ListenerPid, Ref, BoundPort}};
+                        {error, StartReason} ->
+                            _ = ssl:close(ListenSocket),
+                            {error, StartReason}
+                    end;
                 {error, Reason} ->
                     {error, {listen_failed, Reason}}
             end;
@@ -397,14 +403,20 @@ start_server_tcp(Port, Opts) ->
                         enable_connect_protocol => EnableConnectProtocol,
                         ref => Ref
                     },
-                    Self = self(),
-                    AcceptorPids = [spawn_link(fun() ->
-                        tcp_acceptor_loop(Self, ServerState)
-                    end) || _ <- lists:seq(1, NumAcceptors)],
-                    ManagerPid = spawn_link(fun() ->
-                        tcp_server_manager_loop(ListenSocket, AcceptorPids, Ref)
-                    end),
-                    {ok, {ManagerPid, Ref, BoundPort}};
+                    case h2_sup:start_listener(#{
+                        transport => tcp,
+                        listen_socket => ListenSocket,
+                        acceptor_count => NumAcceptors,
+                        ref => Ref,
+                        acceptor_fun => fun(S) -> tcp_acceptor_loop(S) end,
+                        server_state => ServerState
+                    }) of
+                        {ok, ListenerPid} ->
+                            {ok, {ListenerPid, Ref, BoundPort}};
+                        {error, StartReason} ->
+                            _ = gen_tcp:close(ListenSocket),
+                            {error, StartReason}
+                    end;
                 {error, Reason} ->
                     {error, {listen_failed, Reason}}
             end;
@@ -414,38 +426,18 @@ start_server_tcp(Port, Opts) ->
 
 %% @doc Stop an HTTP/2 server.
 -spec stop_server(server_ref()) -> ok.
-stop_server({ManagerPid, Ref, _Port}) ->
-    ManagerPid ! {stop, Ref},
-    ok.
+stop_server({ListenerPid, Ref, _Port}) ->
+    h2_listener:stop(ListenerPid, Ref).
 
 %% @doc Return the TCP port the server is actually listening on.
 -spec server_port(server_ref()) -> inet:port_number().
 server_port({_, _, Port}) -> Port.
 
-server_manager_loop(ListenSocket, AcceptorPids, Ref) ->
+acceptor_loop(State) ->
     process_flag(trap_exit, true),
-    server_manager_loop_inner(ListenSocket, AcceptorPids, Ref).
+    acceptor_loop_inner(State).
 
-server_manager_loop_inner(ListenSocket, AcceptorPids, Ref) ->
-    receive
-        {stop, Ref} ->
-            %% Stop all acceptors
-            lists:foreach(fun(Pid) -> exit(Pid, shutdown) end, AcceptorPids),
-            _ = ssl:close(ListenSocket),
-            ok;
-        {'EXIT', Pid, _Reason} ->
-            %% Acceptor died, remove from list
-            NewPids = lists:delete(Pid, AcceptorPids),
-            server_manager_loop_inner(ListenSocket, NewPids, Ref);
-        _ ->
-            server_manager_loop_inner(ListenSocket, AcceptorPids, Ref)
-    end.
-
-acceptor_loop(Owner, State) ->
-    process_flag(trap_exit, true),
-    acceptor_loop_inner(Owner, State).
-
-acceptor_loop_inner(Owner, #{listen_socket := ListenSocket, handler := Handler, settings := Settings} = State) ->
+acceptor_loop_inner(#{listen_socket := ListenSocket, handler := Handler, settings := Settings} = State) ->
     EnableConnectProtocol = maps:get(enable_connect_protocol, State, false),
     case ssl:transport_accept(ListenSocket, infinity) of
         {ok, Socket} ->
@@ -481,14 +473,14 @@ acceptor_loop_inner(Owner, #{listen_socket := ListenSocket, handler := Handler, 
                 {error, _} ->
                     ok
             end,
-            acceptor_loop_inner(Owner, State);
+            acceptor_loop_inner(State);
         {error, closed} ->
             %% Listen socket closed (server shutdown). Exit with `shutdown`
             %% so any wrapper/connection processes still spawn_link'd to us
             %% (in-flight connections) tear down too.
             exit(shutdown);
         {error, _Reason} ->
-            acceptor_loop_inner(Owner, State)
+            acceptor_loop_inner(State)
     end.
 
 handle_server_connection(Socket, Handler, Settings, Transport, EnableConnectProtocol) ->
@@ -516,28 +508,11 @@ handle_server_connection(Socket, Handler, Settings, Transport, EnableConnectProt
             catch CloseFn(Socket)
     end.
 
-tcp_server_manager_loop(ListenSocket, AcceptorPids, Ref) ->
+tcp_acceptor_loop(State) ->
     process_flag(trap_exit, true),
-    tcp_server_manager_loop_inner(ListenSocket, AcceptorPids, Ref).
+    tcp_acceptor_loop_inner(State).
 
-tcp_server_manager_loop_inner(ListenSocket, AcceptorPids, Ref) ->
-    receive
-        {stop, Ref} ->
-            lists:foreach(fun(Pid) -> exit(Pid, shutdown) end, AcceptorPids),
-            _ = gen_tcp:close(ListenSocket),
-            ok;
-        {'EXIT', Pid, _Reason} ->
-            NewPids = lists:delete(Pid, AcceptorPids),
-            tcp_server_manager_loop_inner(ListenSocket, NewPids, Ref);
-        _ ->
-            tcp_server_manager_loop_inner(ListenSocket, AcceptorPids, Ref)
-    end.
-
-tcp_acceptor_loop(Owner, State) ->
-    process_flag(trap_exit, true),
-    tcp_acceptor_loop_inner(Owner, State).
-
-tcp_acceptor_loop_inner(Owner, #{listen_socket := ListenSocket, handler := Handler, settings := Settings} = State) ->
+tcp_acceptor_loop_inner(#{listen_socket := ListenSocket, handler := Handler, settings := Settings} = State) ->
     EnableConnectProtocol = maps:get(enable_connect_protocol, State, false),
     case gen_tcp:accept(ListenSocket, infinity) of
         {ok, Socket} ->
@@ -560,11 +535,11 @@ tcp_acceptor_loop_inner(Owner, #{listen_socket := ListenSocket, handler := Handl
                     _ = gen_tcp:close(Socket),
                     ok
             end,
-            tcp_acceptor_loop_inner(Owner, State);
+            tcp_acceptor_loop_inner(State);
         {error, closed} ->
             exit(shutdown);
         {error, _Reason} ->
-            tcp_acceptor_loop_inner(Owner, State)
+            tcp_acceptor_loop_inner(State)
     end.
 
 server_connection_loop(Conn, Handler) ->

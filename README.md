@@ -71,6 +71,12 @@ ok = h2:send_data(Conn, Sid, Chunk2, true).   %% last chunk: EndStream = true
 
 ## Server
 
+`h2:start_server/2` starts the listener under the `h2` application's supervision tree, so make sure the application is started first:
+
+```erlang
+ok = application:ensure_started(h2).
+```
+
 ```erlang
 Handler = fun(Conn, StreamId, <<"GET">>, <<"/">>, _Headers) ->
     h2:send_response(Conn, StreamId, 200, [{<<"content-type">>, <<"text/plain">>}]),

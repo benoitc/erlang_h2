@@ -103,7 +103,9 @@ Useful to know when extending or debugging:
 | Module | Role |
 |---|---|
 | `h2_connection` | `gen_statem` owning the socket; one process per connection. |
-| `h2_server` | TLS listener supervisor + acceptor pool, dispatches accepted sockets to `h2_connection` in server mode. |
+| `h2_app` / `h2_sup` | Application callback and top-level supervisor. `h2_sup` is a `simple_one_for_one` parent of per-server listeners, so calling `h2:start_server/2` from a short-lived process no longer tears the listener down when the caller exits. |
+| `h2_listener` | Per-server process spawned under `h2_sup`: owns the listen socket and the acceptor pool. |
+| `h2_server` | Standalone escript entry point; not used by `h2:start_server/2`. |
 | `h2_frame` | Pure frame encode/decode with per-type stream-id 0 and size validation. |
 | `h2_hpack` | HPACK context type, encode/decode, size updates, Huffman. |
 | `h2_settings` | Typed settings map, encode/decode/validate, parameter defaults. |

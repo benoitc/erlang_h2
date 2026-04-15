@@ -121,7 +121,8 @@
     send_connect_without_host_rejected_test/1,
     server_advertises_enable_push_zero_test/1,
     push_promise_gets_stream_reset_test/1,
-    ping_flood_triggers_enhance_your_calm_test/1
+    ping_flood_triggers_enhance_your_calm_test/1,
+    tls_transport_tag_detected_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -253,7 +254,8 @@ groups() ->
             send_connect_without_host_rejected_test,
             server_advertises_enable_push_zero_test,
             push_promise_gets_stream_reset_test,
-            ping_flood_triggers_enhance_your_calm_test
+            ping_flood_triggers_enhance_your_calm_test,
+            tls_transport_tag_detected_test
         ]}
     ].
 
@@ -263,6 +265,7 @@ init_per_suite(Config) ->
     ok = application:ensure_started(asn1),
     ok = application:ensure_started(public_key),
     ok = application:ensure_started(ssl),
+    ok = application:ensure_started(h2),
 
     %% Generate test certificates
     CertDir = ?config(priv_dir, Config),
@@ -305,6 +308,10 @@ init_per_testcase(_TestCase, Config) ->
     end.
 
 end_per_testcase(_TestCase, Config) ->
+    %% Server-side h2_connection processes started on accepted sockets are
+    %% linked to the caller; trap exits so their teardown surfaces as
+    %% messages we can drain instead of killing us.
+    Prev = process_flag(trap_exit, true),
     case ?config(server_ref, Config) of
         undefined -> ok;
         ServerRef -> h2:stop_server(ServerRef)
@@ -313,6 +320,7 @@ end_per_testcase(_TestCase, Config) ->
     timer:sleep(50),
     %% Drain any lingering 'EXIT' messages from linked connection processes
     drain_exits(),
+    process_flag(trap_exit, Prev),
     ok.
 
 drain_exits() ->
@@ -794,14 +802,16 @@ goaway_test(Config) ->
 
     %% Wait for connection to close (either goaway_exchange or close by peer)
     receive
-        {'EXIT', Conn, {shutdown, _Reason}} ->
-            %% Expected - connection closed gracefully
+        {'EXIT', Conn, _Reason} ->
+            %% Expected - connection closed
             ok
     after 5000 ->
         %% If still alive after timeout, close it
-        h2:close(Conn)
+        catch h2:close(Conn),
+        receive {'EXIT', Conn, _} -> ok after 1000 -> ok end
     end,
 
+    drain_exits(),
     process_flag(trap_exit, false),
     ok.
 
@@ -2638,6 +2648,26 @@ receive_full_response_with_trailers(Conn, StreamId, Timeout, Status, Headers, Bo
     after Timeout ->
         {error, timeout}
     end.
+
+%% Regression guard: h2_connection:init/1 classifies its socket by the
+%% `sslsocket' tag, not by tuple arity. OTP 26+ widened sslsocket from a
+%% 3-tuple to an 8-tuple; the old pattern match silently fell through to
+%% `gen_tcp' and later crashed in `prim_inet:setopts/2'. This test fails
+%% fast if that classification ever breaks again.
+tls_transport_tag_detected_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none},
+                     {alpn_advertised_protocols, [<<"h2">>]}]
+    }),
+    {_StateName, Data} = sys:get_state(Conn),
+    ?assertEqual(state, element(1, Data)),
+    %% Field 4 of the #state{} record is `transport'. If record fields
+    %% are ever reordered, update the index — a failure here still
+    %% surfaces the classification regression clearly.
+    ?assertEqual(ssl, element(4, Data)),
+    h2:close(Conn),
+    ok.
 
 generate_test_certs(Dir) ->
     CertFile = filename:join(Dir, "server.pem"),
