@@ -39,6 +39,14 @@
 %% RFC 8441 - Extended CONNECT for WebSockets and WebTransport
 -define(SETTINGS_ENABLE_CONNECT_PROTOCOL, 16#8).
 
+%% draft-ietf-webtrans-http2-14 Section 11.2 - WebTransport over HTTP/2
+-define(SETTINGS_WT_INITIAL_MAX_DATA,                    16#2b61).
+-define(SETTINGS_WT_INITIAL_MAX_STREAM_DATA_UNI,         16#2b62).
+-define(SETTINGS_WT_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,  16#2b63).
+-define(SETTINGS_WT_INITIAL_MAX_STREAMS_UNI,             16#2b64).
+-define(SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI,            16#2b65).
+-define(SETTINGS_WT_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, 16#2b66).
+
 %% Default Settings Values
 -define(DEFAULT_HEADER_TABLE_SIZE,      4096).
 %% RFC 9113 §6.5.2: endpoints that do not produce server push SHOULD

@@ -4,6 +4,14 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-19
+
+### Added
+- `h2_settings`: WebTransport over HTTP/2 settings (draft-ietf-webtrans-http2-14 §11.2). IDs `0x2b61`-`0x2b66` encode/decode as `wt_initial_max_data`, `wt_initial_max_stream_data_uni`, `wt_initial_max_stream_data_bidi_local`, `wt_initial_max_stream_data_bidi_remote`, `wt_initial_max_streams_uni`, `wt_initial_max_streams_bidi`. No defaults: absence means "not advertised".
+
+### Changed
+- `h2_settings:decode/1`: unknown setting IDs are preserved under their raw 16-bit integer key in the returned map instead of being dropped. RFC 7540 §6.5.2 "MUST ignore" means "do not act on", not "discard"; keeping them lets higher layers (e.g. WebTransport) inspect extension settings without a patch here. `h2_settings:encode/1` also accepts integer keys for symmetric round-trip.
+
 ## [0.4.0] - 2026-04-15
 
 Listener robustness + TLS regression guard. The server listener no longer dies when the process that called `h2:start_server/2` exits, which broke test helpers and init callbacks spinning up short-lived listeners.
