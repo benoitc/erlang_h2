@@ -793,9 +793,12 @@ handle_frame(_StateName, {settings_ack}, #state{pending_settings = [Pending|Rest
         _ -> State2
     end,
     {ok, NewStateName, State3};
-handle_frame(_StateName, {settings_ack}, State) ->
-    %% Unexpected ACK - ignore
-    {ok, connected, State};
+handle_frame(StateName, {settings_ack}, State) ->
+    %% Unsolicited SETTINGS ACK with no pending settings. RFC 9113 §6.5.3
+    %% technically calls this a PROTOCOL_ERROR; we stay lenient and ignore
+    %% it, but preserve the current state instead of forcing `connected'
+    %% (which would short-circuit the preface state machine server-side).
+    {ok, StateName, State};
 
 handle_frame(_StateName, {ping, Data}, State) ->
     case bump_flood_counter(ping, State) of
