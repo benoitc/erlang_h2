@@ -54,6 +54,11 @@
 %% block before HPACK decode, so a CONTINUATION flood cannot OOM the node
 %% before max_header_list_size (which acts on decoded headers) can fire.
 -define(MAX_HEADER_BLOCK_BYTES, 256 * 1024).
+%% RFC 7541 §4.2: the peer can advertise an arbitrarily large
+%% SETTINGS_HEADER_TABLE_SIZE; honoring it verbatim turns our encoder
+%% dynamic table into a memory- and CPU-exhaustion vector (lookup is O(n)).
+%% Cap the value we actually apply.
+-define(MAX_PEER_HEADER_TABLE_SIZE, 65536).
 
 %% Stream states per RFC 7540 Section 5.1
 -record(stream, {
@@ -949,8 +954,9 @@ encode_settings_list(Settings) ->
 
 apply_peer_settings(Settings, #state{encode_context = EncCtx, streams = Streams,
                                       peer_settings = OldSettings} = State) ->
-    NewTableSize = h2_settings:get(header_table_size, Settings),
-    EncCtx1 = h2_hpack:set_max_table_size(NewTableSize, EncCtx),
+    PeerTableSize = h2_settings:get(header_table_size, Settings),
+    AppliedTableSize = min(PeerTableSize, ?MAX_PEER_HEADER_TABLE_SIZE),
+    EncCtx1 = h2_hpack:set_max_table_size(AppliedTableSize, EncCtx),
 
     OldWindow = h2_settings:get(initial_window_size, OldSettings),
     NewWindow = h2_settings:get(initial_window_size, Settings),
