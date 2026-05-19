@@ -105,6 +105,13 @@
     cert => binary() | string(),
     key => binary() | string(),
     cacerts => [binary()],
+    %% TLS peer-cert verification policy. Defaults to verify_none. When
+    %% verify_peer is requested, `cacerts' must be supplied; otherwise the
+    %% listener start fails with {error, verify_peer_requires_cacerts}.
+    verify => verify_none | verify_peer,
+    %% Raw ssl:tls_option() overrides; merged on top of our defaults. Useful
+    %% for pinning a cipher list, disabling renegotiation, etc.
+    ssl_opts => [ssl:tls_option()],
     handler := fun((connection(), stream_id(), binary(), binary(), headers()) -> any()),
     settings => h2_settings:settings(),
     acceptors => pos_integer(),
@@ -330,24 +337,12 @@ start_server(Port, Opts) ->
 start_server_ssl(Port, Opts) ->
     case {maps:find(cert, Opts), maps:find(key, Opts), maps:find(handler, Opts)} of
         {{ok, Cert}, {ok, Key}, {ok, Handler}} ->
+            case build_server_ssl_opts(Cert, Key, Opts) of
+                {error, _} = OptsErr -> OptsErr;
+                {ok, SSLOpts} ->
             NumAcceptors = maps:get(acceptors, Opts, erlang:system_info(schedulers)),
             Settings = maps:get(settings, Opts, #{}),
             EnableConnectProtocol = maps:get(enable_connect_protocol, Opts, false),
-            CACerts = maps:get(cacerts, Opts, []),
-            CertFile = load_file(Cert),
-            KeyFile = load_file(Key),
-            SSLOpts = [
-                {certfile, CertFile},
-                {keyfile, KeyFile},
-                {alpn_preferred_protocols, [<<"h2">>]},
-                {versions, ['tlsv1.2', 'tlsv1.3']},
-                {reuseaddr, true},
-                {active, false},
-                {mode, binary}
-            ] ++ case CACerts of
-                [] -> [];
-                _ -> [{cacerts, CACerts}, {verify, verify_peer}]
-            end,
             case ssl:listen(Port, SSLOpts) of
                 {ok, ListenSocket} ->
                     {ok, {_, BoundPort}} = ssl:sockname(ListenSocket),
@@ -375,9 +370,42 @@ start_server_ssl(Port, Opts) ->
                     end;
                 {error, Reason} ->
                     {error, {listen_failed, Reason}}
+            end
             end;
         _ ->
             {error, {missing_required_option, [cert, key, handler]}}
+    end.
+
+%% Build the final ssl:listen/2 option list from the user-supplied map.
+%% Honors `verify' (default verify_none), `cacerts', and `ssl_opts' as a
+%% raw override. Rejects verify_peer without cacerts so a misconfigured
+%% server fails closed instead of silently accepting unauthenticated peers.
+build_server_ssl_opts(Cert, Key, Opts) ->
+    CertFile = load_file(Cert),
+    KeyFile  = load_file(Key),
+    Verify   = maps:get(verify, Opts, verify_none),
+    CACerts  = maps:get(cacerts, Opts, []),
+    UserOpts = maps:get(ssl_opts, Opts, []),
+    case Verify of
+        verify_peer when CACerts =:= [] ->
+            {error, verify_peer_requires_cacerts};
+        _ ->
+            Base = [
+                {certfile, CertFile},
+                {keyfile, KeyFile},
+                {alpn_preferred_protocols, [<<"h2">>]},
+                {versions, ['tlsv1.2', 'tlsv1.3']},
+                {honor_cipher_order, true},
+                {reuseaddr, true},
+                {active, false},
+                {mode, binary},
+                {verify, Verify}
+            ],
+            Auth = case CACerts of
+                []  -> [];
+                _   -> [{cacerts, CACerts}]
+            end,
+            {ok, merge_opts(merge_opts(Base, Auth), UserOpts)}
     end.
 
 %% Cleartext (h2c over TCP, prior-knowledge) server listener.
@@ -438,8 +466,19 @@ acceptor_loop(State) ->
     process_flag(trap_exit, true),
     acceptor_loop_inner(State).
 
+%% Each accepted connection spawns a linked wrapper; when the wrapper
+%% exits the acceptor (trap_exit) receives `{'EXIT', _, _}'. The accept
+%% loop never reads its mailbox, so without a drain these queue up until
+%% the node runs out of memory.
+drain_child_exits() ->
+    receive
+        {'EXIT', _Pid, _Reason} -> drain_child_exits()
+    after 0 -> ok
+    end.
+
 acceptor_loop_inner(#{listen_socket := ListenSocket, handler := Handler, settings := Settings} = State) ->
     EnableConnectProtocol = maps:get(enable_connect_protocol, State, false),
+    drain_child_exits(),
     case ssl:transport_accept(ListenSocket, infinity) of
         {ok, Socket} ->
             case ssl:handshake(Socket, 30000) of
@@ -515,6 +554,7 @@ tcp_acceptor_loop(State) ->
 
 tcp_acceptor_loop_inner(#{listen_socket := ListenSocket, handler := Handler, settings := Settings} = State) ->
     EnableConnectProtocol = maps:get(enable_connect_protocol, State, false),
+    drain_child_exits(),
     case gen_tcp:accept(ListenSocket, infinity) of
         {ok, Socket} ->
             _ = inet:setopts(Socket, [{active, false}]),
