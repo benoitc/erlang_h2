@@ -4,6 +4,55 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-20
+
+Security and concurrency hardening pass driven by a multi-agent audit. Several behaviour changes are flagged below; the new error returns require callers to widen their pattern matches.
+
+### Security
+
+- **CONTINUATION flood (Critical).** `handle_continuation` caps the raw bytes of an in-flight HEADERS+CONTINUATION block at `?MAX_HEADER_BLOCK_BYTES` (256 KB). Past the cap the connection emits `GOAWAY(ENHANCE_YOUR_CALM)`. Pre-fix a peer could OOM the node before `max_header_list_size` (which acts on decoded headers) could fire, same class as CVE-2024-27316.
+- **Owner liveness (Critical).** `controlling_process/2` now monitors the new owner and demonitors the previous one. Before the fix the new owner's death produced no signal and the connection orphaned the socket.
+- **`send_frame/2` error propagation (High).** `send_request` / `send_request_headers` / `send_response` / `send_data` / `send_trailers` used to reply `ok` to the caller even after `Transport:send` returned `{error, closed}`. They now stop with `{shutdown, {send_failed, Reason}}` and propagate `{error, Reason}` to the in-flight caller.
+- **Peer `SETTINGS_HEADER_TABLE_SIZE` capped (High)** at 64 KB before applying. RFC 7541 lets the peer advertise any 32-bit value; honoring it fed the encoder dynamic table (O(n) lookup) and turned a chatty peer into a CPU/memory exhaustion vector.
+- **Per-stream send-buffer cap (High).** `Stream#stream.send_buffer` is capped at `?MAX_SEND_BUFFER_BYTES` (1 MB). A peer that stalls its receive window now gets `{error, send_buffer_full}` instead of growing the connection process unbounded.
+- **Acceptor mailbox drain (High).** ssl and tcp acceptor loops drain queued `{'EXIT', _, _}` after every accept. Pre-fix every closed connection left an EXIT message in the trapping acceptor; on a busy server the mailbox grew without bound.
+- **TLS server hardening (High).** `start_server` honors top-level `verify` (default `verify_none`), rejects `verify_peer` without `cacerts` (`{error, verify_peer_requires_cacerts}`), accepts an `ssl_opts` override list, and defaults `honor_cipher_order` to `true`.
+- **Demo escript path traversal.** `h2_server:safe_path/2` uses `filelib:safe_relative_path/2`; URL-encoded `%2e%2e` and normalised escapes (`/a/../../etc/passwd`) are now rejected.
+
+### Breaking
+
+- `h2:set_stream_handler/3,4` default flipped from `drain_buffer => true` to `drain_buffer => false`. The connection now replays previously-buffered DATA frames to the handler pid itself; the call returns `ok`. Callers that explicitly matched `{ok, Buf}` on the default and forwarded by hand can drop that code. Pass `#{drain_buffer => true}` to keep the old shape.
+- `h2:send_data/3,4` may return `{error, send_buffer_full}` when the peer has stopped consuming. Widen any `ok = h2:send_data(...)` match.
+- `h2:cancel_stream/2,3` is marked `-deprecated` in favour of `h2:cancel/2,3`. Same behaviour; compiler emits the deprecation warning.
+- Default `SETTINGS_MAX_CONCURRENT_STREAMS` is now `100` (was `unlimited`, per RFC 9113 §5.1.2 floor). Peers attempting more than 100 concurrent streams now get `RST_STREAM(REFUSED_STREAM)`.
+- TLS server `start_server`: `verify_peer` without `cacerts` now fails fast with `{error, verify_peer_requires_cacerts}` instead of silently accepting unauthenticated peers.
+
+### Added
+
+- `?MAX_HEADER_BLOCK_BYTES` (256 KB), `?MAX_PEER_HEADER_TABLE_SIZE` (64 KB), `?MAX_SEND_BUFFER_BYTES` (1 MB), `?DEFAULT_TIMEOUT_MS` (30 s) macros in `h2.hrl`.
+- `h2_settings:setting_id/1` and `h2_settings:encode_value/1` exported; `h2_connection` reuses them so the literal-hex setting-id table cannot drift again.
+- CT regressions in `h2_compliance_SUITE`:
+  - `continuation_flood_triggers_enhance_your_calm_test`: > 256 KB of CONTINUATION traffic yields GOAWAY.
+  - `controlling_process_monitors_new_owner_test`: killing the new owner terminates the connection.
+  - `send_returns_error_on_closed_socket_test`: closed socket + `send_data` returns `{error, _}`.
+  - `send_buffer_full_when_peer_stalls_window_test`: 2 MB push past stalled window yields `send_buffer_full`.
+  - `set_stream_handler_default_replays_buffer_test`: the new auto-replay default is exercised.
+  - `large_body_yields_to_inbound_frames_test`: PING ACK round-trips during a 512 KB upload.
+
+### Changed
+
+- `handle_send_data` no longer recurses inside the gen_statem callback for multi-frame bodies. It buffers the payload (subject to the cap) and `flush_stream_one_chunk/2` emits one DATA frame per gen_statem step via self-cast. Inbound frames (PING, WINDOW_UPDATE, RST_STREAM) are now interleaved with outbound chunks instead of queueing for the duration.
+- HPACK decode failures and handler crashes log via `logger:error/2` (was the deprecated `error_logger:error_msg/2`). The HPACK reason term is dropped from the log line; it echoed attacker-supplied header bytes.
+- An unsolicited `SETTINGS_ACK` preserves the current state name instead of forcing `connected` (still lenient-ignore, not the RFC 9113 §6.5.3 PROTOCOL_ERROR; just no longer short-circuits the preface state machine).
+- `peel_reason/1` is recursive; doubly-wrapped `{shutdown, {shutdown, _}}` reasons collapse to the inner value.
+- Default ssl/tcp transport tag, ALPN, and timeouts all flow from `?DEFAULT_TIMEOUT_MS` (30 s).
+
+### Fixed
+
+- `set_active/2` on a closed socket no longer crashes the gen_statem with `badmatch`; the connection stops cleanly with `{shutdown, {socket_error, _}}`.
+- `cancel_timer` uses synchronous cancel + flushes any already-delivered `{timeout, Ref, _}` so stale messages cannot match a future reused timer.
+- `h2_listener:loop/4` and `h2:server_connection_loop/2` `logger:debug` unknown messages instead of silently dropping.
+
 ## [0.5.0] - 2026-04-19
 
 ### Added
