@@ -18,6 +18,8 @@
 %%
 -module(h2_server).
 
+-include_lib("kernel/include/file.hrl").
+
 -export([main/1]).
 
 -define(DEFAULT_PORT, 8443).
@@ -263,8 +265,7 @@ serve_file_head(Conn, StreamId, Path, Docroot, Verbose) ->
             send_error(Conn, StreamId, 400, <<"Bad Request">>, Verbose);
         SafePath ->
             case file:read_file_info(SafePath) of
-                {ok, FileInfo} ->
-                    Size = element(2, FileInfo),
+                {ok, #file_info{size = Size}} ->
                     ContentType = guess_content_type(SafePath),
                     ResponseHeaders = [
                         {<<"content-type">>, ContentType},
