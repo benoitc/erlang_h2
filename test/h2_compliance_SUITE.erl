@@ -89,6 +89,7 @@
     extended_connect_setting_advertised_test/1,
     extended_connect_setting_default_off_test/1,
     extended_connect_round_trip_test/1,
+    extended_connect_handler_registered_after_response_test/1,
     extended_connect_client_refuses_when_peer_disabled_test/1,
     extended_connect_method_must_be_connect_test/1,
     extended_connect_trailers_rejected_test/1,
@@ -222,6 +223,7 @@ groups() ->
             extended_connect_setting_advertised_test,
             extended_connect_setting_default_off_test,
             extended_connect_round_trip_test,
+            extended_connect_handler_registered_after_response_test,
             extended_connect_client_refuses_when_peer_disabled_test,
             extended_connect_method_must_be_connect_test,
             extended_connect_trailers_rejected_test,
@@ -1686,6 +1688,67 @@ extended_connect_round_trip_test(Config) ->
     ok = h2:send_data(Conn, Sid, <<"bye">>, true),
     receive {h2, Conn, {data, Sid, <<"bye">>, true}} -> ok
     after 2000 -> ct:fail(no_final_echo) end,
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% Regression: registering the stream handler AFTER sending the 2xx response
+%% must still deliver subsequent DATA frames to the registered pid. Matches
+%% the tunnel wire-up pattern used by masque (CONNECT-UDP over HTTP/2) where
+%% the handler worker is spawned only after the 200 is on the wire.
+extended_connect_handler_registered_after_response_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    Self = self(),
+    Handler = fun(Conn, Sid, <<"CONNECT">>, _, _) ->
+        ok = h2:send_response(Conn, Sid, 200, []),
+        spawn(fun() ->
+            ok = case h2:set_stream_handler(Conn, Sid, self()) of
+                ok -> ok;
+                {ok, Buf} ->
+                    lists:foreach(fun({D, F}) ->
+                        self() ! {h2, Conn, {data, Sid, D, F}}
+                    end, Buf),
+                    ok
+            end,
+            Self ! {handler_ready, Sid},
+            receive
+                {h2, _, {data, Sid, Data, Fin}} ->
+                    Self ! {got_data, Sid, Data, Fin}
+            after 3000 ->
+                Self ! {timeout, Sid}
+            end
+        end),
+        ok
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => Handler,
+        enable_connect_protocol => true
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        transport => ssl, verify => verify_none, sync => true
+    }),
+    {ok, Sid} = h2:request(Conn, [
+        {<<":method">>,    <<"CONNECT">>},
+        {<<":scheme">>,    <<"https">>},
+        {<<":authority">>, <<"localhost">>},
+        {<<":path">>,      <<"/tunnel">>}
+    ], #{protocol => <<"connect-udp">>}),
+    receive {h2, Conn, {response, Sid, 200, _}} -> ok
+    after 5000 -> ct:fail(no_response) end,
+    receive {handler_ready, Sid} -> ok
+    after 2000 -> ct:fail(handler_not_ready) end,
+    ok = h2:send_data(Conn, Sid, <<"hello">>, false),
+    receive
+        {got_data, Sid, <<"hello">>, false} -> ok;
+        {timeout, Sid} -> ct:fail(data_not_delivered_to_handler)
+    after 5000 -> ct:fail(overall_timeout) end,
     h2:close(Conn),
     h2:stop_server(Ref),
     drain_exits(),
