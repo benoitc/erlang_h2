@@ -101,8 +101,9 @@
 }.
 
 -type server_opts() :: #{
-    cert := binary() | string(),
-    key := binary() | string(),
+    transport => ssl | tcp,
+    cert => binary() | string(),
+    key => binary() | string(),
     cacerts => [binary()],
     handler := fun((connection(), stream_id(), binary(), binary(), headers()) -> any()),
     settings => h2_settings:settings(),
