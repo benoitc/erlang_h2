@@ -123,6 +123,9 @@
     server_advertises_enable_push_zero_test/1,
     push_promise_gets_stream_reset_test/1,
     ping_flood_triggers_enhance_your_calm_test/1,
+    continuation_flood_triggers_enhance_your_calm_test/1,
+    controlling_process_monitors_new_owner_test/1,
+    send_returns_error_on_closed_socket_test/1,
     tls_transport_tag_detected_test/1
 ]).
 
@@ -257,6 +260,9 @@ groups() ->
             server_advertises_enable_push_zero_test,
             push_promise_gets_stream_reset_test,
             ping_flood_triggers_enhance_your_calm_test,
+            continuation_flood_triggers_enhance_your_calm_test,
+            controlling_process_monitors_new_owner_test,
+            send_returns_error_on_closed_socket_test,
             tls_transport_tag_detected_test
         ]}
     ].
@@ -2429,6 +2435,102 @@ ping_flood_triggers_enhance_your_calm_test(Config) ->
         timeout         -> ct:fail(no_goaway)
     end,
     ssl:close(Sock),
+    ok.
+
+%% RFC 9113 §6.5.2 / §10.5: a HEADERS+CONTINUATION block whose raw bytes
+%% exceed our pre-decode cap (?MAX_HEADER_BLOCK_BYTES = 256 KB) must trigger
+%% GOAWAY(ENHANCE_YOUR_CALM) before HPACK decode runs, so a peer cannot
+%% OOM the node by streaming CONTINUATIONs.
+continuation_flood_triggers_enhance_your_calm_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Sock} = raw_h2_client(Port),
+    %% Initial HEADERS with END_HEADERS=0, END_STREAM=0 — small valid payload.
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"localhost">>}
+    ],
+    {Block, _} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    HeadersLen = byte_size(Block),
+    HeadersFrame = <<HeadersLen:24, 16#1:8, 16#0:8, 0:1, 1:31, Block/binary>>,
+    ok = ssl:send(Sock, HeadersFrame),
+    %% Stream junk CONTINUATION frames totalling > 256 KB. Use 16 KB chunks of
+    %% raw bytes — they will fail HPACK decode if processed, but the cap must
+    %% kick in first.
+    Chunk = binary:copy(<<0>>, 16 * 1024),
+    ChunkLen = byte_size(Chunk),
+    ContFrame = <<ChunkLen:24, 16#9:8, 16#0:8, 0:1, 1:31, Chunk/binary>>,
+    %% 20 chunks = 320 KB, comfortably over the cap.
+    _ = [ssl:send(Sock, ContFrame) || _ <- lists:seq(1, 20)],
+    case wait_for_goaway(Sock, 5000) of
+        {ok, ErrorCode} -> ?assertEqual(11, ErrorCode);  %% ENHANCE_YOUR_CALM
+        timeout         -> ct:fail(no_goaway)
+    end,
+    ssl:close(Sock),
+    ok.
+
+%% controlling_process/2 must install a monitor on the new owner so that the
+%% connection is torn down when the new owner exits. Before the fix the
+%% connection became an orphan: the original start_link link still pointed
+%% at the spawning caller, and the new owner had no liveness signal.
+controlling_process_monitors_new_owner_test(Config) ->
+    Port = ?config(port, Config),
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+    Parent = self(),
+    NewOwner = spawn(fun() ->
+        Parent ! {ready, self()},
+        receive die -> exit(boom) end
+    end),
+    receive {ready, NewOwner} -> ok
+    after 1000 -> ct:fail(new_owner_not_ready) end,
+    ok = h2:controlling_process(Conn, NewOwner),
+    ConnRef = erlang:monitor(process, Conn),
+    NewOwner ! die,
+    receive
+        {'DOWN', ConnRef, process, Conn, _Reason} -> ok
+    after 3000 ->
+        ct:fail(connection_did_not_terminate_with_new_owner)
+    end,
+    drain_exits(),
+    ok.
+
+%% send_frame/2 errors must propagate to API callers instead of silently
+%% returning ok. Closing the underlying socket out from under the connection
+%% then issuing a send_data must yield {error, _}, not ok.
+send_returns_error_on_closed_socket_test(Config) ->
+    %% Use a never-completing handler so the server-side stream stays open
+    %% long enough for us to corrupt the socket.
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef    -> h2:stop_server(OldRef)
+    end,
+    Handler = fun(_Conn, _Sid, _, _, _) -> timer:sleep(60000) end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert    => ?config(cert_file, Config),
+        key     => ?config(key_file, Config),
+        handler => Handler
+    }),
+    ServerPort = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", ServerPort, #{
+        ssl_opts => [{verify, verify_none}]
+    }),
+    {ok, Sid} = h2:request(Conn, <<"POST">>, <<"/">>,
+                            [{<<"host">>, <<"localhost">>}]),
+    %% Reach into the gen_statem state to grab the socket and slam it shut.
+    %% This mimics a peer that disappears mid-flight.
+    {_StateName, State} = sys:get_state(Conn),
+    Socket    = element(3, State),
+    Transport = element(4, State),
+    Transport:close(Socket),
+    %% Now any send must surface {error, _}; pre-fix this returned ok.
+    Result = h2:send_data(Conn, Sid, <<"hello">>, false),
+    ?assertMatch({error, _}, Result),
+    catch h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
     ok.
 
 read_headers_block(S) ->
