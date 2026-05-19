@@ -296,28 +296,20 @@ send_error(Conn, StreamId, Status, Message, Verbose) ->
 %% ============================================================================
 
 safe_path(Path, Docroot) ->
-    %% Remove leading slash and decode URL
     PathStr = case Path of
         <<"/">> -> "index.html";
         <<"/", Rest/binary>> -> binary_to_list(Rest);
         _ -> binary_to_list(Path)
     end,
-
-    %% Decode URL-encoded characters
     DecodedPath = uri_string:unquote(PathStr),
-
-    %% Check for path traversal
-    case contains_traversal(DecodedPath) of
-        true ->
-            {error, unsafe};
-        false ->
-            filename:join(Docroot, DecodedPath)
+    %% filelib:safe_relative_path/2 normalizes the path (resolving `.' and
+    %% `..' components) and refuses anything that escapes Docroot. Beats
+    %% the previous string-based `..' check, which missed URL-encoded
+    %% (`%2e%2e') and overlong (`./foo/../../etc') variants.
+    case filelib:safe_relative_path(DecodedPath, Docroot) of
+        unsafe -> {error, unsafe};
+        SafeRel -> filename:join(Docroot, SafeRel)
     end.
-
-contains_traversal(Path) ->
-    %% Check for .. in path components
-    Components = string:tokens(Path, "/\\"),
-    lists:any(fun(C) -> C == ".." end, Components).
 
 guess_content_type(Path) ->
     case filename:extension(Path) of
@@ -375,7 +367,11 @@ safe_path_test_() ->
     [
         ?_assertEqual("./index.html", safe_path(<<"/">>, ".")),
         ?_assertEqual("./test.html", safe_path(<<"/test.html">>, ".")),
-        ?_assertEqual({error, unsafe}, safe_path(<<"/../etc/passwd">>, "."))
+        ?_assertEqual({error, unsafe}, safe_path(<<"/../etc/passwd">>, ".")),
+        %% URL-encoded `..' — previously slipped past the component check.
+        ?_assertEqual({error, unsafe}, safe_path(<<"/%2e%2e/etc/passwd">>, ".")),
+        %% Normalized escape through a fake subdir.
+        ?_assertEqual({error, unsafe}, safe_path(<<"/a/../../etc/passwd">>, "."))
     ].
 
 content_type_test_() ->

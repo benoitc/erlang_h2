@@ -73,6 +73,8 @@
 -export([send_trailers/3]).
 -export([cancel/2, cancel/3]).
 -export([cancel_stream/2, cancel_stream/3]).
+-deprecated([{cancel_stream, 2, "use h2:cancel/2 instead"},
+             {cancel_stream, 3, "use h2:cancel/3 instead"}]).
 -export([set_stream_handler/3, set_stream_handler/4, unset_stream_handler/2]).
 -export([goaway/1, goaway/2]).
 -export([close/1]).
@@ -649,12 +651,12 @@ cancel(Conn, StreamId) ->
 cancel(Conn, StreamId, ErrorCode) ->
     h2_connection:cancel_stream(Conn, StreamId, ErrorCode).
 
-%% @doc Alias for cancel/2.
+%% @deprecated Use {@link cancel/2} instead.
 -spec cancel_stream(connection(), stream_id()) -> ok | {error, term()}.
 cancel_stream(Conn, StreamId) ->
     cancel(Conn, StreamId).
 
-%% @doc Alias for cancel/3.
+%% @deprecated Use {@link cancel/3} instead.
 -spec cancel_stream(connection(), stream_id(), error_code()) -> ok | {error, term()}.
 cancel_stream(Conn, StreamId, ErrorCode) ->
     cancel(Conn, StreamId, ErrorCode).
@@ -665,6 +667,12 @@ cancel_stream(Conn, StreamId, ErrorCode) ->
 %% messages, and the call returns `ok'. Pass `#{drain_buffer => true}' to
 %% receive the buffered frames in the reply (`{ok, [{Data, Fin}, ...]}') and
 %% forward them yourself — useful for tests, rarely for production code.
+%%
+%% Backpressure: incoming DATA is rate-limited at the HTTP/2 flow-control
+%% layer only after we dispatch it to the handler. If the handler pid
+%% cannot keep up, its mailbox grows unbounded — bound your own consumer
+%% (e.g. with a selective receive + flow-control settings) when streaming
+%% large bodies from an untrusted peer.
 -spec set_stream_handler(connection(), stream_id(), pid()) ->
     ok | {ok, [{binary(), boolean()}]} | {error, term()}.
 set_stream_handler(Conn, StreamId, Pid) ->
