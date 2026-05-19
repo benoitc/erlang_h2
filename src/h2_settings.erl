@@ -9,6 +9,7 @@
 -export([default/0, encode/1, decode/1]).
 -export([get/2, set/3, merge/2]).
 -export([validate/1, validate/2]).
+-export([setting_id/1, encode_value/1]).
 
 -include("h2.hrl").
 
@@ -229,7 +230,7 @@ default_test() ->
     D = default(),
     ?assertEqual(4096, maps:get(header_table_size, D)),
     ?assertEqual(0, maps:get(enable_push, D)),
-    ?assertEqual(unlimited, maps:get(max_concurrent_streams, D)),
+    ?assertEqual(100, maps:get(max_concurrent_streams, D)),
     ?assertEqual(65535, maps:get(initial_window_size, D)),
     ?assertEqual(16384, maps:get(max_frame_size, D)),
     ?assertEqual(unlimited, maps:get(max_header_list_size, D)),

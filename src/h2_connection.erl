@@ -1175,8 +1175,11 @@ decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_conte
                 ok ->
                     decode_and_process_headers_validated(Mode, StreamId, Headers, EndStream, State1)
             end;
-        {error, Reason} ->
-            error_logger:error_msg("HPACK decode error: ~p~n", [Reason]),
+        {error, _Reason} ->
+            %% Reason can echo attacker-supplied header bytes; keep the log
+            %% line bounded and tagged. Use modern OTP logger; error_logger
+            %% is deprecated.
+            logger:error("h2: HPACK decode error", #{}),
             {error, compression_error, State}
     end.
 
@@ -2663,23 +2666,11 @@ send_settings_frame(#state{local_settings = Settings, pending_settings = Pending
 
 settings_to_list(Settings) ->
     maps:fold(fun(Key, Value, Acc) ->
-        case setting_id(Key) of
+        case h2_settings:setting_id(Key) of
             undefined -> Acc;
-            Id -> [{Id, encode_setting_value(Value)} | Acc]
+            Id -> [{Id, h2_settings:encode_value(Value)} | Acc]
         end
     end, [], Settings).
-
-setting_id(header_table_size) -> 16#1;
-setting_id(enable_push) -> 16#2;
-setting_id(max_concurrent_streams) -> 16#3;
-setting_id(initial_window_size) -> 16#4;
-setting_id(max_frame_size) -> 16#5;
-setting_id(max_header_list_size) -> 16#6;
-setting_id(enable_connect_protocol) -> 16#8;
-setting_id(_) -> undefined.
-
-encode_setting_value(unlimited) -> 16#ffffffff;
-encode_setting_value(V) -> V.
 
 %% Returns ok | {error, Reason}. Callers must handle errors so that
 %% an in-flight gen_statem:call cannot reply ok to the user after the
@@ -2750,6 +2741,9 @@ swap_owner_monitor(NewOwner, #state{owner_monitor = OldRef} = State) ->
     NewRef = erlang:monitor(process, NewOwner),
     State#state{owner = NewOwner, owner_monitor = NewRef}.
 
+%% Mirror of h2:is_ssl_socket/1. Two copies for now because both modules
+%% need it during their own init paths and neither exposes it publicly;
+%% keep them in sync if you change one.
 is_ssl_socket(Socket) when is_tuple(Socket) ->
     element(1, Socket) =:= sslsocket;
 is_ssl_socket(_) ->
