@@ -127,6 +127,7 @@
     controlling_process_monitors_new_owner_test/1,
     send_returns_error_on_closed_socket_test/1,
     send_buffer_full_when_peer_stalls_window_test/1,
+    set_stream_handler_default_replays_buffer_test/1,
     tls_transport_tag_detected_test/1
 ]).
 
@@ -265,6 +266,7 @@ groups() ->
             controlling_process_monitors_new_owner_test,
             send_returns_error_on_closed_socket_test,
             send_buffer_full_when_peer_stalls_window_test,
+            set_stream_handler_default_replays_buffer_test,
             tls_transport_tag_detected_test
         ]}
     ].
@@ -2496,6 +2498,68 @@ controlling_process_monitors_new_owner_test(Config) ->
     after 3000 ->
         ct:fail(connection_did_not_terminate_with_new_owner)
     end,
+    drain_exits(),
+    ok.
+
+%% h2:set_stream_handler/3 with no options must replay any DATA frames
+%% buffered before the handler was registered as messages to the handler pid
+%% — without the caller having to inspect the reply. Before this change the
+%% default was drain_buffer=>true, so a naive `ok -> ok` match silently lost
+%% buffered tunnel data.
+set_stream_handler_default_replays_buffer_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef    -> h2:stop_server(OldRef)
+    end,
+    Self = self(),
+    %% Server-side: send 200 then push two DATA frames immediately. The
+    %% client's response/data callback fires inline before the test gets
+    %% a chance to register a handler, so the frames land in recv_buffer.
+    Handler = fun(Conn, Sid, <<"CONNECT">>, _, _) ->
+        ok = h2:send_response(Conn, Sid, 200, []),
+        ok = h2:send_data(Conn, Sid, <<"early-1">>, false),
+        ok = h2:send_data(Conn, Sid, <<"early-2">>, true)
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert     => ?config(cert_file, Config),
+        key      => ?config(key_file, Config),
+        handler  => Handler,
+        enable_connect_protocol => true
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{
+        transport => ssl, verify => verify_none, sync => true
+    }),
+    {ok, Sid} = h2:request(Conn, [
+        {<<":method">>,    <<"CONNECT">>},
+        {<<":scheme">>,    <<"https">>},
+        {<<":authority">>, <<"localhost">>},
+        {<<":path">>,      <<"/tunnel">>}
+    ], #{protocol => <<"connect-udp">>}),
+    receive {h2, Conn, {response, Sid, 200, _}} -> ok
+    after 5000 -> ct:fail(no_response) end,
+    %% Give the server's DATA frames time to land in our recv_buffer.
+    timer:sleep(200),
+    %% New default: pattern-match `ok' only, no `{ok, Buf}' handling. Before
+    %% the default flip this would silently drop the early frames.
+    ok = h2:set_stream_handler(Conn, Sid, Self),
+    Drain = fun Loop(Acc, GotFin) ->
+        receive
+            {h2, Conn, {data, Sid, D, Fin}} ->
+                NewAcc = [D | Acc],
+                case Fin of
+                    true  -> {lists:reverse(NewAcc), true};
+                    false -> Loop(NewAcc, GotFin)
+                end
+        after 3000 ->
+            {lists:reverse(Acc), GotFin}
+        end
+    end,
+    {Data, FinSeen} = Drain([], false),
+    ?assertEqual([<<"early-1">>, <<"early-2">>], Data),
+    ?assert(FinSeen),
+    h2:close(Conn),
+    h2:stop_server(Ref),
     drain_exits(),
     ok.
 

@@ -243,7 +243,11 @@ send_request_headers(Conn, Headers, EndStream) ->
     gen_statem:call(Conn, {send_request_headers, Headers, EndStream}).
 
 %% @doc Register a pid to receive body data for StreamId.
-%% Matches quic_h3:set_stream_handler/3,4.
+%% By default any DATA frames that arrived before the handler was registered
+%% are replayed to the handler pid as `{h2, Conn, {data, StreamId, Data, Fin}}'
+%% messages, and the call returns `ok'. Pass `#{drain_buffer => true}' to
+%% receive the raw buffer in the reply (`{ok, [{Data, Fin}, ...]}') and
+%% forward it manually. Matches quic_h3:set_stream_handler/3,4.
 -spec set_stream_handler(pid(), non_neg_integer(), pid()) ->
     ok | {ok, [{binary(), boolean()}]} | {error, term()}.
 set_stream_handler(Conn, StreamId, Pid) ->
@@ -2369,14 +2373,17 @@ handle_cancel_stream(From, StreamId, ErrorCode, #state{streams = Streams} = Stat
 handle_set_stream_handler(From, StreamId, Pid, Opts, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, #stream{recv_buffer = Buf} = Stream} ->
-            Drain = maps:get(drain_buffer, Opts, true),
+            %% Default: the connection itself replays previously-buffered
+            %% DATA frames to the handler pid. Opt in to `drain_buffer => true'
+            %% if the caller wants the raw buffer back to forward by hand —
+            %% useful for tests, almost never for production code.
+            HandToCaller = maps:get(drain_buffer, Opts, false),
             Stream1 = Stream#stream{handler = Pid, recv_buffer = []},
             State1 = put_stream(StreamId, Stream1, State),
-            Reply = case {Drain, Buf} of
-                {true, []}      -> ok;
-                {true, _}       -> {ok, lists:reverse(Buf)};
+            Reply = case {HandToCaller, Buf} of
+                {true, []} -> ok;
+                {true, _}  -> {ok, lists:reverse(Buf)};
                 {false, _} ->
-                    %% Re-send buffered data as messages to the handler.
                     lists:foreach(fun({D, Fin}) ->
                         Pid ! {h2, self(), {data, StreamId, D, Fin}},
                         ok

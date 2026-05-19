@@ -659,6 +659,11 @@ cancel_stream(Conn, StreamId, ErrorCode) ->
     cancel(Conn, StreamId, ErrorCode).
 
 %% @doc Register a pid to receive body data for a stream.
+%% By default the connection replays any DATA frames buffered before the
+%% handler was registered as `{h2, Conn, {data, StreamId, Data, Fin}}'
+%% messages, and the call returns `ok'. Pass `#{drain_buffer => true}' to
+%% receive the buffered frames in the reply (`{ok, [{Data, Fin}, ...]}') and
+%% forward them yourself — useful for tests, rarely for production code.
 -spec set_stream_handler(connection(), stream_id(), pid()) ->
     ok | {ok, [{binary(), boolean()}]} | {error, term()}.
 set_stream_handler(Conn, StreamId, Pid) ->
