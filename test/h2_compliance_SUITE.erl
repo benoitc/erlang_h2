@@ -128,6 +128,7 @@
     send_returns_error_on_closed_socket_test/1,
     send_buffer_full_when_peer_stalls_window_test/1,
     set_stream_handler_default_replays_buffer_test/1,
+    large_body_yields_to_inbound_frames_test/1,
     tls_transport_tag_detected_test/1
 ]).
 
@@ -267,6 +268,7 @@ groups() ->
             send_returns_error_on_closed_socket_test,
             send_buffer_full_when_peer_stalls_window_test,
             set_stream_handler_default_replays_buffer_test,
+            large_body_yields_to_inbound_frames_test,
             tls_transport_tag_detected_test
         ]}
     ].
@@ -2500,6 +2502,70 @@ controlling_process_monitors_new_owner_test(Config) ->
     end,
     drain_exits(),
     ok.
+
+%% handle_send_data used to recurse synchronously over an arbitrary body,
+%% blocking the gen_statem from processing inbound frames for the duration.
+%% With cast-based yielding the connection must still service a PING in the
+%% middle of a multi-frame body transfer. We assert a full round-trip PING
+%% ACK completes while a 512 KB upload is in flight.
+large_body_yields_to_inbound_frames_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef    -> h2:stop_server(OldRef)
+    end,
+    Parent = self(),
+    Handler = fun(Conn, Sid, _, _, _) ->
+        ok = h2:send_response(Conn, Sid, 200, []),
+        %% 512 KB body, well over the default 64 KB initial window so the
+        %% send path goes through buffer + cast loop.
+        Body = binary:copy(<<"x">>, 512 * 1024),
+        Result = h2:send_data(Conn, Sid, Body, true),
+        Parent ! {server_send_result, Result}
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert    => ?config(cert_file, Config),
+        key     => ?config(key_file, Config),
+        handler => Handler
+    }),
+    Port = h2:server_port(Ref),
+    %% Raw client so we can issue a PING while still pulling DATA frames.
+    {ok, Sock} = raw_h2_client(Port),
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"localhost">>}
+    ],
+    {Block, _} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    %% Drain a few DATA frames + WINDOW_UPDATE ack credit, then send a PING.
+    PingData = <<9,8,7,6,5,4,3,2>>,
+    ok = drain_and_credit(Sock, 1, 2000),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:ping(PingData))),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:window_update(0, 1024 * 1024))),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:window_update(1, 1024 * 1024))),
+    ?assertEqual({ok, PingData}, wait_for_ping_ack(Sock, 5000)),
+    %% Server's send_data must have completed with ok.
+    receive {server_send_result, ok} -> ok
+    after 5000 -> ct:fail(server_send_did_not_complete)
+    end,
+    ssl:close(Sock),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% Read a couple of frames so the server starts streaming; ignore anything
+%% that isn't a DATA frame.
+drain_and_credit(Sock, _StreamId, Timeout) ->
+    {ok, <<Len:24, Type:8, _Flags:8, _:32>>} = ssl:recv(Sock, 9, Timeout),
+    case Len of
+        0 -> ok;
+        _ -> {ok, _} = ssl:recv(Sock, Len, Timeout)
+    end,
+    case Type of
+        16#0 -> ok;  %% DATA seen at least once — server is sending
+        _    -> drain_and_credit(Sock, _StreamId, Timeout)
+    end.
 
 %% h2:set_stream_handler/3 with no options must replay any DATA frames
 %% buffered before the handler was registered as messages to the handler pid

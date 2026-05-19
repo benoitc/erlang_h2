@@ -560,6 +560,8 @@ connected({call, From}, Request, State) ->
     handle_call_common(From, Request, connected, State);
 
 connected(EventType, Event, State) ->
+    %% Routes cast {flush_stream, _} (send_data continuation) through
+    %% handle_common so it's handled uniformly across all live states.
     handle_common(EventType, Event, connected, State).
 
 %% ============================================================================
@@ -2216,86 +2218,33 @@ has_banned_tunnel_header(Headers) ->
         Name =:= <<"content-length">> orelse Name =:= <<"transfer-encoding">>
     end, Headers).
 
-handle_send_data(From, StreamId, Data, EndStream, #state{streams = Streams, conn_window_size = ConnWindow,
-                                                          peer_max_frame_size = MaxFrameSize} = State) ->
+%% Buffer the payload onto the stream's send_buffer (with cap check), then
+%% drain at most one DATA frame synchronously. If more remains and the
+%% windows still allow it, flush_stream_one_chunk/2 self-casts so the
+%% gen_statem yields between frames — that way inbound frames (PING,
+%% WINDOW_UPDATE, RST_STREAM) get processed instead of queuing up for the
+%% duration of a multi-megabyte body.
+handle_send_data(From, StreamId, Data, EndStream, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
-        {ok, #stream{state = StreamState, window_size = StreamWindow, send_buffer = Buffer} = Stream}
+        {ok, #stream{state = StreamState, send_buffer = Buffer} = Stream}
           when StreamState == open; StreamState == half_closed_remote ->
-
-            %% Calculate how much we can send
-            Available = min(ConnWindow, StreamWindow),
-            ToSend = min(Available, byte_size(Data)),
-            ToSend1 = min(ToSend, MaxFrameSize),
-
-            case ToSend1 of
-                0 when byte_size(Data) > 0 ->
-                    %% Need to buffer — but only up to ?MAX_SEND_BUFFER_BYTES.
-                    %% Past that a stalled peer would otherwise grow the
-                    %% connection process indefinitely.
-                    case byte_size(Buffer) + byte_size(Data) > ?MAX_SEND_BUFFER_BYTES of
-                        true ->
-                            {keep_state, State,
-                             [{reply, From, {error, send_buffer_full}}]};
-                        false ->
-                            NewBuffer = <<Buffer/binary, Data/binary>>,
-                            Stream1 = Stream#stream{send_buffer = NewBuffer,
-                                                    pending_end_stream = EndStream},
-                            State1 = State#state{streams = maps:put(StreamId, Stream1, Streams)},
-                            {keep_state, State1, [{reply, From, ok}]}
-                    end;
-
-                _ ->
-                    %% Send what we can
-                    <<SendData:ToSend1/binary, Remaining/binary>> = Data,
-                    IsEnd = EndStream andalso Remaining == <<>> andalso Buffer == <<>>,
-                    Frame = h2_frame:data(StreamId, SendData, IsEnd),
-                    case send_frame(Frame, State) of
-                        {error, SendReason} ->
+            case byte_size(Buffer) + byte_size(Data) > ?MAX_SEND_BUFFER_BYTES of
+                true ->
+                    {keep_state, State,
+                     [{reply, From, {error, send_buffer_full}}]};
+                false ->
+                    NewBuffer = <<Buffer/binary, Data/binary>>,
+                    Stream1 = Stream#stream{send_buffer = NewBuffer,
+                                            pending_end_stream = EndStream},
+                    State1 = put_stream(StreamId, Stream1, State),
+                    case flush_stream_one_chunk(StreamId, State1) of
+                        {ok, State2} ->
+                            {keep_state, State2, [{reply, From, ok}]};
+                        {error, Reason, State2} ->
                             {stop_and_reply,
-                             {shutdown, {send_failed, SendReason}},
-                             [{reply, From, {error, SendReason}}],
-                             State};
-                        ok ->
-                            %% Update windows
-                            NewConnWindow = ConnWindow - ToSend1,
-                            NewStreamWindow = StreamWindow - ToSend1,
-
-                            %% Update stream state; Remaining is handled via recursion below,
-                            %% so it must not be appended to send_buffer (would cause duplication).
-                            Stream1 = Stream#stream{
-                                window_size = NewStreamWindow,
-                                send_buffer = Buffer,
-                                pending_end_stream = EndStream andalso Remaining =/= <<>>,
-                                state = case IsEnd of
-                                    true ->
-                                        case StreamState of
-                                            open -> half_closed_local;
-                                            half_closed_remote -> closed
-                                        end;
-                                    false ->
-                                        StreamState
-                                end
-                            },
-
-                            State1 = State#state{
-                                conn_window_size = NewConnWindow,
-                                streams = maps:put(StreamId, Stream1, Streams)
-                            },
-                            %% If we just fully closed the stream, record its close
-                            %% reason so later frames on this id get classified
-                            %% correctly per RFC 9113 §5.1.
-                            State2 = case Stream1#stream.state =:= closed
-                                         andalso StreamState =:= half_closed_remote of
-                                true  -> close_stream(StreamId, end_stream, State1);
-                                false -> State1
-                            end,
-                            %% If there's more data, try to send it
-                            case Remaining of
-                                <<>> ->
-                                    {keep_state, State2, [{reply, From, ok}]};
-                                _ ->
-                                    handle_send_data(From, StreamId, Remaining, EndStream, State2)
-                            end
+                             {shutdown, {send_failed, Reason}},
+                             [{reply, From, {error, Reason}}],
+                             State2}
                     end
             end;
         {ok, _} ->
@@ -2473,6 +2422,16 @@ handle_common(info, {tcp_error, Socket, Reason}, _StateName, #state{socket = Soc
     {stop, {shutdown, {tcp_error, Reason}}, State};
 handle_common(info, {ssl_error, Socket, Reason}, _StateName, #state{socket = Socket} = State) ->
     {stop, {shutdown, {ssl_error, Reason}}, State};
+%% Yielded send_data continuation. We accept this in any state — the
+%% connection may have transitioned to goaway_sent/_received between the
+%% cast being scheduled and processed; draining the buffered data is still
+%% safe and lets in-flight streams complete.
+handle_common(cast, {flush_stream, StreamId}, _StateName, State) ->
+    case flush_stream_one_chunk(StreamId, State) of
+        {ok, State1} -> {keep_state, State1};
+        {error, Reason, State1} ->
+            {stop, {shutdown, {send_failed, Reason}}, State1}
+    end;
 handle_common(_EventType, _Event, _StateName, State) ->
     {keep_state, State}.
 
@@ -2570,56 +2529,119 @@ flush_send_buffers(#state{streams = Streams} = State) ->
         flush_stream_buffer(StreamId, AccState)
     end, State, Streams).
 
-flush_stream_buffer(StreamId, #state{streams = Streams, conn_window_size = ConnWindow,
-                                      peer_max_frame_size = MaxFrameSize} = State) ->
+%% Backwards-compatible wrapper used by callers that don't care about
+%% transport errors at the call site (peer-driven WINDOW_UPDATE handler,
+%% flush_send_buffers fold). The actual draining is one chunk at a time;
+%% remaining bytes drain via self-casts handled in connected/3.
+flush_stream_buffer(StreamId, State) ->
+    case flush_stream_one_chunk(StreamId, State) of
+        {ok, State1} -> State1;
+        %% Best-effort: a dead socket surfaces via {tcp_closed,_} /
+        %% {ssl_closed,_} and terminates the connection shortly after.
+        {error, _Reason, State1} -> State1
+    end.
+
+%% Send AT MOST one DATA frame from the stream's send_buffer. If more
+%% remains and the windows have room, self-cast `{flush_stream, StreamId}'
+%% so the gen_statem yields between chunks instead of monopolising the
+%% scheduler on multi-megabyte bodies. Returns:
+%%   {ok, NewState}             - sent (or nothing to send right now)
+%%   {error, Reason, NewState}  - transport error, caller decides shutdown
+flush_stream_one_chunk(StreamId, #state{streams = Streams,
+                                         conn_window_size = ConnWindow,
+                                         peer_max_frame_size = MaxFrameSize} = State) ->
     case maps:find(StreamId, Streams) of
+        {ok, #stream{send_buffer = <<>>, pending_end_stream = true,
+                     state = SState} = Stream}
+          when SState =:= open; SState =:= half_closed_remote ->
+            %% Empty body with END_STREAM still needs an empty DATA frame
+            %% on the wire to half-close the stream peer-side.
+            emit_end_stream_data(StreamId, Stream, State);
         {ok, #stream{send_buffer = <<>>}} ->
-            State;
+            {ok, State};
         {ok, #stream{send_buffer = Buffer, window_size = StreamWindow,
                      pending_end_stream = PendingEnd, state = StreamState} = Stream} ->
             Available = min(ConnWindow, StreamWindow),
             ToSend = min(Available, byte_size(Buffer)),
             ToSend1 = min(ToSend, MaxFrameSize),
-
             case ToSend1 of
                 0 ->
-                    State;
+                    {ok, State};
                 _ ->
                     <<SendData:ToSend1/binary, Remaining/binary>> = Buffer,
                     IsEnd = PendingEnd andalso Remaining == <<>>,
                     Frame = h2_frame:data(StreamId, SendData, IsEnd),
-                    %% Best-effort: this flush is triggered by a peer WINDOW_UPDATE,
-                    %% there is no in-flight call to reply to. A dead socket surfaces
-                    %% via {tcp_closed,_} / {ssl_closed,_} and terminates the connection.
-                    _ = send_frame(Frame, State),
-
-                    NewStreamState = case IsEnd of
-                        true ->
-                            case StreamState of
-                                open -> half_closed_local;
-                                half_closed_remote -> closed;
-                                _ -> StreamState
-                            end;
-                        false ->
-                            StreamState
-                    end,
-
-                    Stream1 = Stream#stream{
-                        send_buffer = Remaining,
-                        window_size = StreamWindow - ToSend1,
-                        pending_end_stream = PendingEnd andalso Remaining =/= <<>>,
-                        state = NewStreamState
-                    },
-                    State1 = State#state{
-                        conn_window_size = ConnWindow - ToSend1,
-                        streams = maps:put(StreamId, Stream1, Streams)
-                    },
-
-                    %% Try to send more
-                    flush_stream_buffer(StreamId, State1)
+                    case send_frame(Frame, State) of
+                        {error, Reason} ->
+                            {error, Reason, State};
+                        ok ->
+                            NewStreamState = case IsEnd of
+                                true ->
+                                    case StreamState of
+                                        open -> half_closed_local;
+                                        half_closed_remote -> closed;
+                                        _ -> StreamState
+                                    end;
+                                false ->
+                                    StreamState
+                            end,
+                            NewConnWindow = ConnWindow - ToSend1,
+                            NewStreamWindow = StreamWindow - ToSend1,
+                            Stream1 = Stream#stream{
+                                send_buffer = Remaining,
+                                window_size = NewStreamWindow,
+                                pending_end_stream = PendingEnd andalso Remaining =/= <<>>,
+                                state = NewStreamState
+                            },
+                            State1 = State#state{
+                                conn_window_size = NewConnWindow,
+                                streams = maps:put(StreamId, Stream1, Streams)
+                            },
+                            State2 = case NewStreamState =:= closed
+                                         andalso StreamState =:= half_closed_remote of
+                                true  -> close_stream(StreamId, end_stream, State1);
+                                false -> State1
+                            end,
+                            case Remaining =/= <<>>
+                                 andalso NewConnWindow > 0
+                                 andalso NewStreamWindow > 0
+                                 andalso NewStreamState =/= closed of
+                                true ->
+                                    gen_statem:cast(self(),
+                                                    {flush_stream, StreamId}),
+                                    {ok, State2};
+                                false ->
+                                    {ok, State2}
+                            end
+                    end
             end;
         error ->
-            State
+            {ok, State}
+    end.
+
+%% Emit an empty DATA frame with END_STREAM=1 to half-close the stream on
+%% the wire. Used when send_data was called with empty payload + EndStream.
+emit_end_stream_data(StreamId, #stream{state = StreamState} = Stream,
+                     #state{streams = Streams} = State) ->
+    Frame = h2_frame:data(StreamId, <<>>, true),
+    case send_frame(Frame, State) of
+        {error, Reason} ->
+            {error, Reason, State};
+        ok ->
+            NewStreamState = case StreamState of
+                open -> half_closed_local;
+                half_closed_remote -> closed;
+                _ -> StreamState
+            end,
+            Stream1 = Stream#stream{pending_end_stream = false,
+                                    state = NewStreamState},
+            State1 = State#state{streams = maps:put(StreamId, Stream1, Streams)},
+            State2 = case NewStreamState =:= closed
+                         andalso StreamState =:= half_closed_remote of
+                true  -> close_stream(StreamId, end_stream, State1);
+                false -> State1
+            end,
+            {ok, State2}
     end.
 
 %% ============================================================================
