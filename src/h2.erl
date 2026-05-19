@@ -222,12 +222,12 @@ start_connection(Mode, Socket, Opts) ->
                         ok ->
                             {ok, Pid};
                         {error, Reason} ->
-                            catch h2_connection:close(Pid),
+                            _ = (catch h2_connection:close(Pid)),
                             {error, Reason}
                     end;
                 {error, TransferReason} ->
-                    catch h2_connection:close(Pid),
-                    catch close_socket(Transport, Socket),
+                    _ = (catch h2_connection:close(Pid)),
+                    _ = (catch close_socket(Transport, Socket)),
                     {error, {controlling_process_failed, TransferReason}}
             end;
         {error, Reason} ->
@@ -543,11 +543,11 @@ handle_server_connection(Socket, Handler, Settings, Transport, EnableConnectProt
                     _ = h2_connection:activate(Conn),
                     server_connection_loop(Conn, Handler);
                 {error, _} ->
-                    catch h2_connection:close(Conn),
-                    catch CloseFn(Socket)
+                    _ = (catch h2_connection:close(Conn)),
+                    _ = (catch CloseFn(Socket))
             end;
         {error, _Reason} ->
-            catch CloseFn(Socket)
+            _ = (catch CloseFn(Socket))
     end.
 
 tcp_acceptor_loop(State) ->
@@ -595,8 +595,9 @@ server_connection_loop(Conn, Handler) ->
                     Class:Reason:Stack ->
                         logger:error("h2 handler crash: ~ts:~tp~n~tp",
                                      [Class, Reason, Stack]),
-                        catch h2:send_response(Conn, StreamId, 500, []),
-                        catch h2:send_data(Conn, StreamId, <<"Internal Server Error">>, true)
+                        _ = (catch h2:send_response(Conn, StreamId, 500, [])),
+                        _ = (catch h2:send_data(Conn, StreamId,
+                                                <<"Internal Server Error">>, true))
                 end
             end),
             server_connection_loop(Conn, Handler);

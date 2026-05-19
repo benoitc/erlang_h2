@@ -499,11 +499,8 @@ settings(EventType, Event, State) ->
 
 connected(enter, _OldState, #state{settings_timer = Timer, waiters = Waiters,
                                     connected_notified = Notified} = State) ->
-    %% Cancel settings timer if still running
-    case Timer of
-        undefined -> ok;
-        _ -> _ = erlang:cancel_timer(Timer), ok
-    end,
+    %% Cancel settings timer (and flush its message if it already fired).
+    ok = cancel_timer(Timer),
     case Notified of
         true ->
             %% notify_connected/1 already fired inline from handle_frame
@@ -695,8 +692,12 @@ handle_data(StateName, Data, #state{buffer = Buffer, mode = Mode, preface_receiv
                     State2 = State1#state{buffer = Rest, preface_received = true},
                     process_frames(StateName, State2);
                 need_more ->
-                    ok = set_active(State1#state.transport, State1#state.socket),
-                    {keep_state, State1};
+                    case set_active(State1#state.transport, State1#state.socket) of
+                        ok ->
+                            {keep_state, State1};
+                        {error, Reason} ->
+                            {stop, {shutdown, {socket_error, Reason}}, State1}
+                    end;
                 {error, Reason} ->
                     State2 = send_goaway_frame(0, protocol_error, State1),
                     {stop, {shutdown, {preface_error, Reason}}, State2}
@@ -729,9 +730,13 @@ process_frames(StateName, #state{buffer = Buffer, local_settings = Local} = Stat
                     {next_state, closing, NewState1}
             end;
         {more, _Needed} ->
-            ok = set_active(State#state.transport, State#state.socket),
-            %% Determine the correct state based on connection conditions
-            determine_state_transition(State);
+            case set_active(State#state.transport, State#state.socket) of
+                ok ->
+                    %% Determine the correct state based on connection conditions
+                    determine_state_transition(State);
+                {error, Reason} ->
+                    {stop, {shutdown, {socket_error, Reason}}, State}
+            end;
         {error, {stream_error, StreamId, ErrorCode}, Rest} ->
             %% Frame-level decode error scoped to a single stream
             %% (e.g. WINDOW_UPDATE 0 on a non-zero stream id).
@@ -784,7 +789,7 @@ handle_frame(_StateName, {settings_ack}, #state{pending_settings = [Pending|Rest
     %% Apply our pending settings
     State1 = apply_local_settings(Pending, State),
     State2 = State1#state{pending_settings = Rest, settings_acked = true},
-    NewStateName = case State2#state.preface_received orelse State2#state.mode == client of
+    NewStateName = case State2#state.preface_received orelse State2#state.mode =:= client of
         true -> connected;
         false -> settings
     end,
@@ -2448,14 +2453,14 @@ handle_common(_EventType, _Event, _StateName, State) ->
 validate_stream_id(StreamId, client, #state{last_peer_stream_id = LastPeer}) ->
     %% Server-initiated streams must be even
     if
-        StreamId rem 2 == 1 -> {error, protocol_error};  % Must be even
+        StreamId rem 2 =:= 1 -> {error, protocol_error};  % Must be even
         StreamId =< LastPeer -> {error, protocol_error};  % Must be new
         true -> ok
     end;
 validate_stream_id(StreamId, server, #state{last_peer_stream_id = LastPeer}) ->
     %% Client-initiated streams must be odd
     if
-        StreamId rem 2 == 0 -> {error, protocol_error};  % Must be odd
+        StreamId rem 2 =:= 0 -> {error, protocol_error};  % Must be odd
         StreamId =< LastPeer -> {error, protocol_error};  % Must be new
         true -> ok
     end.
@@ -2721,16 +2726,28 @@ stop_and_notify_waiters(Reason, #state{waiters = Waiters} = State) ->
 notify_connected(#state{connected_notified = true} = State) ->
     State;
 notify_connected(#state{waiters = Waiters, settings_timer = Timer} = State) ->
-    case Timer of
-        undefined -> ok;
-        _ -> _ = erlang:cancel_timer(Timer), ok
-    end,
+    ok = cancel_timer(Timer),
     notify_owner({h2, self(), connected}, State),
     [gen_statem:reply(From, ok) || From <- Waiters],
     State#state{waiters = [], settings_timer = undefined, connected_notified = true}.
 
-peel_reason({shutdown, R}) -> R;
+%% Strip nested `{shutdown, _}' wrappers so callers see the underlying
+%% cause; `{shutdown, {shutdown, X}}' shouldn't escape to the API layer.
+peel_reason({shutdown, R}) -> peel_reason(R);
 peel_reason(R) -> R.
+
+%% Cancel a timer and ensure any already-delivered {timeout, Ref, _}
+%% message is flushed from the mailbox so it cannot match a future
+%% timer that happens to reuse the same field name.
+cancel_timer(undefined) -> ok;
+cancel_timer(Ref) ->
+    case erlang:cancel_timer(Ref, [{async, false}, {info, false}]) of
+        _ -> ok
+    end,
+    receive
+        {timeout, Ref, _} -> ok
+    after 0 -> ok
+    end.
 
 %% Switch owner liveness tracking to NewOwner: demonitor the previous
 %% monitor (if any), install a fresh one. The initial owner is reached via
