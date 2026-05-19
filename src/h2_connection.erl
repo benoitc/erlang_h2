@@ -204,7 +204,7 @@ start_link(Mode, Socket, Owner, Opts) ->
 %% @doc Wait for the connection to reach connected state.
 -spec wait_connected(pid()) -> ok | {error, term()}.
 wait_connected(Conn) ->
-    wait_connected(Conn, 30000).
+    wait_connected(Conn, ?DEFAULT_TIMEOUT_MS).
 
 %% @doc Wait for the connection to reach connected state with timeout.
 -spec wait_connected(pid(), timeout()) -> ok | {error, term()}.
@@ -774,9 +774,8 @@ determine_state_transition(#state{mode = Mode, preface_received = PrefaceReceive
 
 %% RFC 7540 §6.10: while awaiting CONTINUATION, only a CONTINUATION on the
 %% same stream is allowed. Anything else is a connection PROTOCOL_ERROR.
-handle_frame(_StateName, Frame, #state{expecting_continuation = {StreamId, _}} = State)
+handle_frame(_StateName, Frame, #state{expecting_continuation = {_StreamId, _}} = State)
   when element(1, Frame) =/= continuation ->
-    _ = StreamId,
     {error, protocol_error, State};
 handle_frame(_StateName, {continuation, StreamId, _, _}, #state{expecting_continuation = {Expected, _}} = State)
   when StreamId =/= Expected ->

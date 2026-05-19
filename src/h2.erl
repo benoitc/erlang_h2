@@ -59,6 +59,8 @@
 %%
 -module(h2).
 
+-include("h2.hrl").
+
 %% Client API
 -export([connect/2, connect/3]).
 -export([wait_connected/1, wait_connected/2]).
@@ -143,7 +145,7 @@ connect(Host, Port, Opts) when is_binary(Host) ->
     connect(binary_to_list(Host), Port, Opts);
 connect(Host, Port, Opts) ->
     Transport = maps:get(transport, Opts, ssl),
-    Timeout = maps:get(timeout, Opts, 30000),
+    Timeout = maps:get(timeout, Opts, ?DEFAULT_TIMEOUT_MS),
 
     case Transport of
         ssl ->
@@ -203,7 +205,7 @@ connect_tcp(Host, Port, Opts, Timeout) ->
 
 start_connection(Mode, Socket, Opts) ->
     ConnOpts = maps:with([settings], Opts),
-    Timeout = maps:get(timeout, Opts, 30000),
+    Timeout = maps:get(timeout, Opts, ?DEFAULT_TIMEOUT_MS),
     case h2_connection:start_link(Mode, Socket, ConnOpts) of
         {ok, Pid} ->
             %% Transfer socket ownership to connection process
@@ -483,7 +485,7 @@ acceptor_loop_inner(#{listen_socket := ListenSocket, handler := Handler, setting
     drain_child_exits(),
     case ssl:transport_accept(ListenSocket, infinity) of
         {ok, Socket} ->
-            case ssl:handshake(Socket, 30000) of
+            case ssl:handshake(Socket, ?DEFAULT_TIMEOUT_MS) of
                 {ok, SSLSocket} ->
                     %% Check ALPN
                     case ssl:negotiated_protocol(SSLSocket) of
@@ -608,7 +610,9 @@ server_connection_loop(Conn, Handler) ->
             ok;
         {h2, Conn, {goaway, _LastStreamId, _ErrorCode}} ->
             ok;
-        _ ->
+        Other ->
+            logger:debug("h2 server_connection_loop: unexpected message ~tp",
+                         [Other]),
             server_connection_loop(Conn, Handler)
     end.
 

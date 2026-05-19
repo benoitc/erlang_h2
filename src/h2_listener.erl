@@ -44,7 +44,8 @@ loop(Transport, ListenSocket, AcceptorPids, Ref) ->
             ok;
         {'EXIT', Pid, _Reason} ->
             loop(Transport, ListenSocket, lists:delete(Pid, AcceptorPids), Ref);
-        _ ->
+        Other ->
+            logger:debug("h2_listener: unexpected message ~tp", [Other]),
             loop(Transport, ListenSocket, AcceptorPids, Ref)
     end.
 

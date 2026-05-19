@@ -47,6 +47,9 @@
 -define(SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI,            16#2b65).
 -define(SETTINGS_WT_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, 16#2b66).
 
+%% Default timeout for connect / wait_connected / TLS handshake (ms).
+-define(DEFAULT_TIMEOUT_MS,             30000).
+
 %% Default Settings Values
 -define(DEFAULT_HEADER_TABLE_SIZE,      4096).
 %% RFC 9113 §6.5.2: endpoints that do not produce server push SHOULD
