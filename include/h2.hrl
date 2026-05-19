@@ -52,7 +52,10 @@
 %% RFC 9113 §6.5.2: endpoints that do not produce server push SHOULD
 %% advertise 0. We reject inbound PUSH_PROMISE; advertise 0.
 -define(DEFAULT_ENABLE_PUSH,            0).
--define(DEFAULT_MAX_CONCURRENT_STREAMS, unlimited).
+%% RFC 9113 §5.1.2 RECOMMENDS at least 100. Defaulting to `unlimited`
+%% lets a peer keep opening idle streams forever; cap at 100 so the
+%% `streams` map (and HPACK dynamic-table state for each) stays bounded.
+-define(DEFAULT_MAX_CONCURRENT_STREAMS, 100).
 -define(DEFAULT_INITIAL_WINDOW_SIZE,    65535).
 -define(DEFAULT_MAX_FRAME_SIZE,         16384).
 -define(DEFAULT_MAX_HEADER_LIST_SIZE,   unlimited).

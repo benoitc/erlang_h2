@@ -591,7 +591,8 @@ server_connection_loop(Conn, Handler) ->
                     invoke_handler(Handler, Conn, StreamId, Method, Path, Headers)
                 catch
                     Class:Reason:Stack ->
-                        error_logger:error_msg("Handler error: ~p:~p~n~p~n", [Class, Reason, Stack]),
+                        logger:error("h2 handler crash: ~ts:~tp~n~tp",
+                                     [Class, Reason, Stack]),
                         catch h2:send_response(Conn, StreamId, 500, []),
                         catch h2:send_data(Conn, StreamId, <<"Internal Server Error">>, true)
                 end
