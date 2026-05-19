@@ -59,6 +59,11 @@
 %% dynamic table into a memory- and CPU-exhaustion vector (lookup is O(n)).
 %% Cap the value we actually apply.
 -define(MAX_PEER_HEADER_TABLE_SIZE, 65536).
+%% Per-stream outbound send buffer cap. If the peer stops opening its
+%% receive window, the only thing limiting our memory is this. Callers
+%% that exceed the cap get {error, send_buffer_full} so they back off
+%% instead of growing the connection process indefinitely.
+-define(MAX_SEND_BUFFER_BYTES, 1024 * 1024).
 
 %% Stream states per RFC 7540 Section 5.1
 -record(stream, {
@@ -2220,11 +2225,20 @@ handle_send_data(From, StreamId, Data, EndStream, #state{streams = Streams, conn
 
             case ToSend1 of
                 0 when byte_size(Data) > 0 ->
-                    %% Need to buffer - also track if EndStream should be set when flushing
-                    NewBuffer = <<Buffer/binary, Data/binary>>,
-                    Stream1 = Stream#stream{send_buffer = NewBuffer, pending_end_stream = EndStream},
-                    State1 = State#state{streams = maps:put(StreamId, Stream1, Streams)},
-                    {keep_state, State1, [{reply, From, ok}]};
+                    %% Need to buffer — but only up to ?MAX_SEND_BUFFER_BYTES.
+                    %% Past that a stalled peer would otherwise grow the
+                    %% connection process indefinitely.
+                    case byte_size(Buffer) + byte_size(Data) > ?MAX_SEND_BUFFER_BYTES of
+                        true ->
+                            {keep_state, State,
+                             [{reply, From, {error, send_buffer_full}}]};
+                        false ->
+                            NewBuffer = <<Buffer/binary, Data/binary>>,
+                            Stream1 = Stream#stream{send_buffer = NewBuffer,
+                                                    pending_end_stream = EndStream},
+                            State1 = State#state{streams = maps:put(StreamId, Stream1, Streams)},
+                            {keep_state, State1, [{reply, From, ok}]}
+                    end;
 
                 _ ->
                     %% Send what we can

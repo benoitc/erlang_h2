@@ -126,6 +126,7 @@
     continuation_flood_triggers_enhance_your_calm_test/1,
     controlling_process_monitors_new_owner_test/1,
     send_returns_error_on_closed_socket_test/1,
+    send_buffer_full_when_peer_stalls_window_test/1,
     tls_transport_tag_detected_test/1
 ]).
 
@@ -263,6 +264,7 @@ groups() ->
             continuation_flood_triggers_enhance_your_calm_test,
             controlling_process_monitors_new_owner_test,
             send_returns_error_on_closed_socket_test,
+            send_buffer_full_when_peer_stalls_window_test,
             tls_transport_tag_detected_test
         ]}
     ].
@@ -2494,6 +2496,50 @@ controlling_process_monitors_new_owner_test(Config) ->
     after 3000 ->
         ct:fail(connection_did_not_terminate_with_new_owner)
     end,
+    drain_exits(),
+    ok.
+
+%% A peer that opens a stream but never sends WINDOW_UPDATE leaves us with
+%% only the initial 64 KB of stream window. Past that we buffer; the buffer
+%% must be capped (?MAX_SEND_BUFFER_BYTES = 1 MB) so a stalled peer cannot
+%% grow the connection process indefinitely. Excess send_data must surface
+%% {error, send_buffer_full} instead of being accepted.
+send_buffer_full_when_peer_stalls_window_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef    -> h2:stop_server(OldRef)
+    end,
+    Parent = self(),
+    Handler = fun(Conn, Sid, _, _, _) ->
+        ok = h2:send_response(Conn, Sid, 200, []),
+        %% 2 MB body — comfortably over the 1 MB cap + 64 KB initial window.
+        Big = binary:copy(<<0>>, 2 * 1024 * 1024),
+        Parent ! {send_result, h2:send_data(Conn, Sid, Big, true)}
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert    => ?config(cert_file, Config),
+        key     => ?config(key_file, Config),
+        handler => Handler
+    }),
+    Port = h2:server_port(Ref),
+    %% Raw client so we can deliberately *not* drain DATA frames.
+    {ok, Sock} = raw_h2_client(Port),
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"localhost">>}
+    ],
+    {Block, _} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    receive
+        {send_result, {error, send_buffer_full}} -> ok;
+        {send_result, Other} -> ct:fail({expected_send_buffer_full, Other})
+    after 5000 ->
+        ct:fail(handler_did_not_return)
+    end,
+    ssl:close(Sock),
+    h2:stop_server(Ref),
     drain_exits(),
     ok.
 
