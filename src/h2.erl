@@ -224,12 +224,12 @@ start_connection(Mode, Socket, Opts) ->
                         ok ->
                             {ok, Pid};
                         {error, Reason} ->
-                            _ = (catch h2_connection:close(Pid)),
+                            ignore_errors(fun() -> h2_connection:close(Pid) end),
                             {error, Reason}
                     end;
                 {error, TransferReason} ->
-                    _ = (catch h2_connection:close(Pid)),
-                    _ = (catch close_socket(Transport, Socket)),
+                    ignore_errors(fun() -> h2_connection:close(Pid) end),
+                    ignore_errors(fun() -> close_socket(Transport, Socket) end),
                     {error, {controlling_process_failed, TransferReason}}
             end;
         {error, Reason} ->
@@ -238,6 +238,14 @@ start_connection(Mode, Socket, Opts) ->
 
 close_socket(ssl, Socket) -> ssl:close(Socket);
 close_socket(gen_tcp, Socket) -> gen_tcp:close(Socket).
+
+-spec ignore_errors(fun(() -> any())) -> ok.
+ignore_errors(Fun) ->
+    try Fun() of
+        _ -> ok
+    catch
+        _:_ -> ok
+    end.
 
 is_ssl_socket(Socket) when is_tuple(Socket) ->
     element(1, Socket) =:= sslsocket;
@@ -545,11 +553,11 @@ handle_server_connection(Socket, Handler, Settings, Transport, EnableConnectProt
                     _ = h2_connection:activate(Conn),
                     server_connection_loop(Conn, Handler);
                 {error, _} ->
-                    _ = (catch h2_connection:close(Conn)),
-                    _ = (catch CloseFn(Socket))
+                    ignore_errors(fun() -> h2_connection:close(Conn) end),
+                    ignore_errors(fun() -> CloseFn(Socket) end)
             end;
         {error, _Reason} ->
-            _ = (catch CloseFn(Socket))
+            ignore_errors(fun() -> CloseFn(Socket) end)
     end.
 
 tcp_acceptor_loop(State) ->
@@ -597,9 +605,9 @@ server_connection_loop(Conn, Handler) ->
                     Class:Reason:Stack ->
                         logger:error("h2 handler crash: ~ts:~tp~n~tp",
                                      [Class, Reason, Stack]),
-                        _ = (catch h2:send_response(Conn, StreamId, 500, [])),
-                        _ = (catch h2:send_data(Conn, StreamId,
-                                                <<"Internal Server Error">>, true))
+                        ignore_errors(fun() -> h2:send_response(Conn, StreamId, 500, []) end),
+                        ignore_errors(fun() -> h2:send_data(Conn, StreamId,
+                                                            <<"Internal Server Error">>, true) end)
                 end
             end),
             server_connection_loop(Conn, Handler);

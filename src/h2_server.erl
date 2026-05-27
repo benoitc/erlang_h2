@@ -70,11 +70,13 @@ parse_args(["--help"|_], _Opts) -> help;
 parse_args(["-p", Port|Rest], Opts) ->
     parse_args(["--port", Port|Rest], Opts);
 parse_args(["--port", Port|Rest], Opts) ->
-    case catch list_to_integer(Port) of
+    try list_to_integer(Port) of
         N when is_integer(N), N > 0, N < 65536 ->
             parse_args(Rest, Opts#{port => N});
         _ ->
             {error, io_lib:format("Invalid port: ~s", [Port])}
+    catch _:_ ->
+        {error, io_lib:format("Invalid port: ~s", [Port])}
     end;
 
 parse_args(["--cert", File|Rest], Opts) ->
