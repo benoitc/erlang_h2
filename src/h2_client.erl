@@ -114,11 +114,13 @@ parse_args(["--output", File|Rest], Opts) ->
     parse_args(Rest, Opts#{output => File});
 
 parse_args(["--timeout", Timeout|Rest], Opts) ->
-    case catch list_to_integer(Timeout) of
+    try list_to_integer(Timeout) of
         N when is_integer(N), N > 0 ->
             parse_args(Rest, Opts#{timeout => N});
         _ ->
             {error, io_lib:format("Invalid timeout: ~s", [Timeout])}
+    catch _:_ ->
+        {error, io_lib:format("Invalid timeout: ~s", [Timeout])}
     end;
 
 parse_args(["-v"|Rest], Opts) ->
@@ -158,9 +160,10 @@ parse_url_parts(Rest, Scheme) ->
             DefaultPort = case Scheme of https -> 443; http -> 80 end,
             {H, DefaultPort};
         [H, PortStr] ->
-            case catch list_to_integer(PortStr) of
+            try list_to_integer(PortStr) of
                 N when is_integer(N) -> {H, N};
                 _ -> {H, 443}
+            catch _:_ -> {H, 443}
             end
     end,
 

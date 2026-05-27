@@ -4,6 +4,13 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-05-28
+
+### Changed
+
+- OTP 29 compatibility: replaced every deprecated old-style `catch Expr` in `src/` with `try ... catch ... end`. Fire-and-forget cleanup calls now go through a private `ignore_errors/1` helper; the `--port`/`--timeout`/URL-port argument parsers use `try`. No behaviour change. The build is clean under `warnings_as_errors` on OTP 29.
+- CI now runs on OTP 29.0.
+
 ## [0.6.0] - 2026-05-20
 
 Security and concurrency hardening pass driven by a multi-agent audit. Several behaviour changes are flagged below; the new error returns require callers to widen their pattern matches.
