@@ -161,8 +161,7 @@ parse_url_parts(Rest, Scheme) ->
             {H, DefaultPort};
         [H, PortStr] ->
             try list_to_integer(PortStr) of
-                N when is_integer(N) -> {H, N};
-                _ -> {H, 443}
+                N when is_integer(N) -> {H, N}
             catch _:_ -> {H, 443}
             end
     end,

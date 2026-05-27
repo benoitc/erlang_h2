@@ -821,7 +821,7 @@ goaway_test(Config) ->
             ok
     after 5000 ->
         %% If still alive after timeout, close it
-        catch h2:close(Conn),
+        try h2:close(Conn) catch _:_ -> ok end,
         receive {'EXIT', Conn, _} -> ok after 1000 -> ok end
     end,
 
@@ -921,7 +921,7 @@ goaway_event_test(Config) ->
     after 2000 ->
         ct:fail(no_goaway_sent_event)
     end,
-    catch h2:close(Conn),
+    try h2:close(Conn) catch _:_ -> ok end,
     drain_exits(),
     ok.
 
@@ -939,7 +939,7 @@ closed_event_test(Config) ->
     after 2000 ->
         ct:fail(no_closed_event)
     end,
-    catch h2:close(Conn),
+    try h2:close(Conn) catch _:_ -> ok end,
     drain_exits(),
     ok.
 
@@ -1212,7 +1212,7 @@ connect_trailers_rejected_test(Config) ->
         %% client side sees a stream_reset / closed event.
         Self ! {tunnel_open, Conn, Sid},
         receive after 1500 -> ok end,
-        catch h2:send_trailers(Conn, Sid, [{<<"x-trailer">>, <<"v">>}])
+        try h2:send_trailers(Conn, Sid, [{<<"x-trailer">>, <<"v">>}]) catch _:_ -> ok end
     end,
     {ok, Ref} = h2:start_server(0, #{
         cert => ?config(cert_file, Config),
@@ -1399,7 +1399,7 @@ goaway_event_three_tuple_test(Config) ->
             ct:fail(no_goaway_or_close)
         end
     end,
-    catch h2:close(Conn2),
+    try h2:close(Conn2) catch _:_ -> ok end,
     drain_exits(),
     ok.
 
@@ -1941,8 +1941,8 @@ informational_end_stream_rejected_test(Config) ->
     after 4000 ->
         ct:fail(no_srv_rst_result)
     end,
-    catch h2:close(Conn),
-    catch ssl:close(LS),
+    try h2:close(Conn) catch _:_ -> ok end,
+    try ssl:close(LS) catch _:_ -> ok end,
     drain_exits(),
     ok.
 
@@ -2240,8 +2240,9 @@ client_rejects_enable_push_one_test(Config) ->
         ssl:close(S)
     end),
     %% Our client connects; it must reject peer SETTINGS → GOAWAY.
-    _ = (catch h2:connect("localhost", Port,
-                           #{ssl_opts => [{verify, verify_none}]})),
+    _ = (try h2:connect("localhost", Port,
+                        #{ssl_opts => [{verify, verify_none}]})
+         catch _:_ -> ok end),
     receive
         {goaway_result, {ok, ErrorCode}} ->
             ?assertEqual(1, ErrorCode);  %% PROTOCOL_ERROR
@@ -2333,10 +2334,10 @@ connect_ssl_without_alpn_rejected_test(Config) ->
     {ok, LS} = ssl:listen(0, Opts),
     {ok, {_, Port}} = ssl:sockname(LS),
     spawn_link(fun() ->
-        _ = (catch begin
+        try
             {ok, Tr} = ssl:transport_accept(LS, 5000),
             _ = ssl:handshake(Tr, 5000)
-        end)
+        catch _:_ -> ok end
     end),
     ?assertMatch({error, alpn_not_negotiated},
                  h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]})),
@@ -2407,7 +2408,7 @@ push_promise_gets_stream_reset_test(Config) ->
     after 5000 ->
         ct:fail(server_timeout)
     end,
-    catch h2:close(Conn),
+    try h2:close(Conn) catch _:_ -> ok end,
     ssl:close(LS),
     drain_exits(),
     ok.
@@ -2704,7 +2705,7 @@ send_returns_error_on_closed_socket_test(Config) ->
     %% Now any send must surface {error, _}; pre-fix this returned ok.
     Result = h2:send_data(Conn, Sid, <<"hello">>, false),
     ?assertMatch({error, _}, Result),
-    catch h2:close(Conn),
+    try h2:close(Conn) catch _:_ -> ok end,
     h2:stop_server(Ref),
     drain_exits(),
     ok.
