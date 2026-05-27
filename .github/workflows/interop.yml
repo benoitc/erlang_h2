@@ -14,7 +14,7 @@ jobs:
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '29.0'
-          rebar3-version: '3.23'
+          rebar3-version: '3.25.0'
       - name: Install h2spec
         run: |
           curl -sSL -o /tmp/h2spec.tar.gz \
