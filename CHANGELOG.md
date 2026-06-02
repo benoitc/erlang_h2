@@ -4,6 +4,15 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-02
+
+### Added
+
+- Listeners can bind a specific address or family. `start_server/2,3`
+  accept `ip => inet:ip_address()` (an 8-tuple selects IPv6) and
+  `inet6 => boolean()` (bind the IPv6 wildcard `::`) for both the `ssl`
+  and `tcp` transports.
+
 ## [0.6.1] - 2026-05-28
 
 ### Changed

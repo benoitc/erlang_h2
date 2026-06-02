@@ -116,6 +116,8 @@
     %% Raw ssl:tls_option() overrides; merged on top of our defaults. Useful
     %% for pinning a cipher list, disabling renegotiation, etc.
     ssl_opts => [ssl:tls_option()],
+    ip => inet:ip_address(),
+    inet6 => boolean(),
     handler := fun((connection(), stream_id(), binary(), binary(), headers()) -> any()),
     settings => h2_settings:settings(),
     acceptors => pos_integer(),
@@ -417,7 +419,8 @@ build_server_ssl_opts(Cert, Key, Opts) ->
                 []  -> [];
                 _   -> [{cacerts, CACerts}]
             end,
-            {ok, merge_opts(merge_opts(Base, Auth), UserOpts)}
+            Addr = socket_addr_opts(Opts),
+            {ok, Addr ++ merge_opts(merge_opts(Base, Auth), UserOpts)}
     end.
 
 %% Cleartext (h2c over TCP, prior-knowledge) server listener.
@@ -432,7 +435,7 @@ start_server_tcp(Port, Opts) ->
                 {active, false},
                 {mode, binary},
                 {packet, raw}
-            ],
+            ] ++ socket_addr_opts(Opts),
             case gen_tcp:listen(Port, TCPOpts) of
                 {ok, ListenSocket} ->
                     {ok, {_, BoundPort}} = inet:sockname(ListenSocket),
@@ -738,6 +741,22 @@ merge_opts(Default, Override) ->
     lists:ukeymerge(1,
         lists:ukeysort(1, Override),
         lists:ukeysort(1, Default)).
+
+%% Build inet listen options from the `ip'/`inet6' server opts. An IPv6
+%% `ip' tuple (or `inet6 => true') selects the inet6 family; `ip' sets the
+%% bind address. Returned as a list for the gen_tcp/ssl listen opts.
+socket_addr_opts(Opts) ->
+    IP = maps:get(ip, Opts, undefined),
+    Family = case {IP, maps:get(inet6, Opts, false)} of
+        {{_, _, _, _, _, _, _, _}, _} -> [inet6];
+        {_, true} -> [inet6];
+        _ -> []
+    end,
+    Addr = case IP of
+        undefined -> [];
+        _ -> [{ip, IP}]
+    end,
+    Family ++ Addr.
 
 load_file(Path) when is_list(Path) -> Path;
 load_file(Path) when is_binary(Path) -> binary_to_list(Path).
