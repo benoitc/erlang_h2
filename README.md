@@ -310,10 +310,10 @@ Numbers are machine-specific; treat them as relative. Reproduce with the harness
 under `bench/` (`start_h2.sh`, raw-client and `fprof`/decode microbenches).
 
 Tuning knobs: a handler that uses `respond/5`, `acceptors` (connection-accept
-rate), and `backlog` (listen queue). HPACK header decode is cheapest once a
+rate), and `backlog` (listen queue). HPACK decode is cheapest once a
 connection's dynamic table is warm (repeated headers decode as indexed
-references); the cold path (first request, or high header churn) is dominated by
-Huffman decoding of literal values.
+references); the cold path (first request, or high header churn) decodes literal
+values through a table-driven Huffman state machine.
 
 ## Build and test
 

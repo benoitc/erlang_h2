@@ -30,8 +30,9 @@
 
 - Static table (61 entries), dynamic table (FIFO eviction), Huffman coding, variable-length integer encoding.
 - `SETTINGS_HEADER_TABLE_SIZE` propagated to both encoders; decoder enforces that any size update is `≤` the peer-advertised cap and that size updates appear only at the start of a header block.
-- Huffman decoder rejects an embedded EOS symbol and rejects padding that isn't strictly a prefix of `11…1`.
-- Encode and decode paths use precomputed, shared tables (`persistent_term`) initialized at module load.
+- Huffman decoder is a table-driven 8-bit state machine (one tuple lookup per input byte); it rejects an embedded EOS symbol and rejects padding that isn't strictly a prefix of `11…1`.
+- Dynamic table is a map keyed by insertion sequence, so indexed lookup/insert/eviction are O(1); the encoder static-table lookup is an O(1) precomputed map.
+- Encode and decode tables are precomputed, shared (`persistent_term`), and initialized at module load.
 
 ### TLS
 
@@ -87,17 +88,6 @@ See the README for usage snippets and `src/h2.erl` for full edoc.
 Per-stream events (`data`, `trailers`, `stream_reset`) are routed to the process registered via `h2:set_stream_handler/3,4` if set; otherwise they fall back to the connection owner.
 
 Identical shape to `quic_h3` so application code that dispatches on protocol events can be shared between h2 and h3.
-
-## Planned
-
-- **Table-driven Huffman decoder.** `h2_hpack:huffman_decode_loop/4` decodes bit
-  by bit (per-length map lookups). Cold header decode (literal values, first
-  request on a connection, or high header churn) is dominated by this: about
-  23 us/op for a typical request versus 0.36 us/op once the dynamic table is
-  warm. A multi-bit (e.g. 8-bit) state-machine decoder would cut the cold path.
-  Deferred: it does not affect steady-state throughput with reused headers, and
-  the rewrite carries correctness risk; do it only if cold-decode workloads
-  (short connections, varying headers) matter.
 
 ## Intentionally out of scope
 

@@ -165,13 +165,9 @@ set_peer_max_table_size(Max, #hpack_context{peer_max_table_size = OldMax} = Ctx)
 init_tables() ->
     persistent_term:put(?PT_HUFFMAN_ENCODE,
                         list_to_tuple(?HUFFMAN_ENCODE_TABLE)),
-    %% Decoder: {SortedDistinctLengths, #{{Len,Code} => Sym}}. Huffman codes are
-    %% prefix-free, so trying lengths shortest-first yields at most one match per
-    %% length; each check is an O(1) map lookup instead of a full table scan.
-    DecMap = maps:from_list([{{Len, Code}, Sym}
-                             || {Sym, Code, Len} <- ?HUFFMAN_ENCODE_TABLE]),
-    DecLens = lists:usort([Len || {_, _, Len} <- ?HUFFMAN_ENCODE_TABLE]),
-    persistent_term:put(?PT_HUFFMAN_DECODE, {DecLens, DecMap}),
+    %% Decoder: an 8-bit state machine (see build_huffman_fsm/0) so decode does
+    %% one tuple lookup per input byte rather than per-bit matching.
+    persistent_term:put(?PT_HUFFMAN_DECODE, build_huffman_fsm()),
     persistent_term:put(?PT_STATIC_TABLE,
                         list_to_tuple(?STATIC_TABLE)),
     {StaticExact, StaticName} = build_static_indices(?STATIC_TABLE),
@@ -605,64 +601,96 @@ huffman_encode_bits(<<C, Rest/binary>>, Acc, Tab) ->
     huffman_encode_bits(Rest, <<Acc/bits, Code:Len>>, Tab).
 
 %% @doc Huffman decode a binary string.
+%%
+%% Uses a table-driven 8-bit state machine (built once at load time by
+%% build_huffman_fsm/0): one tuple lookup per input byte yields the next state
+%% and any bytes completed within that byte, with no per-bit work in the hot
+%% loop. State is the 1-based index of the current trie node (root = 1).
 -spec huffman_decode(binary()) -> {ok, binary()} | {error, term()}.
 huffman_decode(Bin) ->
-    DecodeTable = persistent_term:get(?PT_HUFFMAN_DECODE),
-    huffman_decode_loop(Bin, <<>>, <<>>, DecodeTable).
+    {States, Ends} = persistent_term:get(?PT_HUFFMAN_DECODE),
+    huffman_decode(Bin, 1, [], States, Ends).
 
-huffman_decode_loop(<<>>, <<>>, Acc, _Table) ->
-    {ok, Acc};
-huffman_decode_loop(<<>>, Remaining, Acc, _Table) ->
-    %% Check if remaining bits are valid EOS padding (all 1s)
-    Len = bit_size(Remaining),
-    if
-        Len < 8 ->
-            Expected = (1 bsl Len) - 1,
-            <<Val:Len>> = Remaining,
-            if
-                Val == Expected -> {ok, Acc};
-                true -> {error, invalid_padding}
-            end;
-        true ->
-            {error, incomplete_code}
+huffman_decode(<<>>, State, Acc, _States, Ends) ->
+    %% End of input: the leftover bits since the last symbol (this state's path
+    %% from the root) must be valid EOS padding. Ends/1 classifies the state.
+    case element(State, Ends) of
+        ok    -> {ok, iolist_to_binary(Acc)};
+        Error -> Error
     end;
-huffman_decode_loop(<<B, Rest/binary>>, Bits, Acc, Table) ->
-    AllBits = <<Bits/bits, B>>,
-    decode_symbols(AllBits, Rest, Acc, Table).
-
-%% Decode as many symbols as possible from the bit buffer
-decode_symbols(Bits, MoreBytes, Acc, Table) ->
-    case match_huffman_code(Bits, Table) of
-        {ok, Char, Remaining} ->
-            decode_symbols(Remaining, MoreBytes, <<Acc/binary, Char>>, Table);
-        need_more when MoreBytes =:= <<>> ->
-            huffman_decode_loop(<<>>, Bits, Acc, Table);
-        need_more ->
-            huffman_decode_loop(MoreBytes, Bits, Acc, Table);
-        {error, _} = Err ->
-            Err
+huffman_decode(<<B, Rest/binary>>, State, Acc, States, Ends) ->
+    case element(B + 1, element(State, States)) of
+        {Next, <<>>, ok}   -> huffman_decode(Rest, Next, Acc, States, Ends);
+        {Next, Emit, ok}   -> huffman_decode(Rest, Next, [Acc, Emit], States, Ends);
+        {_, _, eos}        -> {error, eos_in_string}
     end.
 
-%% Match a Huffman code from the bit buffer. Table = {SortedLengths, Map}.
-match_huffman_code(Bits, {Lengths, Map}) ->
-    match_huffman_code(Bits, Lengths, Map, bit_size(Bits)).
+%% Build the 8-bit decode FSM from the Huffman code table. Returns
+%% {StatesTuple, EndsTuple} (both 1-indexed by dense state id, root = 1):
+%%   StatesTuple: element(State) -> 256-tuple; element(Byte+1) ->
+%%                {NextState, EmittedBytes::binary(), ok | eos}
+%%   EndsTuple:   element(State) -> ok | {error, invalid_padding}
+%%                                     | {error, incomplete_code}
+build_huffman_fsm() ->
+    %% Trie as an edge map {NodeId, Bit} => ChildId, a leaf map ChildId => Sym,
+    %% and per-node {Depth, AllOnesPath}. Root is node 0.
+    {Edges, Leaves, Meta, _Cnt} =
+        lists:foldl(fun({Sym, Code, Len}, Acc) -> trie_insert(Sym, Code, Len, Acc) end,
+                    {#{}, #{}, #{0 => {0, true}}, 1},
+                    ?HUFFMAN_ENCODE_TABLE),
+    %% States = internal nodes (root + branches), densely numbered from 1 in id
+    %% order so root (id 0) becomes state 1.
+    InternalIds = lists:sort([Id || Id <- maps:keys(Meta),
+                                    not maps:is_key(Id, Leaves)]),
+    Dense = maps:from_list(lists:zip(InternalIds, lists:seq(1, length(InternalIds)))),
+    States = list_to_tuple([build_state_row(Id, Edges, Leaves, Dense)
+                            || Id <- InternalIds]),
+    Ends = list_to_tuple([end_result(maps:get(Id, Meta)) || Id <- InternalIds]),
+    {States, Ends}.
 
-match_huffman_code(_Bits, [], _Map, _BitSize) ->
-    %% No code length fit the available bits; need another byte.
-    need_more;
-match_huffman_code(Bits, [Len|Rest], Map, BitSize) when Len =< BitSize ->
-    <<Test:Len, Remaining/bits>> = Bits,
-    case Map of
-        #{{Len, Test} := Sym} when Sym =< 255 ->
-            {ok, Sym, Remaining};
-        #{{Len, Test} := 256} ->
-            {error, eos_in_string};
-        _ ->
-            match_huffman_code(Bits, Rest, Map, BitSize)
-    end;
-match_huffman_code(_Bits, [Len|_], _Map, BitSize) when Len > BitSize ->
-    %% Lengths are sorted ascending, so every remaining code is too long.
-    need_more.
+trie_insert(Sym, Code, Len, Acc) ->
+    Bits = [(Code bsr (Len - 1 - I)) band 1 || I <- lists:seq(0, Len - 1)],
+    insert_path(0, Bits, Sym, Acc).
+
+insert_path(Node, [Bit], Sym, {Edges, Leaves, Meta, Cnt}) ->
+    {PD, PAO} = maps:get(Node, Meta),
+    LeafId = Cnt,
+    {Edges#{{Node, Bit} => LeafId}, Leaves#{LeafId => Sym},
+     Meta#{LeafId => {PD + 1, PAO andalso Bit =:= 1}}, Cnt + 1};
+insert_path(Node, [Bit | Rest], Sym, {Edges, Leaves, Meta, Cnt} = Acc) ->
+    case maps:get({Node, Bit}, Edges, undefined) of
+        undefined ->
+            {PD, PAO} = maps:get(Node, Meta),
+            ChildId = Cnt,
+            insert_path(ChildId, Rest, Sym,
+                        {Edges#{{Node, Bit} => ChildId}, Leaves,
+                         Meta#{ChildId => {PD + 1, PAO andalso Bit =:= 1}}, Cnt + 1});
+        ChildId ->
+            insert_path(ChildId, Rest, Sym, Acc)
+    end.
+
+build_state_row(Id, Edges, Leaves, Dense) ->
+    list_to_tuple([walk_byte(Id, B, Edges, Leaves, Dense) || B <- lists:seq(0, 255)]).
+
+walk_byte(StartNode, Byte, Edges, Leaves, Dense) ->
+    Bits = [(Byte bsr (7 - I)) band 1 || I <- lists:seq(0, 7)],
+    walk_bits(StartNode, Bits, [], Edges, Leaves, Dense).
+
+walk_bits(Node, [], Emit, _Edges, _Leaves, Dense) ->
+    {maps:get(Node, Dense), list_to_binary(lists:reverse(Emit)), ok};
+walk_bits(Node, [Bit | Rest], Emit, Edges, Leaves, Dense) ->
+    Child = maps:get({Node, Bit}, Edges),
+    case maps:get(Child, Leaves, internal) of
+        internal -> walk_bits(Child, Rest, Emit, Edges, Leaves, Dense);
+        256      -> {1, <<>>, eos};            %% full EOS code in the stream
+        Sym      -> walk_bits(0, Rest, [Sym | Emit], Edges, Leaves, Dense)
+    end.
+
+%% RFC 7541 §5.2: trailing bits must be the EOS code's all-ones prefix and fewer
+%% than 8 bits; anything else is a decode error.
+end_result({Depth, _AllOnes}) when Depth >= 8 -> {error, incomplete_code};
+end_result({_Depth, true})  -> ok;
+end_result({_Depth, false}) -> {error, invalid_padding}.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -703,6 +731,24 @@ huffman_roundtrip_test_() ->
         <<"custom-value">>
     ],
     [?_assertEqual({ok, S}, huffman_decode(huffman_encode(S))) || S <- Strings].
+
+%% Round-trip every byte value through the FSM decoder (covers all symbols).
+huffman_all_bytes_roundtrip_test() ->
+    S = list_to_binary(lists:seq(0, 255)),
+    ?assertEqual({ok, S}, huffman_decode(huffman_encode(S))).
+
+%% RFC 7541 §5.2 error paths the decoder must reject (guards interop: these
+%% surface as COMPRESSION_ERROR upstream).
+huffman_decode_errors_test_() ->
+    [
+        %% '0' (00000) then three 0 padding bits: padding must be all ones.
+        ?_assertEqual({error, invalid_padding}, huffman_decode(<<0>>)),
+        %% Eight 1 bits: a partial code >= 8 bits, never completed.
+        ?_assertEqual({error, incomplete_code}, huffman_decode(<<16#ff>>)),
+        %% A full EOS code (30 ones) embedded in the stream is illegal.
+        ?_assertEqual({error, eos_in_string},
+                      huffman_decode(<<16#ff, 16#ff, 16#ff, 16#ff>>))
+    ].
 
 encode_decode_test() ->
     Ctx = new_context(),
