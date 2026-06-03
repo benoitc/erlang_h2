@@ -4,6 +4,38 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-03
+
+### Added
+
+- `h2:respond/5` sends a complete response (status, headers and body) in one call
+  and one coalesced socket write (HEADERS plus DATA), instead of the two
+  round-trips of `send_response/4` followed by `send_data/4`. It falls back to
+  the granular path when the response cannot be coalesced (oversized headers or
+  body, CONNECT tunnels). The existing send functions are unchanged.
+- `backlog` server option (default 1024) sizes the listen queue.
+
+### Fixed
+
+- Connection collapse under concurrent load. The server dropped responses for
+  requests pipelined before the client's SETTINGS-ACK (legal per RFC 9113): a
+  handler's `send_response`/`send_data` was rejected while the connection was
+  still in the `settings` state, so fast clients (h2load, browsers) lost whole
+  connections under load. The server now serves while in the `settings` state.
+- Client stream leak. Response HEADERS without END_STREAM reset a
+  `half_closed_local` stream back to `open`, so the final DATA reached only
+  `half_closed_remote` and completed streams never closed, eventually exhausting
+  `SETTINGS_MAX_CONCURRENT_STREAMS`.
+
+### Changed
+
+- HPACK encoder static-table lookup is an O(1) precomputed map, and the dynamic
+  table is a map keyed by insertion sequence for O(1) indexed lookup, insert and
+  eviction (was `lists:nth/2`).
+- HPACK Huffman decoding is a table-driven 8-bit state machine (one tuple lookup
+  per input byte); cold header decode is about 9x faster.
+- DATA frames are sent as iodata without copying the body.
+
 ## [0.7.0] - 2026-06-02
 
 ### Added
