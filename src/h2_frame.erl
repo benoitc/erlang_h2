@@ -15,7 +15,7 @@
 %%
 -module(h2_frame).
 
--export([encode/1, decode/1, decode/2, decode_header/1]).
+-export([encode/1, encode_iodata/1, decode/1, decode/2, decode_header/1]).
 -export([data/3, data/4]).
 -export([headers/3, headers/4, headers/5]).
 -export([priority/4]).
@@ -222,6 +222,18 @@ encode({continuation, StreamId, HeaderBlock, EndHeaders}) ->
     Flags = flags([{?FLAG_END_HEADERS, EndHeaders}]),
     Length = byte_size(HeaderBlock),
     <<Length:24, ?CONTINUATION:8, Flags:8, 0:1, StreamId:31, HeaderBlock/binary>>.
+
+%% @doc Like encode/1 but returns iodata. For DATA frames the (possibly large)
+%% payload is emitted as a separate element rather than copied into a new binary,
+%% so the wire bytes are identical to encode/1 without the body copy. Other
+%% frame types fall back to encode/1.
+-spec encode_iodata(frame_data()) -> iodata().
+encode_iodata({data, StreamId, Data, EndStream}) ->
+    Flags = flags([{?FLAG_END_STREAM, EndStream}]),
+    Length = byte_size(Data),
+    [<<Length:24, ?DATA:8, Flags:8, 0:1, StreamId:31>>, Data];
+encode_iodata(Frame) ->
+    encode(Frame).
 
 encode_settings([], Acc) -> Acc;
 encode_settings([{Id, Value}|Rest], Acc) when is_integer(Id) ->

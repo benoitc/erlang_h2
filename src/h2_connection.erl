@@ -19,7 +19,7 @@
 -export([start_link/3, start_link/4]).
 -export([activate/1]).
 -export([wait_connected/1, wait_connected/2]).
--export([send_request/4, send_request/5, send_request_headers/3, send_response/4, send_data/3, send_data/4]).
+-export([send_request/4, send_request/5, send_request_headers/3, send_response/4, respond/5, send_data/3, send_data/4]).
 -export([set_stream_handler/3, set_stream_handler/4, unset_stream_handler/2]).
 -export([send_trailers/3]).
 -export([cancel_stream/2, cancel_stream/3]).
@@ -268,6 +268,15 @@ unset_stream_handler(Conn, StreamId) ->
 send_response(Conn, StreamId, Status, Headers) ->
     gen_statem:call(Conn, {send_response, StreamId, Status, Headers}).
 
+%% @doc Send a complete response (headers + full body) in one call. Returns
+%% `need_fallback' when the fast path does not apply; callers (h2:respond/5)
+%% then use send_response/4 + send_data/4.
+-spec respond(pid(), non_neg_integer(), non_neg_integer(),
+              [{binary(), binary()}], binary()) ->
+    ok | need_fallback | {error, term()}.
+respond(Conn, StreamId, Status, Headers, Body) ->
+    gen_statem:call(Conn, {respond, StreamId, Status, Headers, Body}).
+
 %% @doc Send data on a stream.
 -spec send_data(pid(), non_neg_integer(), binary()) -> ok | {error, term()}.
 send_data(Conn, StreamId, Data) ->
@@ -487,6 +496,34 @@ settings({call, From}, activate, State) ->
     %% Already activated on transition out of preface; idempotent.
     {keep_state, State, [{reply, From, ok}]};
 
+%% A server may send response frames before the peer ACKs the server's SETTINGS:
+%% it has already sent its own SETTINGS and received the client preface, so it is
+%% allowed to respond. Clients pipeline requests right after the preface
+%% (RFC 9113 §3.4); the per-request handler must not have its response dropped
+%% just because the SETTINGS-ACK has not arrived yet. Handle the response-side
+%% calls here exactly as `connected` does (the connection stays in `settings`
+%% until the ACK arrives, then transitions normally).
+settings({call, From}, {send_response, StreamId, Status, Headers}, State) ->
+    handle_send_response(From, StreamId, Status, Headers, State);
+
+settings({call, From}, {respond, StreamId, Status, Headers, Body}, State) ->
+    handle_respond(From, StreamId, Status, Headers, Body, State);
+
+settings({call, From}, {send_data, StreamId, Data, EndStream}, State) ->
+    handle_send_data(From, StreamId, Data, EndStream, State);
+
+settings({call, From}, {send_trailers, StreamId, Trailers}, State) ->
+    handle_send_trailers(From, StreamId, Trailers, State);
+
+settings({call, From}, {cancel_stream, StreamId, ErrorCode}, State) ->
+    handle_cancel_stream(From, StreamId, ErrorCode, State);
+
+settings({call, From}, {set_stream_handler, StreamId, Pid, Opts}, State) ->
+    handle_set_stream_handler(From, StreamId, Pid, Opts, State);
+
+settings({call, From}, {unset_stream_handler, StreamId}, State) ->
+    handle_unset_stream_handler(From, StreamId, State);
+
 settings({call, From}, Request, State) ->
     handle_call_early(From, Request, settings, State);
 
@@ -530,6 +567,9 @@ connected({call, From}, {send_request_headers, Headers, EndStream}, State) ->
 
 connected({call, From}, {send_response, StreamId, Status, Headers}, State) ->
     handle_send_response(From, StreamId, Status, Headers, State);
+
+connected({call, From}, {respond, StreamId, Status, Headers, Body}, State) ->
+    handle_respond(From, StreamId, Status, Headers, Body, State);
 
 connected({call, From}, {send_data, StreamId, Data, EndStream}, State) ->
     handle_send_data(From, StreamId, Data, EndStream, State);
@@ -1327,7 +1367,13 @@ handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State) ->
             IsTunnel = Stream#stream.request_method =:= <<"CONNECT">>
                        andalso Status >= 200 andalso Status < 300,
             Stream1 = Stream#stream{
-                state = stream_state_after_end(EndStream),
+                %% Apply the remote END_STREAM (or its absence) to the stream's
+                %% *current* state. A client stream is already half_closed_local
+                %% after sending its request; response HEADERS without END_STREAM
+                %% must not reset it to `open` (that would leave the stream stuck
+                %% in half_closed_remote after the final DATA, never reaching
+                %% closed). Mirrors handle_data_frame's transition.
+                state = apply_remote_end(Stream#stream.state, EndStream),
                 response_headers = Headers,
                 response_seen_final = true,
                 tunnel = IsTunnel,
@@ -1406,6 +1452,13 @@ end_stream_body_mismatch(_, _)                  -> false.
 
 stream_state_after_end(true)  -> half_closed_remote;
 stream_state_after_end(false) -> open.
+
+%% Transition a stream on a received END_STREAM (or its absence), preserving any
+%% prior local half-close. Same rule as handle_data_frame's end-of-stream block.
+apply_remote_end(StreamState, false) -> StreamState;
+apply_remote_end(open, true)              -> half_closed_remote;
+apply_remote_end(half_closed_local, true) -> closed;
+apply_remote_end(Other, true)             -> Other.
 
 strip_pseudo(Headers) ->
     lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers).
@@ -2196,6 +2249,104 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
 handle_send_response(From, _StreamId, _Status, _Headers, State) ->
     {keep_state, State, [{reply, From, {error, not_server}}]}.
 
+%% Combined response: status + headers + full body in one gen_statem call and a
+%% single socket write (HEADERS coalesced with the DATA frame). This halves the
+%% per-request round-trips and syscalls versus send_response + send_data. The
+%% fast path covers the common case; anything it does not cover replies
+%% `need_fallback' and h2:respond/5 retries via the granular API. Validation
+%% mirrors handle_send_response exactly.
+handle_respond(From, StreamId, Status, Headers, Body,
+               #state{mode = server, streams = Streams, encode_context = EncCtx,
+                      socket = Socket, transport = Transport,
+                      conn_window_size = ConnWindow,
+                      peer_max_frame_size = MaxFrameSize} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream{state = St, request_method = ReqMethod,
+                     window_size = StreamWindow} = Stream}
+          when (St == open orelse St == half_closed_remote)
+               andalso Status =/= 101
+               andalso ReqMethod =/= <<"CONNECT">> ->
+            AllHeaders = [{<<":status">>, integer_to_binary(Status)} | Headers],
+            case validate_outbound_response(AllHeaders) of
+                {error, _} = Err ->
+                    {keep_state, State, [{reply, From, Err}]};
+                ok ->
+            case check_peer_max_header_list_size(AllHeaders, State) of
+                {error, _} = SErr ->
+                    {keep_state, State, [{reply, From, SErr}]};
+                ok ->
+            {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
+            BodyForbidden = ReqMethod =:= <<"HEAD">>
+                            orelse Status =:= 204 orelse Status =:= 304,
+            HeadersFit = byte_size(HeaderBlock) =< MaxFrameSize,
+            BodySize = byte_size(Body),
+            if
+                %% Headers-only end-of-stream (body forbidden, or empty body).
+                %% send_header_block also handles CONTINUATION for big blocks.
+                BodyForbidden orelse BodySize =:= 0 ->
+                    case send_header_block(StreamId, HeaderBlock, true, State) of
+                        ok ->
+                            finish_respond(From, StreamId, Stream, AllHeaders,
+                                           EncCtx1, St, 0, State);
+                        {error, R} ->
+                            {stop_and_reply, {shutdown, {send_failed, R}},
+                             [{reply, From, {error, R}}], State}
+                    end;
+                %% Coalesce HEADERS + DATA into one write when both fit a single
+                %% frame and the body is within the peer's flow-control windows.
+                HeadersFit andalso BodySize =< MaxFrameSize
+                andalso BodySize =< ConnWindow
+                andalso BodySize =< StreamWindow ->
+                    IoData = [h2_frame:encode(
+                                h2_frame:headers(StreamId, HeaderBlock, false)),
+                              h2_frame:encode_iodata(
+                                {data, StreamId, Body, true})],
+                    case Transport:send(Socket, IoData) of
+                        ok ->
+                            finish_respond(From, StreamId, Stream, AllHeaders,
+                                           EncCtx1, St, BodySize, State);
+                        {error, R} ->
+                            {stop_and_reply, {shutdown, {send_failed, R}},
+                             [{reply, From, {error, R}}], State}
+                    end;
+                %% Oversized headers/body: let the granular path split frames and
+                %% apply flow control. Drop EncCtx1 so the dynamic table is only
+                %% updated once, by the fallback encode.
+                true ->
+                    {keep_state, State, [{reply, From, need_fallback}]}
+            end
+            end
+            end;
+        {ok, _} ->
+            %% Wrong stream state: let the granular path produce the right error.
+            {keep_state, State, [{reply, From, need_fallback}]};
+        error ->
+            {keep_state, State, [{reply, From, {error, unknown_stream}}]}
+    end;
+handle_respond(From, _StreamId, _Status, _Headers, _Body, State) ->
+    {keep_state, State, [{reply, From, {error, not_server}}]}.
+
+%% Commit the post-send stream/window state for handle_respond. BodySize is 0
+%% for headers-only responses. Matches the open->half_closed_local /
+%% half_closed_remote->closed transition used by the granular send path.
+finish_respond(From, StreamId, #stream{window_size = StreamWindow} = Stream,
+               AllHeaders, EncCtx1, OldState, BodySize,
+               #state{streams = Streams, conn_window_size = ConnWindow} = State) ->
+    NewSt = case OldState of
+        open -> half_closed_local;
+        half_closed_remote -> closed
+    end,
+    Stream1 = Stream#stream{response_headers = AllHeaders, state = NewSt,
+                            window_size = StreamWindow - BodySize},
+    State1 = State#state{encode_context = EncCtx1,
+                         conn_window_size = ConnWindow - BodySize,
+                         streams = maps:put(StreamId, Stream1, Streams)},
+    State2 = case NewSt of
+        closed -> close_stream(StreamId, end_stream, State1);
+        _      -> State1
+    end,
+    {keep_state, State2, [{reply, From, ok}]}.
+
 %% RFC 9113 §4.2: a HEADERS frame's payload must not exceed
 %% SETTINGS_MAX_FRAME_SIZE advertised by the peer. If our encoded block is
 %% larger, split it across one HEADERS frame + one or more CONTINUATION
@@ -2683,8 +2834,8 @@ settings_to_list(Settings) ->
 %% an in-flight gen_statem:call cannot reply ok to the user after the
 %% socket has died.
 send_frame(Frame, #state{socket = Socket, transport = Transport}) ->
-    Bin = h2_frame:encode(Frame),
-    Transport:send(Socket, Bin).
+    %% iodata: DATA payloads are sent without an extra body copy.
+    Transport:send(Socket, h2_frame:encode_iodata(Frame)).
 
 send_goaway_frame(LastStreamId, ErrorCode, #state{socket = Socket, transport = Transport} = State) ->
     Frame = h2_frame:goaway(LastStreamId, ErrorCode, <<>>),

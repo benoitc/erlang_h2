@@ -30,8 +30,9 @@
 
 - Static table (61 entries), dynamic table (FIFO eviction), Huffman coding, variable-length integer encoding.
 - `SETTINGS_HEADER_TABLE_SIZE` propagated to both encoders; decoder enforces that any size update is `≤` the peer-advertised cap and that size updates appear only at the start of a header block.
-- Huffman decoder rejects an embedded EOS symbol and rejects padding that isn't strictly a prefix of `11…1`.
-- Encode and decode paths use precomputed, shared tables (`persistent_term`) initialized at module load.
+- Huffman decoder is a table-driven 8-bit state machine (one tuple lookup per input byte); it rejects an embedded EOS symbol and rejects padding that isn't strictly a prefix of `11…1`.
+- Dynamic table is a map keyed by insertion sequence, so indexed lookup/insert/eviction are O(1); the encoder static-table lookup is an O(1) precomputed map.
+- Encode and decode tables are precomputed, shared (`persistent_term`), and initialized at module load.
 
 ### TLS
 
@@ -62,6 +63,7 @@ h2:start_server/2,3
 h2:stop_server/1
 h2:server_port/1
 h2:send_response/4
+h2:respond/5            %% combined headers+body fast path (one call, one write)
 
 %% Inspection
 h2:get_settings/1

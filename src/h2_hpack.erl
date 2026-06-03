@@ -25,13 +25,20 @@
 -define(PT_HUFFMAN_ENCODE, {?MODULE, huffman_encode_tuple}).
 -define(PT_HUFFMAN_DECODE, {?MODULE, huffman_decode_sorted}).
 -define(PT_STATIC_TABLE,   {?MODULE, static_table_tuple}).
+%% Encoder lookups: {Name,Value} -> Index (exact) and Name -> first Index.
+-define(PT_STATIC_EXACT,   {?MODULE, static_exact_index}).
+-define(PT_STATIC_NAME,    {?MODULE, static_name_index}).
 
 %% Context record for encoder/decoder state
 -record(hpack_context, {
     max_table_size = ?DEFAULT_HEADER_TABLE_SIZE :: non_neg_integer(),
     table_size = 0 :: non_neg_integer(),
-    dynamic_table = [] :: [{binary(), binary()}],
-    %% Cached length of dynamic_table to avoid O(n) length/1 on every lookup.
+    %% Dynamic table as a map keyed by a monotonic insertion sequence, giving
+    %% O(1) indexed lookup, insert, and oldest-eviction. HPACK dynamic index i
+    %% (1 = newest) maps to sequence (dynamic_newest - (i - 1)); the oldest live
+    %% sequence is (dynamic_newest - dynamic_table_length + 1).
+    dynamic_entries = #{} :: #{pos_integer() => {binary(), binary()}},
+    dynamic_newest = 0 :: non_neg_integer(),
     dynamic_table_length = 0 :: non_neg_integer(),
     %% RFC 7541 §4.2: when the peer lowers SETTINGS_HEADER_TABLE_SIZE,
     %% the next header block MUST begin with one or more dynamic-table
@@ -158,12 +165,29 @@ set_peer_max_table_size(Max, #hpack_context{peer_max_table_size = OldMax} = Ctx)
 init_tables() ->
     persistent_term:put(?PT_HUFFMAN_ENCODE,
                         list_to_tuple(?HUFFMAN_ENCODE_TABLE)),
-    persistent_term:put(?PT_HUFFMAN_DECODE,
-                        lists:sort(fun({_, _, L1}, {_, _, L2}) -> L1 =< L2 end,
-                                   ?HUFFMAN_ENCODE_TABLE)),
+    %% Decoder: an 8-bit state machine (see build_huffman_fsm/0) so decode does
+    %% one tuple lookup per input byte rather than per-bit matching.
+    persistent_term:put(?PT_HUFFMAN_DECODE, build_huffman_fsm()),
     persistent_term:put(?PT_STATIC_TABLE,
                         list_to_tuple(?STATIC_TABLE)),
+    {StaticExact, StaticName} = build_static_indices(?STATIC_TABLE),
+    persistent_term:put(?PT_STATIC_EXACT, StaticExact),
+    persistent_term:put(?PT_STATIC_NAME, StaticName),
     ok.
+
+%% Build the encoder index maps from the static table. Exact map keys every
+%% {Name,Value} pair to its index; name map keys each Name to its first index
+%% (matching the original linear scan, which returned the first name match).
+build_static_indices(Table) ->
+    {Exact, Name, _} = lists:foldl(
+        fun({N, V}, {ExAcc, NmAcc, Idx}) ->
+            NmAcc1 = case maps:is_key(N, NmAcc) of
+                true  -> NmAcc;
+                false -> NmAcc#{N => Idx}
+            end,
+            {ExAcc#{{N, V} => Idx}, NmAcc1, Idx + 1}
+        end, {#{}, #{}, 1}, Table),
+    {Exact, Name}.
 
 %% @doc Encode a list of headers.
 -spec encode(headers(), context()) -> {binary(), context()}.
@@ -391,38 +415,50 @@ find_header(Name, Value, Ctx) ->
     end.
 
 find_in_static(Name, Value) ->
-    find_in_static(Name, Value, ?STATIC_TABLE, 1, not_found).
+    case maps:find({Name, Value}, persistent_term:get(?PT_STATIC_EXACT)) of
+        {ok, Index} ->
+            {indexed, Index};
+        error ->
+            case maps:find(Name, persistent_term:get(?PT_STATIC_NAME)) of
+                {ok, NameIndex} -> {name_indexed, NameIndex};
+                error           -> not_found
+            end
+    end.
 
-find_in_static(_Name, _Value, [], _Index, NameMatch) ->
+%% Encoder reverse lookup: scan the dynamic table from newest (DynIndex 1) to
+%% oldest. O(n) over the dynamic table, but this is the response-encode path
+%% with a small table, not the hot request-decode path.
+find_in_dynamic(Name, Value, #hpack_context{dynamic_entries = Entries,
+                                            dynamic_newest = Newest,
+                                            dynamic_table_length = Len}) ->
+    find_in_dynamic(Name, Value, Entries, Newest, 1, Len, not_found).
+
+find_in_dynamic(_Name, _Value, _Entries, _Newest, DynIndex, Len, NameMatch)
+  when DynIndex > Len ->
     NameMatch;
-find_in_static(Name, Value, [{Name, Value}|_], Index, _NameMatch) ->
-    {indexed, Index};
-find_in_static(Name, Value, [{Name, _}|Rest], Index, not_found) ->
-    find_in_static(Name, Value, Rest, Index + 1, {name_indexed, Index});
-find_in_static(Name, Value, [_|Rest], Index, NameMatch) ->
-    find_in_static(Name, Value, Rest, Index + 1, NameMatch).
-
-find_in_dynamic(Name, Value, #hpack_context{dynamic_table = DynTable}) ->
-    find_in_dynamic(Name, Value, DynTable, ?HPACK_STATIC_TABLE_SIZE + 1, not_found).
-
-find_in_dynamic(_Name, _Value, [], _Index, NameMatch) ->
-    NameMatch;
-find_in_dynamic(Name, Value, [{Name, Value}|_], Index, _NameMatch) ->
-    {indexed, Index};
-find_in_dynamic(Name, Value, [{Name, _}|Rest], Index, not_found) ->
-    find_in_dynamic(Name, Value, Rest, Index + 1, {name_indexed, Index});
-find_in_dynamic(Name, Value, [_|Rest], Index, NameMatch) ->
-    find_in_dynamic(Name, Value, Rest, Index + 1, NameMatch).
+find_in_dynamic(Name, Value, Entries, Newest, DynIndex, Len, NameMatch) ->
+    Index = ?HPACK_STATIC_TABLE_SIZE + DynIndex,
+    case maps:get(Newest - (DynIndex - 1), Entries) of
+        {Name, Value} ->
+            {indexed, Index};
+        {Name, _} when NameMatch =:= not_found ->
+            find_in_dynamic(Name, Value, Entries, Newest, DynIndex + 1, Len,
+                            {name_indexed, Index});
+        _ ->
+            find_in_dynamic(Name, Value, Entries, Newest, DynIndex + 1, Len,
+                            NameMatch)
+    end.
 
 lookup(Index, _Ctx) when Index >= 1, Index =< ?HPACK_STATIC_TABLE_SIZE ->
     {Name, Value} = element(Index, persistent_term:get(?PT_STATIC_TABLE)),
     {ok, Name, Value};
-lookup(Index, #hpack_context{dynamic_table = DynTable,
+lookup(Index, #hpack_context{dynamic_entries = Entries,
+                             dynamic_newest = Newest,
                              dynamic_table_length = Len}) ->
     DynIndex = Index - ?HPACK_STATIC_TABLE_SIZE,
     if
         DynIndex >= 1, DynIndex =< Len ->
-            {Name, Value} = lists:nth(DynIndex, DynTable),
+            {Name, Value} = maps:get(Newest - (DynIndex - 1), Entries),
             {ok, Name, Value};
         true ->
             error
@@ -431,12 +467,13 @@ lookup(Index, #hpack_context{dynamic_table = DynTable,
 lookup_name(Index, _Ctx) when Index >= 1, Index =< ?HPACK_STATIC_TABLE_SIZE ->
     {Name, _} = element(Index, persistent_term:get(?PT_STATIC_TABLE)),
     Name;
-lookup_name(Index, #hpack_context{dynamic_table = DynTable,
+lookup_name(Index, #hpack_context{dynamic_entries = Entries,
+                                  dynamic_newest = Newest,
                                   dynamic_table_length = Len}) ->
     DynIndex = Index - ?HPACK_STATIC_TABLE_SIZE,
     if
         DynIndex >= 1, DynIndex =< Len ->
-            {Name, _} = lists:nth(DynIndex, DynTable),
+            {Name, _} = maps:get(Newest - (DynIndex - 1), Entries),
             Name;
         true ->
             error
@@ -446,27 +483,28 @@ add_to_dynamic_table(Name, Value, Ctx) ->
     EntrySize = entry_size(Name, Value),
     Ctx1 = evict_to_fit(EntrySize, Ctx),
     #hpack_context{
-        dynamic_table = DynTable,
+        dynamic_entries = Entries,
+        dynamic_newest = Newest,
         dynamic_table_length = Len,
         table_size = TableSize,
         max_table_size = MaxSize
     } = Ctx1,
     if
         EntrySize > MaxSize ->
-            %% Entry too large, clear table
-            Ctx1#hpack_context{dynamic_table = [], dynamic_table_length = 0,
-                               table_size = 0};
+            %% Entry too large for the table: RFC 7541 §4.4 clears it entirely.
+            Ctx1#hpack_context{dynamic_entries = #{}, dynamic_newest = 0,
+                               dynamic_table_length = 0, table_size = 0};
         true ->
+            NewSeq = Newest + 1,
             Ctx1#hpack_context{
-                dynamic_table = [{Name, Value}|DynTable],
+                dynamic_entries = maps:put(NewSeq, {Name, Value}, Entries),
+                dynamic_newest = NewSeq,
                 dynamic_table_length = Len + 1,
                 table_size = TableSize + EntrySize
             }
     end.
 
 evict_to_fit(NewEntrySize, #hpack_context{
-    dynamic_table = DynTable,
-    dynamic_table_length = Len,
     table_size = TableSize,
     max_table_size = MaxSize
 } = Ctx) ->
@@ -475,20 +513,24 @@ evict_to_fit(NewEntrySize, #hpack_context{
         TableSize =< TargetSize ->
             Ctx;
         true ->
-            %% Reverse once (oldest first), drop from front until under target.
-            Reversed = lists:reverse(DynTable),
-            {Kept, NewSize, NewLen} = drop_until(Reversed, TableSize, Len, TargetSize),
-            Ctx#hpack_context{dynamic_table = lists:reverse(Kept),
-                              dynamic_table_length = NewLen,
-                              table_size = NewSize}
+            evict_oldest(Ctx, TargetSize)
     end.
 
-drop_until([], _Size, _Len, _Target) ->
-    {[], 0, 0};
-drop_until(List, Size, Len, Target) when Size =< Target ->
-    {List, Size, Len};
-drop_until([{N, V}|Rest], Size, Len, Target) ->
-    drop_until(Rest, Size - entry_size(N, V), Len - 1, Target).
+%% Drop oldest entries (lowest live sequence) until the table fits TargetSize.
+evict_oldest(#hpack_context{table_size = Size} = Ctx, Target) when Size =< Target ->
+    Ctx;
+evict_oldest(#hpack_context{dynamic_table_length = 0} = Ctx, _Target) ->
+    Ctx#hpack_context{dynamic_newest = 0, table_size = 0};
+evict_oldest(#hpack_context{dynamic_entries = Entries, dynamic_newest = Newest,
+                            dynamic_table_length = Len,
+                            table_size = Size} = Ctx, Target) ->
+    OldestSeq = Newest - Len + 1,
+    {N, V} = maps:get(OldestSeq, Entries),
+    evict_oldest(Ctx#hpack_context{
+        dynamic_entries = maps:remove(OldestSeq, Entries),
+        dynamic_table_length = Len - 1,
+        table_size = Size - entry_size(N, V)
+    }, Target).
 
 entry_size(Name, Value) ->
     byte_size(Name) + byte_size(Value) + 32.
@@ -559,63 +601,96 @@ huffman_encode_bits(<<C, Rest/binary>>, Acc, Tab) ->
     huffman_encode_bits(Rest, <<Acc/bits, Code:Len>>, Tab).
 
 %% @doc Huffman decode a binary string.
+%%
+%% Uses a table-driven 8-bit state machine (built once at load time by
+%% build_huffman_fsm/0): one tuple lookup per input byte yields the next state
+%% and any bytes completed within that byte, with no per-bit work in the hot
+%% loop. State is the 1-based index of the current trie node (root = 1).
 -spec huffman_decode(binary()) -> {ok, binary()} | {error, term()}.
 huffman_decode(Bin) ->
-    DecodeTable = persistent_term:get(?PT_HUFFMAN_DECODE),
-    huffman_decode_loop(Bin, <<>>, <<>>, DecodeTable).
+    {States, Ends} = persistent_term:get(?PT_HUFFMAN_DECODE),
+    huffman_decode(Bin, 1, [], States, Ends).
 
-huffman_decode_loop(<<>>, <<>>, Acc, _Table) ->
-    {ok, Acc};
-huffman_decode_loop(<<>>, Remaining, Acc, _Table) ->
-    %% Check if remaining bits are valid EOS padding (all 1s)
-    Len = bit_size(Remaining),
-    if
-        Len < 8 ->
-            Expected = (1 bsl Len) - 1,
-            <<Val:Len>> = Remaining,
-            if
-                Val == Expected -> {ok, Acc};
-                true -> {error, invalid_padding}
-            end;
-        true ->
-            {error, incomplete_code}
+huffman_decode(<<>>, State, Acc, _States, Ends) ->
+    %% End of input: the leftover bits since the last symbol (this state's path
+    %% from the root) must be valid EOS padding. Ends/1 classifies the state.
+    case element(State, Ends) of
+        ok    -> {ok, iolist_to_binary(Acc)};
+        Error -> Error
     end;
-huffman_decode_loop(<<B, Rest/binary>>, Bits, Acc, Table) ->
-    AllBits = <<Bits/bits, B>>,
-    decode_symbols(AllBits, Rest, Acc, Table).
-
-%% Decode as many symbols as possible from the bit buffer
-decode_symbols(Bits, MoreBytes, Acc, Table) ->
-    case match_huffman_code(Bits, Table) of
-        {ok, Char, Remaining} ->
-            decode_symbols(Remaining, MoreBytes, <<Acc/binary, Char>>, Table);
-        need_more when MoreBytes =:= <<>> ->
-            huffman_decode_loop(<<>>, Bits, Acc, Table);
-        need_more ->
-            huffman_decode_loop(MoreBytes, Bits, Acc, Table);
-        {error, _} = Err ->
-            Err
+huffman_decode(<<B, Rest/binary>>, State, Acc, States, Ends) ->
+    case element(B + 1, element(State, States)) of
+        {Next, <<>>, ok}   -> huffman_decode(Rest, Next, Acc, States, Ends);
+        {Next, Emit, ok}   -> huffman_decode(Rest, Next, [Acc, Emit], States, Ends);
+        {_, _, eos}        -> {error, eos_in_string}
     end.
 
-%% Match a Huffman code from the bit buffer
-match_huffman_code(Bits, Table) ->
-    match_huffman_code(Bits, Table, bit_size(Bits)).
+%% Build the 8-bit decode FSM from the Huffman code table. Returns
+%% {StatesTuple, EndsTuple} (both 1-indexed by dense state id, root = 1):
+%%   StatesTuple: element(State) -> 256-tuple; element(Byte+1) ->
+%%                {NextState, EmittedBytes::binary(), ok | eos}
+%%   EndsTuple:   element(State) -> ok | {error, invalid_padding}
+%%                                     | {error, incomplete_code}
+build_huffman_fsm() ->
+    %% Trie as an edge map {NodeId, Bit} => ChildId, a leaf map ChildId => Sym,
+    %% and per-node {Depth, AllOnesPath}. Root is node 0.
+    {Edges, Leaves, Meta, _Cnt} =
+        lists:foldl(fun({Sym, Code, Len}, Acc) -> trie_insert(Sym, Code, Len, Acc) end,
+                    {#{}, #{}, #{0 => {0, true}}, 1},
+                    ?HUFFMAN_ENCODE_TABLE),
+    %% States = internal nodes (root + branches), densely numbered from 1 in id
+    %% order so root (id 0) becomes state 1.
+    InternalIds = lists:sort([Id || Id <- maps:keys(Meta),
+                                    not maps:is_key(Id, Leaves)]),
+    Dense = maps:from_list(lists:zip(InternalIds, lists:seq(1, length(InternalIds)))),
+    States = list_to_tuple([build_state_row(Id, Edges, Leaves, Dense)
+                            || Id <- InternalIds]),
+    Ends = list_to_tuple([end_result(maps:get(Id, Meta)) || Id <- InternalIds]),
+    {States, Ends}.
 
-match_huffman_code(_Bits, [], _BitSize) ->
-    need_more;
-match_huffman_code(Bits, [{Sym, Code, Len}|Rest], BitSize) when Len =< BitSize ->
-    <<Test:Len, Remaining/bits>> = Bits,
-    if
-        Test == Code, Sym =< 255 ->
-            {ok, Sym, Remaining};
-        Test == Code, Sym == 256 ->
-            {error, eos_in_string};
-        true ->
-            match_huffman_code(Bits, Rest, BitSize)
-    end;
-match_huffman_code(_Bits, [{_, _, Len}|_], BitSize) when Len > BitSize ->
-    %% All remaining codes are longer than available bits
-    need_more.
+trie_insert(Sym, Code, Len, Acc) ->
+    Bits = [(Code bsr (Len - 1 - I)) band 1 || I <- lists:seq(0, Len - 1)],
+    insert_path(0, Bits, Sym, Acc).
+
+insert_path(Node, [Bit], Sym, {Edges, Leaves, Meta, Cnt}) ->
+    {PD, PAO} = maps:get(Node, Meta),
+    LeafId = Cnt,
+    {Edges#{{Node, Bit} => LeafId}, Leaves#{LeafId => Sym},
+     Meta#{LeafId => {PD + 1, PAO andalso Bit =:= 1}}, Cnt + 1};
+insert_path(Node, [Bit | Rest], Sym, {Edges, Leaves, Meta, Cnt} = Acc) ->
+    case maps:get({Node, Bit}, Edges, undefined) of
+        undefined ->
+            {PD, PAO} = maps:get(Node, Meta),
+            ChildId = Cnt,
+            insert_path(ChildId, Rest, Sym,
+                        {Edges#{{Node, Bit} => ChildId}, Leaves,
+                         Meta#{ChildId => {PD + 1, PAO andalso Bit =:= 1}}, Cnt + 1});
+        ChildId ->
+            insert_path(ChildId, Rest, Sym, Acc)
+    end.
+
+build_state_row(Id, Edges, Leaves, Dense) ->
+    list_to_tuple([walk_byte(Id, B, Edges, Leaves, Dense) || B <- lists:seq(0, 255)]).
+
+walk_byte(StartNode, Byte, Edges, Leaves, Dense) ->
+    Bits = [(Byte bsr (7 - I)) band 1 || I <- lists:seq(0, 7)],
+    walk_bits(StartNode, Bits, [], Edges, Leaves, Dense).
+
+walk_bits(Node, [], Emit, _Edges, _Leaves, Dense) ->
+    {maps:get(Node, Dense), list_to_binary(lists:reverse(Emit)), ok};
+walk_bits(Node, [Bit | Rest], Emit, Edges, Leaves, Dense) ->
+    Child = maps:get({Node, Bit}, Edges),
+    case maps:get(Child, Leaves, internal) of
+        internal -> walk_bits(Child, Rest, Emit, Edges, Leaves, Dense);
+        256      -> {1, <<>>, eos};            %% full EOS code in the stream
+        Sym      -> walk_bits(0, Rest, [Sym | Emit], Edges, Leaves, Dense)
+    end.
+
+%% RFC 7541 §5.2: trailing bits must be the EOS code's all-ones prefix and fewer
+%% than 8 bits; anything else is a decode error.
+end_result({Depth, _AllOnes}) when Depth >= 8 -> {error, incomplete_code};
+end_result({_Depth, true})  -> ok;
+end_result({_Depth, false}) -> {error, invalid_padding}.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -656,6 +731,24 @@ huffman_roundtrip_test_() ->
         <<"custom-value">>
     ],
     [?_assertEqual({ok, S}, huffman_decode(huffman_encode(S))) || S <- Strings].
+
+%% Round-trip every byte value through the FSM decoder (covers all symbols).
+huffman_all_bytes_roundtrip_test() ->
+    S = list_to_binary(lists:seq(0, 255)),
+    ?assertEqual({ok, S}, huffman_decode(huffman_encode(S))).
+
+%% RFC 7541 §5.2 error paths the decoder must reject (guards interop: these
+%% surface as COMPRESSION_ERROR upstream).
+huffman_decode_errors_test_() ->
+    [
+        %% '0' (00000) then three 0 padding bits: padding must be all ones.
+        ?_assertEqual({error, invalid_padding}, huffman_decode(<<0>>)),
+        %% Eight 1 bits: a partial code >= 8 bits, never completed.
+        ?_assertEqual({error, incomplete_code}, huffman_decode(<<16#ff>>)),
+        %% A full EOS code (30 ones) embedded in the stream is illegal.
+        ?_assertEqual({error, eos_in_string},
+                      huffman_decode(<<16#ff, 16#ff, 16#ff, 16#ff>>))
+    ].
 
 encode_decode_test() ->
     Ctx = new_context(),

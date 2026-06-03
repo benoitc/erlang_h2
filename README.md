@@ -94,6 +94,22 @@ Port = h2:server_port(Server),
 ok = h2:stop_server(Server).
 ```
 
+For the common headers-plus-body response, `h2:respond/5` sends both in a single
+call and a single socket write (HEADERS coalesced with DATA), instead of the two
+round-trips of `send_response/4` + `send_data/4`. It falls back to the granular
+path automatically when the response cannot be coalesced (oversized headers or
+body, CONNECT tunnels):
+
+```erlang
+Handler = fun(Conn, StreamId, <<"GET">>, <<"/">>, _Headers) ->
+    h2:respond(Conn, StreamId, 200, [{<<"content-type">>, <<"text/plain">>}],
+               <<"Hello HTTP/2!">>)
+end.
+```
+
+Use the granular `send_response/4` + `send_data/4` (or `send_data/4` in chunks)
+when the body is streamed or produced incrementally.
+
 Options to `h2:start_server/2,3`:
 
 ```erlang
@@ -103,6 +119,7 @@ Options to `h2:start_server/2,3`:
   handler                 := fun((Conn, StreamId, Method, Path, Headers) -> any()),
   settings                => h2_settings:settings(),
   acceptors               => pos_integer(),       %% default: schedulers
+  backlog                 => pos_integer(),       %% listen queue, default: 1024
   transport               => ssl | tcp,           %% default: ssl
   enable_connect_protocol => boolean()}           %% RFC 8441, default: false
 ```
@@ -269,6 +286,34 @@ Listener `alpn_preferred_protocols` becomes `[<<"h2">>, <<"http/1.1">>]`. One po
 | `h2_hpack` | HPACK encoder/decoder. |
 | `h2_settings` | SETTINGS encode/decode/validate. |
 | `h2_error` | Error code mappings. |
+
+## Performance
+
+Each connection is one `h2_connection` gen_statem that owns the socket; each
+request is handled in its own process, so in-flight concurrency scales with BEAM
+schedulers.
+
+For the common request/response, prefer `h2:respond/5` (status + headers + body
+in one call and one coalesced socket write) over `h2:send_response/4` +
+`h2:send_data/4` (two `gen_statem` round-trips and two writes). Use the granular
+pair when the body is produced or streamed incrementally.
+
+Indicative h2c throughput, `h2load` on a 14-core machine with a "Hello, World!"
+handler, against cowboy 2.14 on the same box:
+
+| clients x streams | `send_response` + `send_data` | `respond/5` | cowboy |
+|---|---|---|---|
+| 16 x 16 | 250k req/s | 388k req/s | 320k req/s |
+| 32 x 32 | 268k req/s | 420k req/s | 397k req/s |
+
+Numbers are machine-specific; treat them as relative. Reproduce with the harness
+under `bench/` (`start_h2.sh`, raw-client and `fprof`/decode microbenches).
+
+Tuning knobs: a handler that uses `respond/5`, `acceptors` (connection-accept
+rate), and `backlog` (listen queue). HPACK decode is cheapest once a
+connection's dynamic table is warm (repeated headers decode as indexed
+references); the cold path (first request, or high header churn) decodes literal
+values through a table-driven Huffman state machine.
 
 ## Build and test
 
