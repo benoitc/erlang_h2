@@ -87,6 +87,17 @@ Per-stream events (`data`, `trailers`, `stream_reset`) are routed to the process
 
 Identical shape to `quic_h3` so application code that dispatches on protocol events can be shared between h2 and h3.
 
+## Planned
+
+- **Table-driven Huffman decoder.** `h2_hpack:huffman_decode_loop/4` decodes bit
+  by bit (per-length map lookups). Cold header decode (literal values, first
+  request on a connection, or high header churn) is dominated by this: about
+  23 us/op for a typical request versus 0.36 us/op once the dynamic table is
+  warm. A multi-bit (e.g. 8-bit) state-machine decoder would cut the cold path.
+  Deferred: it does not affect steady-state throughput with reused headers, and
+  the rewrite carries correctness risk; do it only if cold-decode workloads
+  (short connections, varying headers) matter.
+
 ## Intentionally out of scope
 
 - **Server push (§8.2)** — deprecated by browsers, removed from HTTP/3.
