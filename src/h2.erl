@@ -69,6 +69,7 @@
 %% Server API
 -export([start_server/2, start_server/3, stop_server/1, server_port/1]).
 -export([send_response/4]).
+-export([respond/5]).
 
 %% Common API
 -export([send_data/3, send_data/4]).
@@ -639,6 +640,25 @@ invoke_handler(Module, Conn, StreamId, Method, Path, Headers) when is_atom(Modul
     ok | {error, term()}.
 send_response(Conn, StreamId, Status, Headers) ->
     h2_connection:send_response(Conn, StreamId, Status, Headers).
+
+%% @doc Send a complete response (headers + full body) in a single call. This is
+%% the fast path for the common request/response case: one message to the
+%% connection and one socket write (HEADERS coalesced with DATA), versus the two
+%% round-trips of send_response/4 followed by send_data/4. Falls back to the
+%% granular path transparently when the response cannot be coalesced (oversized
+%% headers/body, CONNECT tunnels).
+-spec respond(connection(), stream_id(), status(), headers(), binary()) ->
+    ok | {error, term()}.
+respond(Conn, StreamId, Status, Headers, Body) ->
+    case h2_connection:respond(Conn, StreamId, Status, Headers, Body) of
+        need_fallback ->
+            case h2_connection:send_response(Conn, StreamId, Status, Headers) of
+                ok  -> h2_connection:send_data(Conn, StreamId, Body, true);
+                Err -> Err
+            end;
+        Result ->
+            Result
+    end.
 
 %% ============================================================================
 %% Common API

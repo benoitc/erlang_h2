@@ -11,12 +11,14 @@
 
 -export([all/0, init_per_suite/1, end_per_suite/1,
          init_per_testcase/2, end_per_testcase/2]).
--export([pre_settings_ack_response/1, sequential_no_stream_leak/1]).
+-export([pre_settings_ack_response/1, sequential_no_stream_leak/1,
+         respond_combined/1, respond_large_body_fallback/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
-all() -> [pre_settings_ack_response, sequential_no_stream_leak].
+all() -> [pre_settings_ack_response, sequential_no_stream_leak,
+          respond_combined, respond_large_body_fallback].
 
 init_per_suite(Config) ->
     ok = application:ensure_started(crypto),
@@ -116,4 +118,50 @@ await_body(Conn, Sid) ->
         {h2, Conn, {data, Sid, _D, true}} -> ok;
         {h2, Conn, {data, Sid, _D, false}} -> await_body(Conn, Sid)
     after 4000 -> ct:fail({body_timeout, Sid})
+    end.
+
+%% h2:respond/5 fast path: a normal small response must arrive intact.
+respond_combined(Config) ->
+    Body = <<"Hello, World!">>,
+    {Status, Got} = respond_roundtrip(Config, Body),
+    ?assertEqual(200, Status),
+    ?assertEqual(Body, Got).
+
+%% h2:respond/5 fallback: a body larger than SETTINGS_MAX_FRAME_SIZE cannot be
+%% coalesced into one frame, so respond/5 falls back to the granular path. The
+%% full body must still arrive intact across multiple DATA frames.
+respond_large_body_fallback(Config) ->
+    Body = binary:copy(<<"x">>, 100000),
+    {Status, Got} = respond_roundtrip(Config, Body),
+    ?assertEqual(200, Status),
+    ?assertEqual(Body, Got).
+
+respond_roundtrip(_Config, Body) ->
+    Handler = fun(Conn, Sid, _M, _P, _H) ->
+        ok = h2:respond(Conn, Sid, 200,
+                        [{<<"content-type">>, <<"text/plain">>}], Body)
+    end,
+    {ok, Ref} = h2:start_server(0, #{transport => tcp, handler => Handler}),
+    Port = h2:server_port(Ref),
+    try
+        {ok, Conn} = h2:connect("127.0.0.1", Port, #{transport => tcp}),
+        ok = h2:wait_connected(Conn),
+        {ok, Sid} = h2:request(Conn, <<"GET">>, <<"/">>,
+                               [{<<":authority">>, <<"127.0.0.1">>}]),
+        Status = receive
+            {h2, Conn, {response, Sid, St, _H}} -> St
+        after 4000 -> ct:fail(response_timeout)
+        end,
+        Got = collect_body(Conn, Sid, <<>>),
+        h2:close(Conn),
+        {Status, Got}
+    after
+        h2:stop_server(Ref)
+    end.
+
+collect_body(Conn, Sid, Acc) ->
+    receive
+        {h2, Conn, {data, Sid, D, true}}  -> <<Acc/binary, D/binary>>;
+        {h2, Conn, {data, Sid, D, false}} -> collect_body(Conn, Sid, <<Acc/binary, D/binary>>)
+    after 4000 -> ct:fail({body_timeout, Acc})
     end.

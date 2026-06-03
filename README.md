@@ -94,6 +94,22 @@ Port = h2:server_port(Server),
 ok = h2:stop_server(Server).
 ```
 
+For the common headers-plus-body response, `h2:respond/5` sends both in a single
+call and a single socket write (HEADERS coalesced with DATA), instead of the two
+round-trips of `send_response/4` + `send_data/4`. It falls back to the granular
+path automatically when the response cannot be coalesced (oversized headers or
+body, CONNECT tunnels):
+
+```erlang
+Handler = fun(Conn, StreamId, <<"GET">>, <<"/">>, _Headers) ->
+    h2:respond(Conn, StreamId, 200, [{<<"content-type">>, <<"text/plain">>}],
+               <<"Hello HTTP/2!">>)
+end.
+```
+
+Use the granular `send_response/4` + `send_data/4` (or `send_data/4` in chunks)
+when the body is streamed or produced incrementally.
+
 Options to `h2:start_server/2,3`:
 
 ```erlang
