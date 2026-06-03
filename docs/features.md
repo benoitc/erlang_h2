@@ -62,6 +62,7 @@ h2:start_server/2,3
 h2:stop_server/1
 h2:server_port/1
 h2:send_response/4
+h2:respond/5            %% combined headers+body fast path (one call, one write)
 
 %% Inspection
 h2:get_settings/1
