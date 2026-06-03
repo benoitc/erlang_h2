@@ -33,8 +33,12 @@
 -record(hpack_context, {
     max_table_size = ?DEFAULT_HEADER_TABLE_SIZE :: non_neg_integer(),
     table_size = 0 :: non_neg_integer(),
-    dynamic_table = [] :: [{binary(), binary()}],
-    %% Cached length of dynamic_table to avoid O(n) length/1 on every lookup.
+    %% Dynamic table as a map keyed by a monotonic insertion sequence, giving
+    %% O(1) indexed lookup, insert, and oldest-eviction. HPACK dynamic index i
+    %% (1 = newest) maps to sequence (dynamic_newest - (i - 1)); the oldest live
+    %% sequence is (dynamic_newest - dynamic_table_length + 1).
+    dynamic_entries = #{} :: #{pos_integer() => {binary(), binary()}},
+    dynamic_newest = 0 :: non_neg_integer(),
     dynamic_table_length = 0 :: non_neg_integer(),
     %% RFC 7541 §4.2: when the peer lowers SETTINGS_HEADER_TABLE_SIZE,
     %% the next header block MUST begin with one or more dynamic-table
@@ -425,27 +429,40 @@ find_in_static(Name, Value) ->
             end
     end.
 
-find_in_dynamic(Name, Value, #hpack_context{dynamic_table = DynTable}) ->
-    find_in_dynamic(Name, Value, DynTable, ?HPACK_STATIC_TABLE_SIZE + 1, not_found).
+%% Encoder reverse lookup: scan the dynamic table from newest (DynIndex 1) to
+%% oldest. O(n) over the dynamic table, but this is the response-encode path
+%% with a small table, not the hot request-decode path.
+find_in_dynamic(Name, Value, #hpack_context{dynamic_entries = Entries,
+                                            dynamic_newest = Newest,
+                                            dynamic_table_length = Len}) ->
+    find_in_dynamic(Name, Value, Entries, Newest, 1, Len, not_found).
 
-find_in_dynamic(_Name, _Value, [], _Index, NameMatch) ->
+find_in_dynamic(_Name, _Value, _Entries, _Newest, DynIndex, Len, NameMatch)
+  when DynIndex > Len ->
     NameMatch;
-find_in_dynamic(Name, Value, [{Name, Value}|_], Index, _NameMatch) ->
-    {indexed, Index};
-find_in_dynamic(Name, Value, [{Name, _}|Rest], Index, not_found) ->
-    find_in_dynamic(Name, Value, Rest, Index + 1, {name_indexed, Index});
-find_in_dynamic(Name, Value, [_|Rest], Index, NameMatch) ->
-    find_in_dynamic(Name, Value, Rest, Index + 1, NameMatch).
+find_in_dynamic(Name, Value, Entries, Newest, DynIndex, Len, NameMatch) ->
+    Index = ?HPACK_STATIC_TABLE_SIZE + DynIndex,
+    case maps:get(Newest - (DynIndex - 1), Entries) of
+        {Name, Value} ->
+            {indexed, Index};
+        {Name, _} when NameMatch =:= not_found ->
+            find_in_dynamic(Name, Value, Entries, Newest, DynIndex + 1, Len,
+                            {name_indexed, Index});
+        _ ->
+            find_in_dynamic(Name, Value, Entries, Newest, DynIndex + 1, Len,
+                            NameMatch)
+    end.
 
 lookup(Index, _Ctx) when Index >= 1, Index =< ?HPACK_STATIC_TABLE_SIZE ->
     {Name, Value} = element(Index, persistent_term:get(?PT_STATIC_TABLE)),
     {ok, Name, Value};
-lookup(Index, #hpack_context{dynamic_table = DynTable,
+lookup(Index, #hpack_context{dynamic_entries = Entries,
+                             dynamic_newest = Newest,
                              dynamic_table_length = Len}) ->
     DynIndex = Index - ?HPACK_STATIC_TABLE_SIZE,
     if
         DynIndex >= 1, DynIndex =< Len ->
-            {Name, Value} = lists:nth(DynIndex, DynTable),
+            {Name, Value} = maps:get(Newest - (DynIndex - 1), Entries),
             {ok, Name, Value};
         true ->
             error
@@ -454,12 +471,13 @@ lookup(Index, #hpack_context{dynamic_table = DynTable,
 lookup_name(Index, _Ctx) when Index >= 1, Index =< ?HPACK_STATIC_TABLE_SIZE ->
     {Name, _} = element(Index, persistent_term:get(?PT_STATIC_TABLE)),
     Name;
-lookup_name(Index, #hpack_context{dynamic_table = DynTable,
+lookup_name(Index, #hpack_context{dynamic_entries = Entries,
+                                  dynamic_newest = Newest,
                                   dynamic_table_length = Len}) ->
     DynIndex = Index - ?HPACK_STATIC_TABLE_SIZE,
     if
         DynIndex >= 1, DynIndex =< Len ->
-            {Name, _} = lists:nth(DynIndex, DynTable),
+            {Name, _} = maps:get(Newest - (DynIndex - 1), Entries),
             Name;
         true ->
             error
@@ -469,27 +487,28 @@ add_to_dynamic_table(Name, Value, Ctx) ->
     EntrySize = entry_size(Name, Value),
     Ctx1 = evict_to_fit(EntrySize, Ctx),
     #hpack_context{
-        dynamic_table = DynTable,
+        dynamic_entries = Entries,
+        dynamic_newest = Newest,
         dynamic_table_length = Len,
         table_size = TableSize,
         max_table_size = MaxSize
     } = Ctx1,
     if
         EntrySize > MaxSize ->
-            %% Entry too large, clear table
-            Ctx1#hpack_context{dynamic_table = [], dynamic_table_length = 0,
-                               table_size = 0};
+            %% Entry too large for the table: RFC 7541 §4.4 clears it entirely.
+            Ctx1#hpack_context{dynamic_entries = #{}, dynamic_newest = 0,
+                               dynamic_table_length = 0, table_size = 0};
         true ->
+            NewSeq = Newest + 1,
             Ctx1#hpack_context{
-                dynamic_table = [{Name, Value}|DynTable],
+                dynamic_entries = maps:put(NewSeq, {Name, Value}, Entries),
+                dynamic_newest = NewSeq,
                 dynamic_table_length = Len + 1,
                 table_size = TableSize + EntrySize
             }
     end.
 
 evict_to_fit(NewEntrySize, #hpack_context{
-    dynamic_table = DynTable,
-    dynamic_table_length = Len,
     table_size = TableSize,
     max_table_size = MaxSize
 } = Ctx) ->
@@ -498,20 +517,24 @@ evict_to_fit(NewEntrySize, #hpack_context{
         TableSize =< TargetSize ->
             Ctx;
         true ->
-            %% Reverse once (oldest first), drop from front until under target.
-            Reversed = lists:reverse(DynTable),
-            {Kept, NewSize, NewLen} = drop_until(Reversed, TableSize, Len, TargetSize),
-            Ctx#hpack_context{dynamic_table = lists:reverse(Kept),
-                              dynamic_table_length = NewLen,
-                              table_size = NewSize}
+            evict_oldest(Ctx, TargetSize)
     end.
 
-drop_until([], _Size, _Len, _Target) ->
-    {[], 0, 0};
-drop_until(List, Size, Len, Target) when Size =< Target ->
-    {List, Size, Len};
-drop_until([{N, V}|Rest], Size, Len, Target) ->
-    drop_until(Rest, Size - entry_size(N, V), Len - 1, Target).
+%% Drop oldest entries (lowest live sequence) until the table fits TargetSize.
+evict_oldest(#hpack_context{table_size = Size} = Ctx, Target) when Size =< Target ->
+    Ctx;
+evict_oldest(#hpack_context{dynamic_table_length = 0} = Ctx, _Target) ->
+    Ctx#hpack_context{dynamic_newest = 0, table_size = 0};
+evict_oldest(#hpack_context{dynamic_entries = Entries, dynamic_newest = Newest,
+                            dynamic_table_length = Len,
+                            table_size = Size} = Ctx, Target) ->
+    OldestSeq = Newest - Len + 1,
+    {N, V} = maps:get(OldestSeq, Entries),
+    evict_oldest(Ctx#hpack_context{
+        dynamic_entries = maps:remove(OldestSeq, Entries),
+        dynamic_table_length = Len - 1,
+        table_size = Size - entry_size(N, V)
+    }, Target).
 
 entry_size(Name, Value) ->
     byte_size(Name) + byte_size(Value) + 32.
