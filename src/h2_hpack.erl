@@ -25,6 +25,9 @@
 -define(PT_HUFFMAN_ENCODE, {?MODULE, huffman_encode_tuple}).
 -define(PT_HUFFMAN_DECODE, {?MODULE, huffman_decode_sorted}).
 -define(PT_STATIC_TABLE,   {?MODULE, static_table_tuple}).
+%% Encoder lookups: {Name,Value} -> Index (exact) and Name -> first Index.
+-define(PT_STATIC_EXACT,   {?MODULE, static_exact_index}).
+-define(PT_STATIC_NAME,    {?MODULE, static_name_index}).
 
 %% Context record for encoder/decoder state
 -record(hpack_context, {
@@ -158,12 +161,33 @@ set_peer_max_table_size(Max, #hpack_context{peer_max_table_size = OldMax} = Ctx)
 init_tables() ->
     persistent_term:put(?PT_HUFFMAN_ENCODE,
                         list_to_tuple(?HUFFMAN_ENCODE_TABLE)),
-    persistent_term:put(?PT_HUFFMAN_DECODE,
-                        lists:sort(fun({_, _, L1}, {_, _, L2}) -> L1 =< L2 end,
-                                   ?HUFFMAN_ENCODE_TABLE)),
+    %% Decoder: {SortedDistinctLengths, #{{Len,Code} => Sym}}. Huffman codes are
+    %% prefix-free, so trying lengths shortest-first yields at most one match per
+    %% length; each check is an O(1) map lookup instead of a full table scan.
+    DecMap = maps:from_list([{{Len, Code}, Sym}
+                             || {Sym, Code, Len} <- ?HUFFMAN_ENCODE_TABLE]),
+    DecLens = lists:usort([Len || {_, _, Len} <- ?HUFFMAN_ENCODE_TABLE]),
+    persistent_term:put(?PT_HUFFMAN_DECODE, {DecLens, DecMap}),
     persistent_term:put(?PT_STATIC_TABLE,
                         list_to_tuple(?STATIC_TABLE)),
+    {StaticExact, StaticName} = build_static_indices(?STATIC_TABLE),
+    persistent_term:put(?PT_STATIC_EXACT, StaticExact),
+    persistent_term:put(?PT_STATIC_NAME, StaticName),
     ok.
+
+%% Build the encoder index maps from the static table. Exact map keys every
+%% {Name,Value} pair to its index; name map keys each Name to its first index
+%% (matching the original linear scan, which returned the first name match).
+build_static_indices(Table) ->
+    {Exact, Name, _} = lists:foldl(
+        fun({N, V}, {ExAcc, NmAcc, Idx}) ->
+            NmAcc1 = case maps:is_key(N, NmAcc) of
+                true  -> NmAcc;
+                false -> NmAcc#{N => Idx}
+            end,
+            {ExAcc#{{N, V} => Idx}, NmAcc1, Idx + 1}
+        end, {#{}, #{}, 1}, Table),
+    {Exact, Name}.
 
 %% @doc Encode a list of headers.
 -spec encode(headers(), context()) -> {binary(), context()}.
@@ -391,16 +415,15 @@ find_header(Name, Value, Ctx) ->
     end.
 
 find_in_static(Name, Value) ->
-    find_in_static(Name, Value, ?STATIC_TABLE, 1, not_found).
-
-find_in_static(_Name, _Value, [], _Index, NameMatch) ->
-    NameMatch;
-find_in_static(Name, Value, [{Name, Value}|_], Index, _NameMatch) ->
-    {indexed, Index};
-find_in_static(Name, Value, [{Name, _}|Rest], Index, not_found) ->
-    find_in_static(Name, Value, Rest, Index + 1, {name_indexed, Index});
-find_in_static(Name, Value, [_|Rest], Index, NameMatch) ->
-    find_in_static(Name, Value, Rest, Index + 1, NameMatch).
+    case maps:find({Name, Value}, persistent_term:get(?PT_STATIC_EXACT)) of
+        {ok, Index} ->
+            {indexed, Index};
+        error ->
+            case maps:find(Name, persistent_term:get(?PT_STATIC_NAME)) of
+                {ok, NameIndex} -> {name_indexed, NameIndex};
+                error           -> not_found
+            end
+    end.
 
 find_in_dynamic(Name, Value, #hpack_context{dynamic_table = DynTable}) ->
     find_in_dynamic(Name, Value, DynTable, ?HPACK_STATIC_TABLE_SIZE + 1, not_found).
@@ -597,24 +620,25 @@ decode_symbols(Bits, MoreBytes, Acc, Table) ->
             Err
     end.
 
-%% Match a Huffman code from the bit buffer
-match_huffman_code(Bits, Table) ->
-    match_huffman_code(Bits, Table, bit_size(Bits)).
+%% Match a Huffman code from the bit buffer. Table = {SortedLengths, Map}.
+match_huffman_code(Bits, {Lengths, Map}) ->
+    match_huffman_code(Bits, Lengths, Map, bit_size(Bits)).
 
-match_huffman_code(_Bits, [], _BitSize) ->
+match_huffman_code(_Bits, [], _Map, _BitSize) ->
+    %% No code length fit the available bits; need another byte.
     need_more;
-match_huffman_code(Bits, [{Sym, Code, Len}|Rest], BitSize) when Len =< BitSize ->
+match_huffman_code(Bits, [Len|Rest], Map, BitSize) when Len =< BitSize ->
     <<Test:Len, Remaining/bits>> = Bits,
-    if
-        Test == Code, Sym =< 255 ->
+    case Map of
+        #{{Len, Test} := Sym} when Sym =< 255 ->
             {ok, Sym, Remaining};
-        Test == Code, Sym == 256 ->
+        #{{Len, Test} := 256} ->
             {error, eos_in_string};
-        true ->
-            match_huffman_code(Bits, Rest, BitSize)
+        _ ->
+            match_huffman_code(Bits, Rest, Map, BitSize)
     end;
-match_huffman_code(_Bits, [{_, _, Len}|_], BitSize) when Len > BitSize ->
-    %% All remaining codes are longer than available bits
+match_huffman_code(_Bits, [Len|_], _Map, BitSize) when Len > BitSize ->
+    %% Lengths are sorted ascending, so every remaining code is too long.
     need_more.
 
 -ifdef(TEST).

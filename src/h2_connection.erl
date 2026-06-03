@@ -487,6 +487,31 @@ settings({call, From}, activate, State) ->
     %% Already activated on transition out of preface; idempotent.
     {keep_state, State, [{reply, From, ok}]};
 
+%% A server may send response frames before the peer ACKs the server's SETTINGS:
+%% it has already sent its own SETTINGS and received the client preface, so it is
+%% allowed to respond. Clients pipeline requests right after the preface
+%% (RFC 9113 §3.4); the per-request handler must not have its response dropped
+%% just because the SETTINGS-ACK has not arrived yet. Handle the response-side
+%% calls here exactly as `connected` does (the connection stays in `settings`
+%% until the ACK arrives, then transitions normally).
+settings({call, From}, {send_response, StreamId, Status, Headers}, State) ->
+    handle_send_response(From, StreamId, Status, Headers, State);
+
+settings({call, From}, {send_data, StreamId, Data, EndStream}, State) ->
+    handle_send_data(From, StreamId, Data, EndStream, State);
+
+settings({call, From}, {send_trailers, StreamId, Trailers}, State) ->
+    handle_send_trailers(From, StreamId, Trailers, State);
+
+settings({call, From}, {cancel_stream, StreamId, ErrorCode}, State) ->
+    handle_cancel_stream(From, StreamId, ErrorCode, State);
+
+settings({call, From}, {set_stream_handler, StreamId, Pid, Opts}, State) ->
+    handle_set_stream_handler(From, StreamId, Pid, Opts, State);
+
+settings({call, From}, {unset_stream_handler, StreamId}, State) ->
+    handle_unset_stream_handler(From, StreamId, State);
+
 settings({call, From}, Request, State) ->
     handle_call_early(From, Request, settings, State);
 
@@ -1327,7 +1352,13 @@ handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State) ->
             IsTunnel = Stream#stream.request_method =:= <<"CONNECT">>
                        andalso Status >= 200 andalso Status < 300,
             Stream1 = Stream#stream{
-                state = stream_state_after_end(EndStream),
+                %% Apply the remote END_STREAM (or its absence) to the stream's
+                %% *current* state. A client stream is already half_closed_local
+                %% after sending its request; response HEADERS without END_STREAM
+                %% must not reset it to `open` (that would leave the stream stuck
+                %% in half_closed_remote after the final DATA, never reaching
+                %% closed). Mirrors handle_data_frame's transition.
+                state = apply_remote_end(Stream#stream.state, EndStream),
                 response_headers = Headers,
                 response_seen_final = true,
                 tunnel = IsTunnel,
@@ -1406,6 +1437,13 @@ end_stream_body_mismatch(_, _)                  -> false.
 
 stream_state_after_end(true)  -> half_closed_remote;
 stream_state_after_end(false) -> open.
+
+%% Transition a stream on a received END_STREAM (or its absence), preserving any
+%% prior local half-close. Same rule as handle_data_frame's end-of-stream block.
+apply_remote_end(StreamState, false) -> StreamState;
+apply_remote_end(open, true)              -> half_closed_remote;
+apply_remote_end(half_closed_local, true) -> closed;
+apply_remote_end(Other, true)             -> Other.
 
 strip_pseudo(Headers) ->
     lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers).
@@ -2683,8 +2721,8 @@ settings_to_list(Settings) ->
 %% an in-flight gen_statem:call cannot reply ok to the user after the
 %% socket has died.
 send_frame(Frame, #state{socket = Socket, transport = Transport}) ->
-    Bin = h2_frame:encode(Frame),
-    Transport:send(Socket, Bin).
+    %% iodata: DATA payloads are sent without an extra body copy.
+    Transport:send(Socket, h2_frame:encode_iodata(Frame)).
 
 send_goaway_frame(LastStreamId, ErrorCode, #state{socket = Socket, transport = Transport} = State) ->
     Frame = h2_frame:goaway(LastStreamId, ErrorCode, <<>>),

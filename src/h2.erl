@@ -413,6 +413,7 @@ build_server_ssl_opts(Cert, Key, Opts) ->
                 {reuseaddr, true},
                 {active, false},
                 {mode, binary},
+                {backlog, maps:get(backlog, Opts, 1024)},
                 {verify, Verify}
             ],
             Auth = case CACerts of
@@ -434,7 +435,8 @@ start_server_tcp(Port, Opts) ->
                 {reuseaddr, true},
                 {active, false},
                 {mode, binary},
-                {packet, raw}
+                {packet, raw},
+                {backlog, maps:get(backlog, Opts, 1024)}
             ] ++ socket_addr_opts(Opts),
             case gen_tcp:listen(Port, TCPOpts) of
                 {ok, ListenSocket} ->
