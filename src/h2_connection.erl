@@ -26,6 +26,7 @@
 -export([send_goaway/1, send_goaway/2, close/1]).
 -export([get_settings/1, get_peer_settings/1]).
 -export([controlling_process/2]).
+-export([verify_stream_counts/1]).
 
 %% gen_statem callbacks
 -export([init/1, callback_mode/0, terminate/3, code_change/4]).
@@ -136,6 +137,13 @@
 
     %% Streams
     streams = #{} :: #{non_neg_integer() => #stream{}},
+    %% Incrementally maintained stream counters, kept in sync by put_stream/3.
+    %% Avoid folding the whole `streams` map (which also holds retained closed
+    %% streams) on every new stream. See put_stream/3 and stream_count_delta/4.
+    %% active: streams whose state =/= closed (any initiator).
+    %% peer_active: peer-initiated streams in open / half_closed_*.
+    active_stream_count = 0 :: non_neg_integer(),
+    peer_active_stream_count = 0 :: non_neg_integer(),
     %% FIFO of closed stream ids in close order, bounded by ?CLOSED_STREAMS_LIMIT.
     %% When the limit is exceeded the oldest id is evicted from `streams`.
     closed_streams = queue:new() :: queue:queue(non_neg_integer()),
@@ -1148,21 +1156,10 @@ peer_stream_limit_exceeded(Mode, #state{local_settings = Settings} = State) ->
             count_peer_active_streams(Mode, State) >= N
     end.
 
-count_peer_active_streams(Mode, #state{streams = Streams}) ->
-    IsPeerInitiated = fun(Id) ->
-        case Mode of
-            server -> Id rem 2 =:= 1;  %% peer = client (odd ids)
-            client -> Id rem 2 =:= 0   %% peer = server (even ids, e.g. push)
-        end
-    end,
-    maps:fold(fun(Id, #stream{state = S}, Acc) ->
-        case IsPeerInitiated(Id)
-             andalso (S =:= open orelse S =:= half_closed_local
-                      orelse S =:= half_closed_remote) of
-            true  -> Acc + 1;
-            false -> Acc
-        end
-    end, 0, Streams).
+%% O(1): peer_active_stream_count is kept in sync by put_stream/3. Mode is
+%% already baked into the counter (the connection's mode is fixed).
+count_peer_active_streams(_Mode, #state{peer_active_stream_count = N}) ->
+    N.
 
 %% RFC 9113 §6.10: CONTINUATION is only valid immediately after a
 %% HEADERS/PUSH_PROMISE/CONTINUATION without END_HEADERS on the same stream.
@@ -1885,9 +1882,7 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
                             end,
 
                             {Stream3, State1} = dispatch_data(StreamId, Stream2, Data, EndStream, State0a),
-                            State2 = State1#state{
-                                streams = maps:put(StreamId, Stream3, State1#state.streams)
-                            },
+                            State2 = put_stream(StreamId, Stream3, State1),
 
                             State3 = maybe_send_window_update(StreamId, FlowControlled, State2),
 
@@ -2079,9 +2074,9 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
 
                     case send_header_block(StreamId, HeaderBlock, EndStream, State) of
                         ok ->
-                            State1 = State#state{
+                            State0 = put_stream(StreamId, Stream, State),
+                            State1 = State0#state{
                                 encode_context = EncCtx1,
-                                streams = maps:put(StreamId, Stream, State#state.streams),
                                 next_stream_id = StreamId + 2
                             },
                             {keep_state, State1, [{reply, From, {ok, StreamId}}]};
@@ -2151,9 +2146,9 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
             },
             case send_header_block(StreamId, HeaderBlock, EndStream, State) of
                 ok ->
-                    State1 = State#state{
+                    State0 = put_stream(StreamId, Stream, State),
+                    State1 = State0#state{
                         encode_context = EncCtx1,
-                        streams = maps:put(StreamId, Stream, State#state.streams),
                         next_stream_id = StreamId + 2
                     },
                     {keep_state, State1, [{reply, From, {ok, StreamId}}]};
@@ -2222,10 +2217,8 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
                                                     tunnel = NewTunnel,
                                                     body_forbidden = BodyForbidden,
                                                     state = NewState},
-                            State1 = State#state{
-                                encode_context = EncCtx1,
-                                streams = maps:put(StreamId, Stream1, Streams)
-                            },
+                            State0 = put_stream(StreamId, Stream1, State),
+                            State1 = State0#state{encode_context = EncCtx1},
                             State2 = case NewState of
                                 closed -> close_stream(StreamId, end_stream, State1);
                                 _      -> State1
@@ -2331,16 +2324,16 @@ handle_respond(From, _StreamId, _Status, _Headers, _Body, State) ->
 %% half_closed_remote->closed transition used by the granular send path.
 finish_respond(From, StreamId, #stream{window_size = StreamWindow} = Stream,
                AllHeaders, EncCtx1, OldState, BodySize,
-               #state{streams = Streams, conn_window_size = ConnWindow} = State) ->
+               #state{conn_window_size = ConnWindow} = State) ->
     NewSt = case OldState of
         open -> half_closed_local;
         half_closed_remote -> closed
     end,
     Stream1 = Stream#stream{response_headers = AllHeaders, state = NewSt,
                             window_size = StreamWindow - BodySize},
-    State1 = State#state{encode_context = EncCtx1,
-                         conn_window_size = ConnWindow - BodySize,
-                         streams = maps:put(StreamId, Stream1, Streams)},
+    State0 = put_stream(StreamId, Stream1, State),
+    State1 = State0#state{encode_context = EncCtx1,
+                          conn_window_size = ConnWindow - BodySize},
     State2 = case NewSt of
         closed -> close_stream(StreamId, end_stream, State1);
         _      -> State1
@@ -2447,10 +2440,8 @@ handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams, encode_
                         end
                     },
 
-                    State1 = State#state{
-                        encode_context = EncCtx1,
-                        streams = maps:put(StreamId, Stream1, Streams)
-                    },
+                    State0 = put_stream(StreamId, Stream1, State),
+                    State1 = State0#state{encode_context = EncCtx1},
 
                     case Stream1#stream.state of
                         closed ->
@@ -2631,28 +2622,67 @@ get_or_create_stream(StreamId, #state{streams = Streams,
             }
     end.
 
-put_stream(StreamId, Stream, #state{streams = Streams} = State) ->
-    State#state{streams = maps:put(StreamId, Stream, Streams)}.
+%% Single choke point for stream-map writes. Adjusts the maintained counters by
+%% comparing the stream's old state (from the map) to its new state, so the two
+%% count_* functions stay O(1). The only deletion from `streams` is closed-stream
+%% eviction (count 0), so removals never need adjustment.
+put_stream(StreamId, Stream, #state{streams = Streams, mode = Mode,
+                                    active_stream_count = AC,
+                                    peer_active_stream_count = PC} = State) ->
+    OldState = case maps:find(StreamId, Streams) of
+                   {ok, #stream{state = OS}} -> OS;
+                   error -> undefined
+               end,
+    {DA, DP} = stream_count_delta(StreamId, Mode, OldState, Stream#stream.state),
+    State#state{streams = maps:put(StreamId, Stream, Streams),
+                active_stream_count = AC + DA,
+                peer_active_stream_count = PC + DP}.
+
+%% Count-membership delta for a stream transitioning OldState -> NewState.
+%% `undefined` OldState means the stream was absent (insert).
+stream_count_delta(Id, Mode, OldState, NewState) ->
+    {b2i(is_active_state(NewState)) - b2i(is_active_state(OldState)),
+     b2i(is_peer_active(Id, Mode, NewState))
+         - b2i(is_peer_active(Id, Mode, OldState))}.
+
+is_active_state(closed)    -> false;
+is_active_state(undefined) -> false;
+is_active_state(_)         -> true.
+
+is_peer_active(Id, Mode, S) ->
+    is_peer_initiated(Id, Mode)
+        andalso (S =:= open orelse S =:= half_closed_local
+                 orelse S =:= half_closed_remote).
+
+%% Stream-id parity fixes the initiator for the stream's whole life.
+is_peer_initiated(Id, server) -> Id rem 2 =:= 1;   %% peer = client (odd ids)
+is_peer_initiated(Id, client) -> Id rem 2 =:= 0.   %% peer = server (even ids, push)
+
+b2i(true)  -> 1;
+b2i(false) -> 0.
 
 %% Mark a stream closed with an explicit reason and retain its record so
 %% later frames can be classified correctly per RFC 9113 §5.1.
 %% Reason: `end_stream` (natural close) → post-close frames are a connection
 %% error; `rst` (peer or local RST_STREAM) → post-close frames are a stream
 %% error. The FIFO is capped so memory stays bounded.
-close_stream(StreamId, Reason, #state{streams = Streams,
-                                       closed_streams = Q,
-                                       closed_streams_count = N,
-                                       closed_reasons = Reasons,
-                                       closed_reasons_q = RQ,
-                                       closed_reasons_count = RN} = State) ->
-    Streams1 = case maps:find(StreamId, Streams) of
+close_stream(StreamId, Reason, #state{streams = Streams} = State0) ->
+    %% Flip state via put_stream/3 so the counters are decremented once
+    %% (idempotent: a stream already closed has Old = closed, delta 0).
+    State = case maps:find(StreamId, Streams) of
         {ok, Stream} ->
-            maps:put(StreamId, Stream#stream{state = closed,
-                                             closed_reason = Reason},
-                     Streams);
+            put_stream(StreamId,
+                       Stream#stream{state = closed, closed_reason = Reason},
+                       State0);
         error ->
-            Streams
+            State0
     end,
+    #state{streams = Streams1,
+           closed_streams = Q,
+           closed_streams_count = N,
+           closed_reasons = Reasons,
+           closed_reasons_q = RQ,
+           closed_reasons_count = RN} = State,
     Q1 = queue:in(StreamId, Q),
     N1 = N + 1,
     {Streams2, Q2, N2} = evict_old_closed(Streams1, Q1, N1),
@@ -2677,13 +2707,27 @@ evict_old_reasons(Reasons, Q, N) ->
     {{value, OldId}, Q1} = queue:out(Q),
     evict_old_reasons(maps:remove(OldId, Reasons), Q1, N - 1).
 
-count_active_streams(#state{streams = Streams}) ->
-    maps:fold(fun(_Id, #stream{state = S}, Acc) ->
-        case S of
-            closed -> Acc;
-            _ -> Acc + 1
-        end
-    end, 0, Streams).
+%% O(1): active_stream_count is kept in sync by put_stream/3.
+count_active_streams(#state{active_stream_count = N}) ->
+    N.
+
+%% @doc Test/debug invariant: recompute the stream counters by folding the live
+%% `streams` map and compare against the incrementally maintained fields.
+%% Returns `ok' when they agree, `{mismatch, ...}' otherwise.
+-spec verify_stream_counts(pid()) -> ok | {mismatch, map()}.
+verify_stream_counts(Pid) ->
+    {_StateName, #state{mode = Mode, streams = Streams,
+                        active_stream_count = AC,
+                        peer_active_stream_count = PC}} = sys:get_state(Pid),
+    {RA, RP} = maps:fold(fun(Id, #stream{state = S}, {A, P}) ->
+        {A + b2i(is_active_state(S)),
+         P + b2i(is_peer_active(Id, Mode, S))}
+    end, {0, 0}, Streams),
+    case {AC, PC} of
+        {RA, RP} -> ok;
+        _ -> {mismatch, #{active => AC, recomputed_active => RA,
+                          peer_active => PC, recomputed_peer_active => RP}}
+    end.
 
 flush_send_buffers(#state{streams = Streams} = State) ->
     maps:fold(fun(StreamId, _Stream, AccState) ->
@@ -2754,10 +2798,8 @@ flush_stream_one_chunk(StreamId, #state{streams = Streams,
                                 pending_end_stream = PendingEnd andalso Remaining =/= <<>>,
                                 state = NewStreamState
                             },
-                            State1 = State#state{
-                                conn_window_size = NewConnWindow,
-                                streams = maps:put(StreamId, Stream1, Streams)
-                            },
+                            State0 = put_stream(StreamId, Stream1, State),
+                            State1 = State0#state{conn_window_size = NewConnWindow},
                             State2 = case NewStreamState =:= closed
                                          andalso StreamState =:= half_closed_remote of
                                 true  -> close_stream(StreamId, end_stream, State1);
@@ -2782,8 +2824,7 @@ flush_stream_one_chunk(StreamId, #state{streams = Streams,
 
 %% Emit an empty DATA frame with END_STREAM=1 to half-close the stream on
 %% the wire. Used when send_data was called with empty payload + EndStream.
-emit_end_stream_data(StreamId, #stream{state = StreamState} = Stream,
-                     #state{streams = Streams} = State) ->
+emit_end_stream_data(StreamId, #stream{state = StreamState} = Stream, State) ->
     Frame = h2_frame:data(StreamId, <<>>, true),
     case send_frame(Frame, State) of
         {error, Reason} ->
@@ -2796,7 +2837,7 @@ emit_end_stream_data(StreamId, #stream{state = StreamState} = Stream,
             end,
             Stream1 = Stream#stream{pending_end_stream = false,
                                     state = NewStreamState},
-            State1 = State#state{streams = maps:put(StreamId, Stream1, Streams)},
+            State1 = put_stream(StreamId, Stream1, State),
             State2 = case NewStreamState =:= closed
                          andalso StreamState =:= half_closed_remote of
                 true  -> close_stream(StreamId, end_stream, State1);
