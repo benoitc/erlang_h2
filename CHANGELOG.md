@@ -4,6 +4,15 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+### Changed
+
+- Active stream counts are maintained incrementally instead of folding the whole
+  stream map on every new stream. `count_peer_active_streams/2` (checked per
+  inbound HEADERS) and `count_active_streams/1` (checked per outbound request)
+  are now O(1) reads of counters kept in sync by `put_stream/3`, removing an
+  O(n^2) cost under stream churn. About 13% h2load throughput gain at c=100
+  m=100 over h2c. No behaviour change.
+
 ## [0.8.0] - 2026-06-03
 
 ### Added
