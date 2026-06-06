@@ -4,8 +4,19 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-06
+
 ### Changed
 
+- A response's frames are written to the socket in one `Transport:send` instead
+  of one send per frame. `flush_stream_one_chunk/2` now stages every
+  flow-control-ready DATA frame (chunked to `peer_max_frame_size`, bounded by a
+  1 MiB coalescing cap) into a single write, and the `respond/5` fast path writes
+  `[HEADERS | DATA...]` in one go. A 100 KiB TLS response drops from 8 socket
+  writes to 1, cutting the per-frame gen_statem round-trips and TLS-record AEAD
+  encryptions; large-body throughput roughly doubles (~37k -> ~65k req/s on
+  h2load `-c64 -m32` over TLS). Flow control, framing and the public API are
+  unchanged; multi-megabyte bodies still yield between cap-sized batches.
 - Active stream counts are maintained incrementally instead of folding the whole
   stream map on every new stream. `count_peer_active_streams/2` (checked per
   inbound HEADERS) and `count_active_streams/1` (checked per outbound request)

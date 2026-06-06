@@ -66,6 +66,14 @@
 %% instead of growing the connection process indefinitely.
 -define(MAX_SEND_BUFFER_BYTES, 1024 * 1024).
 
+%% Upper bound on the body bytes staged into a single coalesced socket write.
+%% flush_stream_one_chunk/2 batches every flow-control-ready DATA frame into one
+%% Transport:send instead of one send per frame; this caps the per-write iolist
+%% so a large window cannot build an unbounded binary. Bodies past this still
+%% drain via the existing {flush_stream,_} self-cast, one write per cap-sized
+%% batch, so multi-MB responses keep yielding to inbound frames.
+-define(MAX_COALESCED_BODY_BYTES, 1024 * 1024).
+
 %% Stream states per RFC 7540 Section 5.1
 -record(stream, {
     id :: non_neg_integer(),
@@ -415,7 +423,7 @@ terminate(Reason, _StateName, #state{socket = Socket, transport = Transport, goa
     case GoawaySent of
         false ->
             Frame = h2_frame:goaway(0, no_error, <<>>),
-            _ = Transport:send(Socket, h2_frame:encode(Frame));
+            _ = sock_send(State, h2_frame:encode_iodata(Frame));
         true ->
             ok
     end,
@@ -2250,7 +2258,6 @@ handle_send_response(From, _StreamId, _Status, _Headers, State) ->
 %% mirrors handle_send_response exactly.
 handle_respond(From, StreamId, Status, Headers, Body,
                #state{mode = server, streams = Streams, encode_context = EncCtx,
-                      socket = Socket, transport = Transport,
                       conn_window_size = ConnWindow,
                       peer_max_frame_size = MaxFrameSize} = State) ->
     case maps:find(StreamId, Streams) of
@@ -2285,16 +2292,19 @@ handle_respond(From, StreamId, Status, Headers, Body,
                             {stop_and_reply, {shutdown, {send_failed, R}},
                              [{reply, From, {error, R}}], State}
                     end;
-                %% Coalesce HEADERS + DATA into one write when both fit a single
-                %% frame and the body is within the peer's flow-control windows.
-                HeadersFit andalso BodySize =< MaxFrameSize
+                %% Coalesce HEADERS + every DATA frame into one write when the
+                %% whole body is within the peer's flow-control windows and the
+                %% coalesce cap. HeadersFit keeps the HEADERS within one frame;
+                %% data_frames/4 chunks the body to MaxFrameSize. BodySize > 0
+                %% here (the empty/forbidden case is handled by the branch above).
+                HeadersFit
                 andalso BodySize =< ConnWindow
-                andalso BodySize =< StreamWindow ->
+                andalso BodySize =< StreamWindow
+                andalso BodySize =< ?MAX_COALESCED_BODY_BYTES ->
                     IoData = [h2_frame:encode(
-                                h2_frame:headers(StreamId, HeaderBlock, false)),
-                              h2_frame:encode_iodata(
-                                {data, StreamId, Body, true})],
-                    case Transport:send(Socket, IoData) of
+                                h2_frame:headers(StreamId, HeaderBlock, false))
+                              | data_frames(StreamId, Body, MaxFrameSize, true)],
+                    case sock_send(State, IoData) of
                         ok ->
                             finish_respond(From, StreamId, Stream, AllHeaders,
                                            EncCtx1, St, BodySize, State);
@@ -2365,6 +2375,21 @@ send_continuations(StreamId, Rest, MaxFrameSize, State) ->
         ok -> send_continuations(StreamId, More, MaxFrameSize, State);
         {error, _} = Err -> Err
     end.
+
+%% Build an iolist of DATA frames covering Body, each at most MaxFrameSize, so
+%% the whole batch goes out in one socket write. END_STREAM is set only on the
+%% final frame, and only when End is true. An empty Body yields no frame unless
+%% End is set (then a single empty END_STREAM frame). Pure: no socket, no state.
+data_frames(_StreamId, <<>>, _MaxFrameSize, false) ->
+    [];
+data_frames(StreamId, <<>>, _MaxFrameSize, true) ->
+    [h2_frame:encode_iodata({data, StreamId, <<>>, true})];
+data_frames(StreamId, Bin, MaxFrameSize, End) when byte_size(Bin) =< MaxFrameSize ->
+    [h2_frame:encode_iodata({data, StreamId, Bin, End})];
+data_frames(StreamId, Bin, MaxFrameSize, End) ->
+    <<Chunk:MaxFrameSize/binary, Rest/binary>> = Bin,
+    [h2_frame:encode_iodata({data, StreamId, Chunk, false})
+     | data_frames(StreamId, Rest, MaxFrameSize, End)].
 
 %% RFC 7540 §8.3: forbidden on a 2xx CONNECT response.
 has_banned_tunnel_header(Headers) ->
@@ -2767,16 +2792,17 @@ flush_stream_one_chunk(StreamId, #state{streams = Streams,
         {ok, #stream{send_buffer = Buffer, window_size = StreamWindow,
                      pending_end_stream = PendingEnd, state = StreamState} = Stream} ->
             Available = min(ConnWindow, StreamWindow),
-            ToSend = min(Available, byte_size(Buffer)),
-            ToSend1 = min(ToSend, MaxFrameSize),
-            case ToSend1 of
-                0 ->
+            %% Stage the whole flow-control-ready batch (bounded by the coalesce
+            %% cap) and write it in one go, chunked to MaxFrameSize frames.
+            ToSend = min(min(Available, ?MAX_COALESCED_BODY_BYTES), byte_size(Buffer)),
+            case ToSend =< 0 of
+                true ->
                     {ok, State};
-                _ ->
-                    <<SendData:ToSend1/binary, Remaining/binary>> = Buffer,
+                false ->
+                    <<SendData:ToSend/binary, Remaining/binary>> = Buffer,
                     IsEnd = PendingEnd andalso Remaining == <<>>,
-                    Frame = h2_frame:data(StreamId, SendData, IsEnd),
-                    case send_frame(Frame, State) of
+                    IoData = data_frames(StreamId, SendData, MaxFrameSize, IsEnd),
+                    case sock_send(State, IoData) of
                         {error, Reason} ->
                             {error, Reason, State};
                         ok ->
@@ -2790,8 +2816,8 @@ flush_stream_one_chunk(StreamId, #state{streams = Streams,
                                 false ->
                                     StreamState
                             end,
-                            NewConnWindow = ConnWindow - ToSend1,
-                            NewStreamWindow = StreamWindow - ToSend1,
+                            NewConnWindow = ConnWindow - ToSend,
+                            NewStreamWindow = StreamWindow - ToSend,
                             Stream1 = Stream#stream{
                                 send_buffer = Remaining,
                                 window_size = NewStreamWindow,
@@ -2850,9 +2876,9 @@ emit_end_stream_data(StreamId, #stream{state = StreamState} = Stream, State) ->
 %% Internal: Frame Sending
 %% ============================================================================
 
-send_preface(#state{socket = Socket, transport = Transport} = State) ->
+send_preface(State) ->
     %% Send connection preface (tolerate peer-close mid-send)
-    _ = Transport:send(Socket, ?H2_PREFACE),
+    _ = sock_send(State, ?H2_PREFACE),
     send_settings_frame(State).
 
 send_settings_frame(#state{local_settings = Settings, pending_settings = Pending} = State) ->
@@ -2874,20 +2900,24 @@ settings_to_list(Settings) ->
 %% Returns ok | {error, Reason}. Callers must handle errors so that
 %% an in-flight gen_statem:call cannot reply ok to the user after the
 %% socket has died.
-send_frame(Frame, #state{socket = Socket, transport = Transport}) ->
+send_frame(Frame, State) ->
     %% iodata: DATA payloads are sent without an extra body copy.
-    Transport:send(Socket, h2_frame:encode_iodata(Frame)).
+    sock_send(State, h2_frame:encode_iodata(Frame)).
 
-send_goaway_frame(LastStreamId, ErrorCode, #state{socket = Socket, transport = Transport} = State) ->
+%% Single socket-write choke point. Every frame and coalesced batch goes through
+%% here, so one Transport:send maps to one socket write (and the test traces this
+%% to count writes). Returns ok | {error, Reason} from the transport.
+sock_send(#state{socket = Socket, transport = Transport}, IoData) ->
+    Transport:send(Socket, IoData).
+
+send_goaway_frame(LastStreamId, ErrorCode, State) ->
     Frame = h2_frame:goaway(LastStreamId, ErrorCode, <<>>),
-    Bin = h2_frame:encode(Frame),
-    _ = Transport:send(Socket, Bin),
+    _ = sock_send(State, h2_frame:encode_iodata(Frame)),
     State#state{goaway_sent = true, goaway_error = ErrorCode}.
 
-send_rst_stream(StreamId, ErrorCode, #state{socket = Socket, transport = Transport}) ->
+send_rst_stream(StreamId, ErrorCode, State) ->
     Frame = h2_frame:rst_stream(StreamId, ErrorCode),
-    Bin = h2_frame:encode(Frame),
-    _ = Transport:send(Socket, Bin),
+    _ = sock_send(State, h2_frame:encode_iodata(Frame)),
     ok.
 
 %% ============================================================================
@@ -2978,6 +3008,40 @@ notify_stream(StreamId, Event, #state{streams = Streams} = State) ->
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+%% Parse a flattened iolist of DATA frames back into [{Payload, EndStream}].
+parse_data_frames(<<>>) ->
+    [];
+parse_data_frames(<<Len:24, 0:8, Flags:8, _R:1, _Sid:31,
+                    Payload:Len/binary, Rest/binary>>) ->
+    [{Payload, (Flags band 1) =:= 1} | parse_data_frames(Rest)].
+
+data_frames_test_() ->
+    Max = 16384,
+    Body = binary:copy(<<"x">>, 100 * 1024),
+    Frames = parse_data_frames(iolist_to_binary(data_frames(1, Body, Max, true))),
+    Sizes = [byte_size(P) || {P, _} <- Frames],
+    Ends  = [E || {_, E} <- Frames],
+    %% Exact multiple of Max: N full frames, END_STREAM on the last only.
+    Body2 = binary:copy(<<"y">>, 2 * Max),
+    Frames2 = parse_data_frames(iolist_to_binary(data_frames(3, Body2, Max, true))),
+    [%% 100 KiB / 16 KiB -> 7 DATA frames.
+     ?_assertEqual(7, length(Frames)),
+     %% Only the final frame carries END_STREAM.
+     ?_assertEqual([false, false, false, false, false, false, true], Ends),
+     %% Chunked to Max, last frame is the 4 KiB remainder.
+     ?_assertEqual([Max, Max, Max, Max, Max, Max, 100 * 1024 - 6 * Max], Sizes),
+     %% Reassembles to the original body.
+     ?_assertEqual(Body, iolist_to_binary([P || {P, _} <- Frames])),
+     %% Empty body without END_STREAM -> no frames.
+     ?_assertEqual([], data_frames(1, <<>>, Max, false)),
+     %% Empty body with END_STREAM -> a single empty END_STREAM frame.
+     ?_assertEqual([{<<>>, true}],
+                   parse_data_frames(iolist_to_binary(
+                       data_frames(1, <<>>, Max, true)))),
+     %% Exact multiple: two full frames, END_STREAM on the second.
+     ?_assertEqual([Max, Max], [byte_size(P) || {P, _} <- Frames2]),
+     ?_assertEqual([false, true], [E || {_, E} <- Frames2])].
 
 parse_status_test_() ->
     [?_assertEqual({ok, 200}, parse_status([{<<":status">>, <<"200">>}])),
