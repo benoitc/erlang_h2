@@ -30,6 +30,9 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
     peer handler as `{stream_reset, StreamId, Code}'.
   - All additions are opt-in; default streams and the existing client/server and
     WebSocket-over-h2 (extended CONNECT) APIs are unchanged.
+  - Interop coverage in both directions: a real gRPC client (grpcurl) against an
+    h2-hosted echo service, and our h2 client against a real grpc-python echo
+    server.
 
 ### Fixed
 

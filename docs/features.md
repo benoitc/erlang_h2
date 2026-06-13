@@ -130,5 +130,6 @@ Useful to know when extending or debugging:
 - `rebar3 ct --suite=test/h2_compliance_SUITE` — 81 Common Test cases: RFC compliance, client/server round-trips, CONNECT and Extended CONNECT tunnels, API-parity with `quic_h3`, malformed-message enforcement, flow-control accounting, error paths.
 - `rebar3 ct --suite=test/h2_interop_SUITE` — external interop via h2spec (generic + HPACK).
 - `rebar3 ct --suite=test/h2_grpc_interop_SUITE` — gRPC interop: a real gRPC client (grpcurl) drives an h2-hosted echo service over a bidi stream. Skipped when grpcurl is absent.
+- `rebar3 ct --suite=test/h2_grpc_client_interop_SUITE` — gRPC interop, other direction: our h2 client drives a real grpc-python echo server (identity-serialized bytes, no protobuf) over a bidi stream, exercising client half-close and flow control. Skipped when python3/grpcio is absent (set GRPC_PYTHON to pick the interpreter).
 - gRPC bidi coverage: `test/h2_grpc_tests.erl` (behavioural - interleaved roundtrip, late-handler replay, receive/send backpressure, cancel each side, goaway/closed to handler, ownership, plus small-window / many-stream / high-message-count stress) and `test/h2_grpc_frame_tests.erl` (frame vectors - exact WINDOW_UPDATE gating, RST_STREAM CANCEL, no DATA while the window is shut, and trailers queued strictly after buffered DATA).
 - `rebar3 dialyzer` / `rebar3 xref` — clean.
