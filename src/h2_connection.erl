@@ -19,8 +19,10 @@
 -export([start_link/3, start_link/4]).
 -export([activate/1]).
 -export([wait_connected/1, wait_connected/2]).
--export([send_request/4, send_request/5, send_request_headers/3, send_response/4, respond/5, send_data/3, send_data/4]).
+-export([send_request/4, send_request/5, send_request_headers/3, send_request_headers/4,
+         send_response/4, respond/5, send_data/3, send_data/4, send_data/5]).
 -export([set_stream_handler/3, set_stream_handler/4, unset_stream_handler/2]).
+-export([consume/3]).
 -export([send_trailers/3]).
 -export([cancel_stream/2, cancel_stream/3]).
 -export([send_goaway/1, send_goaway/2, close/1]).
@@ -86,10 +88,30 @@
     header_buffer_size = 0 :: non_neg_integer(),
     request_headers = [] :: [{binary(), binary()}],
     response_headers = [] :: [{binary(), binary()}],
-    %% Optional pid to receive body data for this stream (set_stream_handler).
+    %% Optional pid to receive events for this stream (set_stream_handler).
     handler :: pid() | undefined,
-    %% Data buffered before a handler is registered.
-    recv_buffer = [] :: [{binary(), boolean()}],
+    %% Where stream-scoped events go when no handler is registered yet.
+    %%   owner  -> deliver to the connection owner (default; legacy client behaviour)
+    %%   buffer -> hold in recv_buffer until a handler registers, then replay
+    %% Server streams buffer implicitly (see dispatch_stream_event_inflight/4)
+    %% to preserve the pre-existing "buffer DATA until set_stream_handler" model.
+    dispatch_mode = owner :: owner | buffer,
+    %% Events buffered before a handler is registered. Holds full event tuples
+    %% in arrival order, most-recent first (reversed on replay). Generalises the
+    %% old DATA-only buffer so response/trailers/stream_reset that race ahead of
+    %% set_stream_handler are replayed too (gRPC bidi), never dropped to the owner.
+    recv_buffer = [] :: [term()],
+    %% Receive-side flow control mode (RFC 9113 §6.9):
+    %%   auto   -> connection replenishes the stream window on dispatch (default)
+    %%   manual -> window is only replenished by an explicit consume/3 call, so a
+    %%             slow consumer applies backpressure instead of growing unbounded.
+    flow_control = auto :: auto | manual,
+    %% Bytes received but not yet acknowledged via consume/3 (manual mode only).
+    unacked = 0 :: non_neg_integer(),
+    %% Blocking send_data/5 callers parked until the send buffer drains, each with
+    %% an optional timeout timer ref. Replied `ok` on drain, `{error, timeout}` on
+    %% timer fire. Empty for the default non-blocking send path.
+    send_waiters = [] :: [{term(), reference() | undefined}],
     %% RFC 7540 §8.3: stream is a CONNECT tunnel — DATA frames carry raw
     %% bytes, END_STREAM is half-close, no trailers, no CL/TE on response.
     tunnel = false :: boolean(),
@@ -256,7 +278,18 @@ send_request(Conn, Method, Path, Headers, EndStream) ->
 -spec send_request_headers(pid(), [{binary(), binary()}], boolean()) ->
     {ok, non_neg_integer()} | {error, term()}.
 send_request_headers(Conn, Headers, EndStream) ->
-    gen_statem:call(Conn, {send_request_headers, Headers, EndStream}).
+    send_request_headers(Conn, Headers, EndStream, #{}).
+
+%% @doc Send a request with a pre-built header list and per-stream options. For
+%% gRPC bidi a dedicated call process passes `#{handler => self()}' so the
+%% stream's events route to it from creation (race-free, no owner detour), and
+%% optionally `#{flow_control => manual}' to apply receive-side backpressure.
+%% `#{defer => true}' buffers events until a later set_stream_handler/3 replays
+%% them when the handler pid is not known at creation time.
+-spec send_request_headers(pid(), [{binary(), binary()}], boolean(), map()) ->
+    {ok, non_neg_integer()} | {error, term()}.
+send_request_headers(Conn, Headers, EndStream, Opts) when is_map(Opts) ->
+    gen_statem:call(Conn, {send_request_headers, Headers, EndStream, Opts}).
 
 %% @doc Register a pid to receive body data for StreamId.
 %% By default any DATA frames that arrived before the handler was registered
@@ -299,9 +332,45 @@ send_data(Conn, StreamId, Data) ->
     send_data(Conn, StreamId, Data, false).
 
 %% @doc Send data on a stream with end_stream flag.
+%%
+%% Default (non-blocking) backpressure: when the peer's flow-control window is
+%% exhausted the data is buffered, and once the buffer would exceed the per-stream
+%% cap the call returns `{error, send_buffer_full}' so the caller backs off rather
+%% than growing the connection unboundedly.
 -spec send_data(pid(), non_neg_integer(), binary(), boolean()) -> ok | {error, term()}.
 send_data(Conn, StreamId, Data, EndStream) ->
     gen_statem:call(Conn, {send_data, StreamId, Data, EndStream}).
+
+%% @doc Send data with per-call options. `#{block => Timeout}' turns send_data
+%% into a blocking call: when the peer's window cannot accept the data yet the
+%% caller is parked (bypassing the send_buffer_full cap) until the buffer drains,
+%% returning `ok', or `{error, timeout}' if `Timeout' ms elapse first. Without
+%% `block' this behaves exactly like send_data/4.
+-spec send_data(pid(), non_neg_integer(), binary(), boolean(), map()) ->
+    ok | {error, term()}.
+send_data(Conn, StreamId, Data, EndStream, Opts) when is_map(Opts) ->
+    case maps:get(block, Opts, undefined) of
+        undefined ->
+            gen_statem:call(Conn, {send_data, StreamId, Data, EndStream});
+        Timeout ->
+            %% Give the gen_statem call a longer deadline than the flow-control
+            %% block so the {error, timeout} comes from us, not gen_statem.
+            CallTimeout = call_timeout_for(Timeout),
+            gen_statem:call(Conn, {send_data_blocking, StreamId, Data, EndStream, Timeout},
+                            CallTimeout)
+    end.
+
+call_timeout_for(infinity) -> infinity;
+call_timeout_for(Timeout) when is_integer(Timeout) -> Timeout + 1000.
+
+%% @doc Acknowledge consumption of ByteCount received bytes on a manual-flow
+%% stream, replenishing its receive window via WINDOW_UPDATE. No-op for streams
+%% in the default `auto' flow-control mode. This is the receive-side backpressure
+%% knob: a handler calls it only after it has processed data, so the peer's send
+%% window tracks consumer progress instead of growing the mailbox unboundedly.
+-spec consume(pid(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
+consume(Conn, StreamId, ByteCount) when is_integer(ByteCount), ByteCount >= 0 ->
+    gen_statem:call(Conn, {consume, StreamId, ByteCount}).
 
 %% @doc Send trailers on a stream.
 -spec send_trailers(pid(), non_neg_integer(), [{binary(), binary()}]) -> ok | {error, term()}.
@@ -429,7 +498,10 @@ terminate(Reason, _StateName, #state{socket = Socket, transport = Transport, goa
     end,
     Transport:close(Socket),
     %% Notify owner exactly once that the connection is gone.
-    notify_owner({h2, self(), {closed, peel_reason(Reason)}}, State),
+    PeeledReason = peel_reason(Reason),
+    notify_owner({h2, self(), {closed, PeeledReason}}, State),
+    %% Also tell each per-stream handler so a bidi call process can clean up.
+    notify_all_handlers({closed, PeeledReason}, State),
     ok.
 
 code_change(_OldVsn, StateName, State, _Extra) ->
@@ -528,6 +600,12 @@ settings({call, From}, {respond, StreamId, Status, Headers, Body}, State) ->
 settings({call, From}, {send_data, StreamId, Data, EndStream}, State) ->
     handle_send_data(From, StreamId, Data, EndStream, State);
 
+settings({call, From}, {send_data_blocking, StreamId, Data, EndStream, Timeout}, State) ->
+    handle_send_data_blocking(From, StreamId, Data, EndStream, Timeout, State);
+
+settings({call, From}, {consume, StreamId, ByteCount}, State) ->
+    handle_consume(From, StreamId, ByteCount, State);
+
 settings({call, From}, {send_trailers, StreamId, Trailers}, State) ->
     handle_send_trailers(From, StreamId, Trailers, State);
 
@@ -578,8 +656,14 @@ connected(info, {ssl_closed, Socket}, #state{socket = Socket} = State) ->
 connected({call, From}, {send_request, Method, Path, Headers, EndStream}, State) ->
     handle_send_request(From, Method, Path, Headers, EndStream, State);
 
-connected({call, From}, {send_request_headers, Headers, EndStream}, State) ->
-    handle_send_request_headers(From, Headers, EndStream, State);
+connected({call, From}, {send_request_headers, Headers, EndStream, Opts}, State) ->
+    handle_send_request_headers(From, Headers, EndStream, Opts, State);
+
+connected({call, From}, {send_data_blocking, StreamId, Data, EndStream, Timeout}, State) ->
+    handle_send_data_blocking(From, StreamId, Data, EndStream, Timeout, State);
+
+connected({call, From}, {consume, StreamId, ByteCount}, State) ->
+    handle_consume(From, StreamId, ByteCount, State);
 
 connected({call, From}, {send_response, StreamId, Status, Headers}, State) ->
     handle_send_response(From, StreamId, Status, Headers, State);
@@ -654,9 +738,15 @@ goaway_sent({call, From}, {send_data, StreamId, Data, EndStream}, State) ->
     %% Allow completing existing streams
     handle_send_data(From, StreamId, Data, EndStream, State);
 
+goaway_sent({call, From}, {send_data_blocking, StreamId, Data, EndStream, Timeout}, State) ->
+    handle_send_data_blocking(From, StreamId, Data, EndStream, Timeout, State);
+
+goaway_sent({call, From}, {consume, StreamId, ByteCount}, State) ->
+    handle_consume(From, StreamId, ByteCount, State);
+
 goaway_sent({call, From}, {send_request, _, _, _, _}, State) ->
     {keep_state, State, [{reply, From, {error, goaway_sent}}]};
-goaway_sent({call, From}, {send_request_headers, _, _}, State) ->
+goaway_sent({call, From}, {send_request_headers, _, _, _}, State) ->
     {keep_state, State, [{reply, From, {error, goaway_sent}}]};
 
 goaway_sent({call, From}, Request, State) ->
@@ -685,6 +775,12 @@ goaway_received(info, {ssl_closed, Socket}, #state{socket = Socket} = State) ->
 goaway_received({call, From}, {send_data, StreamId, Data, EndStream}, State) ->
     %% Allow completing existing streams
     handle_send_data(From, StreamId, Data, EndStream, State);
+
+goaway_received({call, From}, {send_data_blocking, StreamId, Data, EndStream, Timeout}, State) ->
+    handle_send_data_blocking(From, StreamId, Data, EndStream, Timeout, State);
+
+goaway_received({call, From}, {consume, StreamId, ByteCount}, State) ->
+    handle_consume(From, StreamId, ByteCount, State);
 
 goaway_received({call, From}, Request, State) ->
     handle_call_common(From, Request, goaway_received, State);
@@ -880,6 +976,9 @@ handle_frame(_StateName, {ping_ack, _Data}, State) ->
 handle_frame(StateName, {goaway, LastStreamId, ErrorCodeInt, _DebugData}, State) ->
     ErrorCode = h2_error:name(ErrorCodeInt),
     notify_owner({h2, self(), {goaway, LastStreamId, ErrorCode}}, State),
+    %% Also tell each per-stream handler so a bidi call process (which owns its
+    %% stream's events but not the connection) learns the connection is going away.
+    notify_all_handlers({goaway, LastStreamId, ErrorCode}, State),
     State1 = State#state{goaway_received = true, last_stream_id = LastStreamId},
     case StateName of
         goaway_sent -> {stop, {shutdown, goaway_exchange}, State1};
@@ -953,9 +1052,9 @@ handle_frame(_StateName, {rst_stream, StreamId, ErrorCode},
                  orelse in_closed_stream_range(StreamId, State0),
             case WasSeen of
                 true ->
-                    notify_stream(StreamId, {stream_reset, StreamId,
+                    State0a = dispatch_stream_event(StreamId, {stream_reset, StreamId,
                                              h2_error:name(ErrorCode)}, State0),
-                    State1 = close_stream(StreamId, rst, State0),
+                    State1 = close_stream(StreamId, rst, State0a),
                     {ok, connected, State1};
                 false ->
                     {error, protocol_error, State0}
@@ -1296,7 +1395,7 @@ dispatch_headers(server, trailers, StreamId, _Stream, _Headers, false, State) ->
     %% RFC 9113 §8.1: trailers MUST carry END_STREAM.
     stream_reject(StreamId, protocol_error, State);
 dispatch_headers(server, trailers, StreamId, Stream, Headers, true, State) ->
-    deliver_trailers(StreamId, Stream, Headers, State, fun notify_stream/3);
+    deliver_trailers(StreamId, Stream, Headers, State);
 
 %% Client receives a 1xx informational response. Stream stays open.
 %% RFC 9113 §8.1 / RFC 9110 §15.2: interim responses MUST NOT carry END_STREAM
@@ -1309,8 +1408,9 @@ dispatch_headers(client, interim, StreamId, _Stream, Headers, false, State) ->
             stream_reject_and_close(StreamId, protocol_error, State);
         false ->
             {ok, Status} = parse_status(Headers),
-            notify_owner({h2, self(), {informational, StreamId, Status, strip_pseudo(Headers)}}, State),
-            {ok, connected, State}
+            State1 = dispatch_stream_event(StreamId,
+                        {informational, StreamId, Status, strip_pseudo(Headers)}, State),
+            {ok, connected, State1}
     end;
 
 %% Client receives the final response HEADERS.
@@ -1322,7 +1422,7 @@ dispatch_headers(client, initial, StreamId, Stream, Headers, EndStream, State) -
 
 %% Client receives trailing HEADERS closing a response body.
 dispatch_headers(client, trailers, StreamId, Stream, Headers, _EndStream, State) ->
-    deliver_trailers(StreamId, Stream, Headers, State, fun notify_owner_stream/3).
+    deliver_trailers(StreamId, Stream, Headers, State).
 
 %% ---- Initial-HEADERS handlers ------------------------------------------------
 
@@ -1386,8 +1486,9 @@ handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State) ->
                 body_forbidden = BodyForbidden
             },
             State1 = put_stream(StreamId, Stream1, State),
-            notify_owner({h2, self(), {response, StreamId, Status, strip_pseudo(Headers)}}, State1),
-            finalize_client_initial(StreamId, EndStream, ExpectedCL, BodyForbidden, State1)
+            State2 = dispatch_stream_event(StreamId,
+                        {response, StreamId, Status, strip_pseudo(Headers)}, State1),
+            finalize_client_initial(StreamId, EndStream, ExpectedCL, BodyForbidden, State2)
     end.
 
 %% RFC 9110 §9.3.2 / §15.4: HEAD, 204, 304 responses have no body — any
@@ -1395,14 +1496,14 @@ handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State) ->
 %% END_STREAM is absent on the header block, the response is malformed
 %% and the stream must not be left open for later frames.
 finalize_client_initial(StreamId, false, _ExpectedCL, true, State) ->
-    notify_stream(StreamId, {stream_reset, StreamId, protocol_error}, State),
-    stream_reject_and_close(StreamId, protocol_error, State);
+    State1 = dispatch_stream_event(StreamId, {stream_reset, StreamId, protocol_error}, State),
+    stream_reject_and_close(StreamId, protocol_error, State1);
 %% Body-less response with END_STREAM — the response is complete. A
 %% non-zero content-length on HEAD is allowed (RFC 9110 §9.3.2, it
 %% indicates what the GET response size would be) — do not reject it.
 finalize_client_initial(StreamId, true, _ExpectedCL, true, State) ->
-    notify_stream(StreamId, {data, StreamId, <<>>, true}, State),
-    {ok, connected, close_stream(StreamId, end_stream, State)};
+    State1 = dispatch_stream_event(StreamId, {data, StreamId, <<>>, true}, State),
+    {ok, connected, close_stream(StreamId, end_stream, State1)};
 %% Body-allowed response: body continues arriving as DATA frames.
 finalize_client_initial(_StreamId, false, _ExpectedCL, false, State) ->
     {ok, connected, State};
@@ -1415,8 +1516,8 @@ finalize_client_initial(StreamId, true, ExpectedCL, false, State)
 %% content-length=0: emit the trailing empty DATA event so owners waiting
 %% on end-of-stream don't hang. Matches quic_h3.
 finalize_client_initial(StreamId, true, _ExpectedCL, false, State) ->
-    notify_stream(StreamId, {data, StreamId, <<>>, true}, State),
-    {ok, connected, close_stream(StreamId, end_stream, State)}.
+    State1 = dispatch_stream_event(StreamId, {data, StreamId, <<>>, true}, State),
+    {ok, connected, close_stream(StreamId, end_stream, State1)}.
 
 %% ---- Shared helpers ---------------------------------------------------------
 
@@ -1427,8 +1528,7 @@ finalize_client_initial(StreamId, true, _ExpectedCL, false, State) ->
 %%   half_closed_local → closed
 %% Closing prematurely (as we used to) makes the owner's reply on a still-
 %% open server stream fail with invalid_stream_state.
-deliver_trailers(StreamId, #stream{state = StreamState} = Stream, Headers,
-                  State, NotifyFun) ->
+deliver_trailers(StreamId, #stream{state = StreamState} = Stream, Headers, State) ->
     NewState = case StreamState of
         open              -> half_closed_remote;
         half_closed_local -> closed;
@@ -1436,15 +1536,11 @@ deliver_trailers(StreamId, #stream{state = StreamState} = Stream, Headers,
     end,
     Stream1 = Stream#stream{state = NewState},
     State1  = put_stream(StreamId, Stream1, State),
-    NotifyFun(StreamId, {trailers, StreamId, Headers}, State1),
+    State2  = dispatch_stream_event(StreamId, {trailers, StreamId, Headers}, State1),
     case NewState of
-        closed -> {ok, connected, close_stream(StreamId, end_stream, State1)};
-        _      -> {ok, connected, State1}
+        closed -> {ok, connected, close_stream(StreamId, end_stream, State2)};
+        _      -> {ok, connected, State2}
     end.
-
-%% Uniform 3-arity shim so `deliver_trailers` can dispatch either fan-out style.
-notify_owner_stream(_StreamId, Event, State) ->
-    notify_owner({h2, self(), Event}, State).
 
 %% RFC 8441 §4: a server that has not advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1
 %% MUST treat a request carrying `:protocol` as malformed.
@@ -2000,11 +2096,17 @@ maybe_send_conn_window_update(_DataSize, #state{recv_conn_window_size = ConnWind
             State
     end.
 
-maybe_send_window_update(StreamId, _DataSize, #state{local_settings = Settings,
+maybe_send_window_update(StreamId, DataSize, #state{local_settings = Settings,
                                                      streams = Streams} = State) ->
     InitialWindow = h2_settings:get(initial_window_size, Settings),
     Threshold = InitialWindow div 2,
     case maps:find(StreamId, Streams) of
+        %% Manual flow control (RFC 9113 §6.9): do NOT auto-replenish. Track the
+        %% bytes as unacked so consume/3 can replenish them on consumer progress.
+        %% This is what bounds a slow consumer's in-flight data to one window.
+        {ok, #stream{flow_control = manual, unacked = Unacked} = Stream} ->
+            Stream1 = Stream#stream{unacked = Unacked + DataSize},
+            State#state{streams = maps:put(StreamId, Stream1, Streams)};
         {ok, #stream{recv_window_size = StreamWindow} = Stream} when StreamWindow < Threshold ->
             StreamIncrement = InitialWindow - StreamWindow,
             %% Best-effort: dead socket surfaces via {tcp_closed,_} / {ssl_closed,_}.
@@ -2013,6 +2115,31 @@ maybe_send_window_update(StreamId, _DataSize, #state{local_settings = Settings,
             State#state{streams = maps:put(StreamId, Stream1, Streams)};
         _ ->
             State
+    end.
+
+%% Handle an explicit consume/3 call: replenish the stream receive window by up
+%% to the unacked byte count via WINDOW_UPDATE. No-op (but still `ok') for auto
+%% streams — auto windows are managed by maybe_send_window_update/3.
+handle_consume(From, StreamId, ByteCount, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream{flow_control = manual, recv_window_size = StreamWindow,
+                     unacked = Unacked} = Stream} ->
+            Ack = min(ByteCount, Unacked),
+            case Ack > 0 of
+                true ->
+                    _ = send_frame(h2_frame:window_update(StreamId, Ack), State),
+                    Stream1 = Stream#stream{recv_window_size = StreamWindow + Ack,
+                                            unacked = Unacked - Ack},
+                    State1 = State#state{streams = maps:put(StreamId, Stream1, Streams)},
+                    {keep_state, State1, [{reply, From, ok}]};
+                false ->
+                    {keep_state, State, [{reply, From, ok}]}
+            end;
+        {ok, _} ->
+            %% auto-mode stream: window already managed automatically.
+            {keep_state, State, [{reply, From, ok}]};
+        error ->
+            {keep_state, State, [{reply, From, {error, unknown_stream}}]}
     end.
 
 %% ============================================================================
@@ -2102,11 +2229,12 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
 handle_send_request(From, _Method, _Path, _Headers, _EndStream, State) ->
     {keep_state, State, [{reply, From, {error, not_client}}]}.
 
-handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next_stream_id = StreamId,
-                                                              peer_max_concurrent_streams = MaxStreams,
-                                                              peer_initial_window_size = InitialWindow,
-                                                              peer_settings = PeerSettings,
-                                                              encode_context = EncCtx} = State) ->
+handle_send_request_headers(From, Headers, EndStream, Opts,
+                            #state{mode = client, next_stream_id = StreamId,
+                                   peer_max_concurrent_streams = MaxStreams,
+                                   peer_initial_window_size = InitialWindow,
+                                   peer_settings = PeerSettings,
+                                   encode_context = EncCtx} = State) ->
     ActiveStreams = count_active_streams(State),
     case MaxStreams of
         N when is_integer(N), ActiveStreams >= N ->
@@ -2142,6 +2270,7 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
             {HeaderBlock, EncCtx1} = h2_hpack:encode(Headers, EncCtx),
             RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
             StreamState = case EndStream of true -> half_closed_local; false -> open end,
+            {Handler, DispatchMode, FlowControl} = stream_opts(Opts),
             %% RFC 7540 §8.3 / RFC 8441: tunnel only opens on the 2xx response.
             Stream = #stream{
                 id = StreamId,
@@ -2150,7 +2279,10 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
                 recv_window_size = RecvWindow,
                 tunnel = false,
                 protocol = Protocol,
-                request_method = Method
+                request_method = Method,
+                handler = Handler,
+                dispatch_mode = DispatchMode,
+                flow_control = FlowControl
             },
             case send_header_block(StreamId, HeaderBlock, EndStream, State) of
                 ok ->
@@ -2170,8 +2302,28 @@ handle_send_request_headers(From, Headers, EndStream, #state{mode = client, next
             end
             end
     end;
-handle_send_request_headers(From, _Headers, _EndStream, State) ->
+handle_send_request_headers(From, _Headers, _EndStream, _Opts, State) ->
     {keep_state, State, [{reply, From, {error, not_client}}]}.
+
+%% Resolve per-stream creation options into {Handler, DispatchMode, FlowControl}.
+%% `handler' takes priority (events route to the pid from creation, race-free);
+%% `defer => true' buffers events for a later set_stream_handler; otherwise the
+%% legacy owner-dispatch default applies.
+stream_opts(Opts) ->
+    Handler = case maps:get(handler, Opts, undefined) of
+        P when is_pid(P) -> P;
+        _                -> undefined
+    end,
+    DispatchMode = case {Handler, maps:get(defer, Opts, false)} of
+        {H, _} when is_pid(H) -> owner;   %% handler set: mode is irrelevant
+        {_, true}             -> buffer;
+        _                     -> owner
+    end,
+    FlowControl = case maps:get(flow_control, Opts, auto) of
+        manual -> manual;
+        _      -> auto
+    end,
+    {Handler, DispatchMode, FlowControl}.
 
 handle_send_response(From, StreamId, Status, Headers, #state{mode = server, streams = Streams,
                                                               encode_context = EncCtx} = State) ->
@@ -2416,7 +2568,7 @@ handle_send_data(From, StreamId, Data, EndStream, #state{streams = Streams} = St
                     Stream1 = Stream#stream{send_buffer = NewBuffer,
                                             pending_end_stream = EndStream},
                     State1 = put_stream(StreamId, Stream1, State),
-                    case flush_stream_one_chunk(StreamId, State1) of
+                    case flush_stream(StreamId, State1) of
                         {ok, State2} ->
                             {keep_state, State2, [{reply, From, ok}]};
                         {error, Reason, State2} ->
@@ -2430,6 +2582,95 @@ handle_send_data(From, StreamId, Data, EndStream, #state{streams = Streams} = St
             {keep_state, State, [{reply, From, {error, invalid_stream_state}}]};
         error ->
             {keep_state, State, [{reply, From, {error, unknown_stream}}]}
+    end.
+
+%% Blocking send: append the data and drain a chunk. If the window already
+%% accepted everything, reply `ok'. Otherwise park the caller on the stream's
+%% send_waiters until the buffer drains (flush_stream/2 releases it) or the
+%% per-call timer fires with {error, timeout}. Parking the caller is what bounds
+%% buffering: it cannot enqueue more until this call returns.
+handle_send_data_blocking(From, StreamId, Data, EndStream, Timeout,
+                          #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream{state = StreamState, send_buffer = Buffer} = Stream}
+          when StreamState == open; StreamState == half_closed_remote ->
+            NewBuffer = <<Buffer/binary, Data/binary>>,
+            Stream1 = Stream#stream{send_buffer = NewBuffer,
+                                    pending_end_stream = EndStream},
+            State1 = put_stream(StreamId, Stream1, State),
+            case flush_stream(StreamId, State1) of
+                {ok, State2} ->
+                    case stream_send_buffer_empty(StreamId, State2) of
+                        true ->
+                            {keep_state, State2, [{reply, From, ok}]};
+                        false ->
+                            TimerRef = start_send_timer(Timeout),
+                            State3 = add_send_waiter(StreamId, {From, TimerRef}, State2),
+                            {keep_state, State3}
+                    end;
+                {error, Reason, State2} ->
+                    {stop_and_reply,
+                     {shutdown, {send_failed, Reason}},
+                     [{reply, From, {error, Reason}}],
+                     State2}
+            end;
+        {ok, _} ->
+            {keep_state, State, [{reply, From, {error, invalid_stream_state}}]};
+        error ->
+            {keep_state, State, [{reply, From, {error, unknown_stream}}]}
+    end.
+
+start_send_timer(infinity) -> undefined;
+start_send_timer(Timeout) when is_integer(Timeout) ->
+    erlang:start_timer(Timeout, self(), send_timeout).
+
+stream_send_buffer_empty(StreamId, #state{streams = Streams}) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream{send_buffer = <<>>, pending_end_stream = false}} -> true;
+        _ -> false
+    end.
+
+add_send_waiter(StreamId, Waiter, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream{send_waiters = Waiters} = Stream} ->
+            put_stream(StreamId, Stream#stream{send_waiters = Waiters ++ [Waiter]}, State);
+        error ->
+            State
+    end.
+
+%% Reply `ok' to every parked blocking-send caller once a stream's buffer has
+%% fully drained, cancelling their timers.
+release_send_waiters_if_drained(StreamId, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream{send_buffer = <<>>, pending_end_stream = false,
+                     send_waiters = [_ | _] = Waiters} = Stream} ->
+            lists:foreach(fun({From, TimerRef}) ->
+                ok = cancel_timer(TimerRef),
+                gen_statem:reply(From, ok)
+            end, Waiters),
+            put_stream(StreamId, Stream#stream{send_waiters = []}, State);
+        _ ->
+            State
+    end.
+
+%% Fire {error, timeout} to the parked caller whose timer expired and drop it.
+release_send_waiter_timeout(TimerRef, #state{streams = Streams} = State) ->
+    maps:fold(fun(StreamId, #stream{send_waiters = Waiters} = Stream, AccState) ->
+        case lists:keytake(TimerRef, 2, Waiters) of
+            {value, {From, TimerRef}, Rest} ->
+                gen_statem:reply(From, {error, timeout}),
+                put_stream(StreamId, Stream#stream{send_waiters = Rest}, AccState);
+            false ->
+                AccState
+        end
+    end, State, Streams).
+
+%% Drain one chunk and then release any blocking-send waiters that became
+%% satisfied. The single choke point used by every flush trigger.
+flush_stream(StreamId, State) ->
+    case flush_stream_one_chunk(StreamId, State) of
+        {ok, State1} -> {ok, release_send_waiters_if_drained(StreamId, State1)};
+        {error, _Reason, _State1} = Err -> Err
     end.
 
 handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams, encode_context = EncCtx} = State) ->
@@ -2499,21 +2740,32 @@ handle_cancel_stream(From, StreamId, ErrorCode, #state{streams = Streams} = Stat
 handle_set_stream_handler(From, StreamId, Pid, Opts, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, #stream{recv_buffer = Buf} = Stream} ->
-            %% Default: the connection itself replays previously-buffered
-            %% DATA frames to the handler pid. Opt in to `drain_buffer => true'
-            %% if the caller wants the raw buffer back to forward by hand —
-            %% useful for tests, almost never for production code.
+            %% Default: the connection replays every previously-buffered event
+            %% (response/data/trailers/informational/stream_reset) to the handler
+            %% pid, in arrival order, so anything that raced ahead of registration
+            %% is never dropped to the owner. Opt in to `drain_buffer => true' to
+            %% get the raw DATA buffer back as [{Data,Fin}] and forward it by hand
+            %% (kept for the existing WebSocket/MASQUE callers).
             HandToCaller = maps:get(drain_buffer, Opts, false),
-            Stream1 = Stream#stream{handler = Pid, recv_buffer = []},
+            FlowControl = case maps:get(flow_control, Opts, Stream#stream.flow_control) of
+                manual -> manual;
+                _      -> auto
+            end,
+            Stream1 = Stream#stream{handler = Pid, recv_buffer = [],
+                                    flow_control = FlowControl},
             State1 = put_stream(StreamId, Stream1, State),
-            Reply = case {HandToCaller, Buf} of
-                {true, []} -> ok;
-                {true, _}  -> {ok, lists:reverse(Buf)};
-                {false, _} ->
-                    lists:foreach(fun({D, Fin}) ->
-                        Pid ! {h2, self(), {data, StreamId, D, Fin}},
+            Ordered = lists:reverse(Buf),
+            Reply = case HandToCaller of
+                true ->
+                    case [{D, Fin} || {data, _Sid, D, Fin} <- Ordered] of
+                        []   -> ok;
+                        Data -> {ok, Data}
+                    end;
+                false ->
+                    lists:foreach(fun(Event) ->
+                        Pid ! {h2, self(), Event},
                         ok
-                    end, lists:reverse(Buf)),
+                    end, Ordered),
                     ok
             end,
             {keep_state, State1, [{reply, From, Reply}]};
@@ -2531,17 +2783,43 @@ handle_unset_stream_handler(From, StreamId, #state{streams = Streams} = State) -
             {keep_state, State, [{reply, From, ok}]}
     end.
 
-%% Deliver DATA to the stream's registered handler, or fall back to the
-%% mode default (client→owner, server→buffer for later handler).
-%% Matches quic_h3:notify_stream_data/4 semantics.
-dispatch_data(StreamId, #stream{handler = Pid} = Stream, Data, Fin, State) when is_pid(Pid) ->
-    _ = Pid ! {h2, self(), {data, StreamId, Data, Fin}},
+%% Deliver a DATA event using the unified stream-event routing below.
+dispatch_data(StreamId, Stream, Data, Fin, State) ->
+    dispatch_stream_event_inflight(StreamId, Stream, {data, StreamId, Data, Fin}, State).
+
+%% Route a stream-scoped event for an *in-flight* (not-yet-committed) #stream
+%% record, returning the possibly-updated record plus state. One choke point for
+%% every per-stream event (data/response/trailers/informational/stream_reset):
+%%   1. handler registered      -> deliver to the handler pid
+%%   2. dispatch_mode = buffer  -> hold in recv_buffer for later replay
+%%   3. client, no handler      -> deliver to the owner (legacy client behaviour)
+%%   4. server, no handler      -> buffer (legacy "buffer until set_stream_handler")
+dispatch_stream_event_inflight(_StreamId, #stream{handler = Pid} = Stream, Event, State)
+  when is_pid(Pid) ->
+    _ = Pid ! {h2, self(), Event},
     {Stream, State};
-dispatch_data(StreamId, #stream{} = Stream, Data, Fin, #state{mode = client} = State) ->
-    notify_owner({h2, self(), {data, StreamId, Data, Fin}}, State),
+dispatch_stream_event_inflight(_StreamId, #stream{dispatch_mode = buffer,
+                                                  recv_buffer = Buf} = Stream, Event, State) ->
+    {Stream#stream{recv_buffer = [Event | Buf]}, State};
+dispatch_stream_event_inflight(_StreamId, #stream{} = Stream, Event,
+                               #state{mode = client} = State) ->
+    notify_owner({h2, self(), Event}, State),
     {Stream, State};
-dispatch_data(_StreamId, #stream{recv_buffer = Buf} = Stream, Data, Fin, State) ->
-    {Stream#stream{recv_buffer = [{Data, Fin} | Buf]}, State}.
+dispatch_stream_event_inflight(_StreamId, #stream{recv_buffer = Buf} = Stream, Event, State) ->
+    {Stream#stream{recv_buffer = [Event | Buf]}, State}.
+
+%% Route a stream-scoped event when the #stream record is already committed to
+%% the streams map (response/informational/trailers/stream_reset paths). Reads
+%% the record, dispatches via the in-flight router, and re-commits it so the
+%% buffer case persists. Falls back to the owner for unknown streams.
+dispatch_stream_event(StreamId, Event, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            {Stream1, State1} = dispatch_stream_event_inflight(StreamId, Stream, Event, State),
+            put_stream(StreamId, Stream1, State1);
+        error ->
+            notify_owner({h2, self(), Event}, State)
+    end.
 
 handle_send_goaway(From, ErrorCode, _CurrentState, State) ->
     %% RFC 7540 §6.8: two-phase GOAWAY. Send a "shutdown warning" first with
@@ -2604,11 +2882,14 @@ handle_common(info, {ssl_error, Socket, Reason}, _StateName, #state{socket = Soc
 %% cast being scheduled and processed; draining the buffered data is still
 %% safe and lets in-flight streams complete.
 handle_common(cast, {flush_stream, StreamId}, _StateName, State) ->
-    case flush_stream_one_chunk(StreamId, State) of
+    case flush_stream(StreamId, State) of
         {ok, State1} -> {keep_state, State1};
         {error, Reason, State1} ->
             {stop, {shutdown, {send_failed, Reason}}, State1}
     end;
+%% A blocking send_data/5 waiter's deadline elapsed before its buffer drained.
+handle_common(info, {timeout, TimerRef, send_timeout}, _StateName, State) ->
+    {keep_state, release_send_waiter_timeout(TimerRef, State)};
 handle_common(_EventType, _Event, _StateName, State) ->
     {keep_state, State}.
 
@@ -2764,7 +3045,7 @@ flush_send_buffers(#state{streams = Streams} = State) ->
 %% flush_send_buffers fold). The actual draining is one chunk at a time;
 %% remaining bytes drain via self-casts handled in connected/3.
 flush_stream_buffer(StreamId, State) ->
-    case flush_stream_one_chunk(StreamId, State) of
+    case flush_stream(StreamId, State) of
         {ok, State1} -> State1;
         %% Best-effort: a dead socket surfaces via {tcp_closed,_} /
         %% {ssl_closed,_} and terminates the connection shortly after.
@@ -2994,17 +3275,19 @@ notify_owner(Msg, #state{owner = Owner}) ->
     Owner ! Msg,
     ok.
 
-%% Send a per-stream event to the registered stream handler if any, else
-%% fall back to the connection owner. Used for stream_reset and trailers so
-%% they follow the same routing as DATA dispatched via dispatch_data/5.
-notify_stream(StreamId, Event, #state{streams = Streams} = State) ->
-    case maps:find(StreamId, Streams) of
-        {ok, #stream{handler = Pid}} when is_pid(Pid) ->
-            Pid ! {h2, self(), Event},
-            ok;
-        _ ->
-            notify_owner({h2, self(), Event}, State)
-    end.
+%% Deliver Event to every distinct registered stream handler. Used on
+%% connection-wide teardown (GOAWAY / closed) so a per-stream bidi process is
+%% told its connection is going away even though it does not own the connection.
+%% The owner is excluded — it is notified separately, exactly once.
+notify_all_handlers(Event, #state{streams = Streams, owner = Owner}) ->
+    Pids = maps:fold(fun(_Id, #stream{handler = Pid}, Acc)
+                           when is_pid(Pid), Pid =/= Owner ->
+                             Acc#{Pid => true};
+                        (_Id, _Stream, Acc) ->
+                             Acc
+                     end, #{}, Streams),
+    _ = [Pid ! {h2, self(), Event} || Pid <- maps:keys(Pids)],
+    ok.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

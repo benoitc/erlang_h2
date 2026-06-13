@@ -72,7 +72,8 @@
 -export([respond/5]).
 
 %% Common API
--export([send_data/3, send_data/4]).
+-export([send_data/3, send_data/4, send_data/5]).
+-export([consume/3]).
 -export([send_trailers/3]).
 -export([cancel/2, cancel/3]).
 -export([cancel_stream/2, cancel_stream/3]).
@@ -271,24 +272,42 @@ wait_connected(Conn, Timeout) ->
 request(Conn, Headers) ->
     request(Conn, Headers, #{}).
 
+%% Opts may carry per-stream routing/backpressure options for gRPC-style use:
+%%   handler      => pid()           route this stream's events to pid from
+%%                                   creation (race-free; recommended for bidi)
+%%   defer        => true            buffer events until a later
+%%                                   set_stream_handler/3 replays them
+%%   flow_control => manual | auto   manual = receive-side backpressure (consume/3)
+%%   end_stream   => boolean()       half-close the send side immediately
+%%   protocol     => binary()        RFC 8441 Extended CONNECT
 -spec request(connection(), headers(), map()) ->
     {ok, stream_id()} | {error, term()}.
 request(Conn, Headers, Opts) ->
+    StreamOpts = stream_opts(Opts),
     %% RFC 8441 Extended CONNECT: when `protocol` is supplied, inject the
     %% `:protocol` pseudo-header (unless caller already included it) and
     %% default end_stream to false (the stream stays open as a tunnel).
     case maps:get(protocol, Opts, undefined) of
         undefined ->
             EndStream = maps:get(end_stream, Opts, true),
-            h2_connection:send_request_headers(Conn, Headers, EndStream);
+            h2_connection:send_request_headers(Conn, Headers, EndStream, StreamOpts);
         Protocol when is_binary(Protocol) ->
             Headers1 = case proplists:is_defined(<<":protocol">>, Headers) of
                 true  -> Headers;
                 false -> inject_protocol_pseudo(Headers, Protocol)
             end,
             EndStream = maps:get(end_stream, Opts, false),
-            h2_connection:send_request_headers(Conn, Headers1, EndStream)
+            h2_connection:send_request_headers(Conn, Headers1, EndStream, StreamOpts)
     end.
+
+%% Project the per-stream creation options out of the user opts map.
+stream_opts(Opts) ->
+    lists:foldl(fun(Key, Acc) ->
+        case maps:find(Key, Opts) of
+            {ok, Value} -> Acc#{Key => Value};
+            error       -> Acc
+        end
+    end, #{}, [handler, defer, flow_control]).
 
 %% Insert `:protocol` after the trailing pseudo-header so the block stays
 %% well-ordered (RFC 9113 §8.3: pseudo-headers must precede regular ones).
@@ -670,9 +689,31 @@ send_data(Conn, StreamId, Data) ->
     h2_connection:send_data(Conn, StreamId, Data).
 
 %% @doc Send data on a stream with end_stream flag.
+%%
+%% Non-blocking backpressure: when the peer's send window is exhausted the data
+%% is buffered, and `{error, send_buffer_full}' is returned once the buffer would
+%% exceed the per-stream cap, so the caller backs off instead of growing memory
+%% without bound. For a blocking variant see send_data/5.
 -spec send_data(connection(), stream_id(), binary(), boolean()) -> ok | {error, term()}.
 send_data(Conn, StreamId, Data, EndStream) ->
     h2_connection:send_data(Conn, StreamId, Data, EndStream).
+
+%% @doc Send data with per-call options. Pass `#{block => Timeout}' (ms or
+%% `infinity') to block until the peer's window accepts the data, returning `ok',
+%% or `{error, timeout}' if the window does not open in time (the data may still
+%% be queued; the caller should slow down or cancel the stream).
+-spec send_data(connection(), stream_id(), binary(), boolean(), map()) ->
+    ok | {error, term()}.
+send_data(Conn, StreamId, Data, EndStream, Opts) ->
+    h2_connection:send_data(Conn, StreamId, Data, EndStream, Opts).
+
+%% @doc Acknowledge consumption of ByteCount received bytes on a manual
+%% flow-control stream, replenishing its receive window. Receive-side
+%% backpressure: a handler calls this only after processing data, gating the
+%% peer's WINDOW_UPDATE on consumer progress. No-op on auto-mode streams.
+-spec consume(connection(), stream_id(), non_neg_integer()) -> ok | {error, term()}.
+consume(Conn, StreamId, ByteCount) ->
+    h2_connection:consume(Conn, StreamId, ByteCount).
 
 %% @doc Send trailers on a stream.
 -spec send_trailers(connection(), stream_id(), headers()) -> ok | {error, term()}.
@@ -699,18 +740,24 @@ cancel_stream(Conn, StreamId) ->
 cancel_stream(Conn, StreamId, ErrorCode) ->
     cancel(Conn, StreamId, ErrorCode).
 
-%% @doc Register a pid to receive body data for a stream.
-%% By default the connection replays any DATA frames buffered before the
-%% handler was registered as `{h2, Conn, {data, StreamId, Data, Fin}}'
-%% messages, and the call returns `ok'. Pass `#{drain_buffer => true}' to
-%% receive the buffered frames in the reply (`{ok, [{Data, Fin}, ...]}') and
-%% forward them yourself — useful for tests, rarely for production code.
+%% @doc Register a pid to receive a stream's events.
+%% Routes every event for the stream — `{response,...}', `{data,...}',
+%% `{trailers,...}', `{informational,...}', `{stream_reset,...}' — to the
+%% handler pid as `{h2, Conn, Event}'. By default the connection replays any
+%% events buffered before the handler was registered, in arrival order, so a
+%% response/trailers that raced ahead of registration is never dropped to the
+%% owner. The call returns `ok'. Pass `#{drain_buffer => true}' to instead get
+%% the buffered DATA back in the reply (`{ok, [{Data, Fin}, ...]}') and forward
+%% it yourself (kept for the WebSocket/MASQUE tunnel callers).
 %%
-%% Backpressure: incoming DATA is rate-limited at the HTTP/2 flow-control
-%% layer only after we dispatch it to the handler. If the handler pid
-%% cannot keep up, its mailbox grows unbounded — bound your own consumer
-%% (e.g. with a selective receive + flow-control settings) when streaming
-%% large bodies from an untrusted peer.
+%% To avoid the registration race entirely, set the handler at stream creation
+%% with `h2:request(Conn, Headers, #{handler => Pid})'.
+%%
+%% Backpressure: by default incoming DATA replenishes the receive window on
+%% dispatch, so a slow handler's mailbox can grow unbounded. Pass
+%% `#{flow_control => manual}' (here or at request time) to gate window
+%% replenishment on consume/3 — the handler calls `h2:consume(Conn, StreamId, N)'
+%% after processing N bytes, bounding in-flight data to one window.
 -spec set_stream_handler(connection(), stream_id(), pid()) ->
     ok | {ok, [{binary(), boolean()}]} | {error, term()}.
 set_stream_handler(Conn, StreamId, Pid) ->

@@ -49,7 +49,8 @@ Public module `h2`:
 h2:connect/2,3
 h2:wait_connected/1,2
 h2:request/2,3,4,5
-h2:send_data/3,4
+h2:send_data/3,4,5      %% /5 takes #{block => Timeout} for blocking backpressure
+h2:consume/3            %% replenish receive window in manual flow-control mode
 h2:send_trailers/3
 h2:cancel/2,3
 h2:set_stream_handler/3,4
@@ -85,9 +86,19 @@ See the README for usage snippets and `src/h2.erl` for full edoc.
 {h2, Conn, {closed, Reason}}
 ```
 
-Per-stream events (`data`, `trailers`, `stream_reset`) are routed to the process registered via `h2:set_stream_handler/3,4` if set; otherwise they fall back to the connection owner.
+All per-stream events (`response`, `informational`, `data`, `trailers`, `stream_reset`) are routed to the process registered via `h2:set_stream_handler/3,4` (or set at creation with `#{handler => Pid}`) if one is set; otherwise they fall back to the connection owner. Events that arrive before a handler registers are buffered and replayed in arrival order, never dropped. The connection-wide `goaway` and `closed` events are delivered to the owner and, additionally, to each stream handler so a per-stream process learns the connection is going away.
 
 Identical shape to `quic_h3` so application code that dispatches on protocol events can be shared between h2 and h3.
+
+### gRPC bidirectional streaming
+
+The library satisfies the gRPC bidi contract over a single stream: both peers send interleaved DATA concurrently, the client half-closes with `END_STREAM` on its last DATA while still receiving, and the server ends with trailers carrying `grpc-status`. Each call can run in its own process that owns only its stream's events.
+
+- One stream, two directions: after `h2:request(Conn, Headers, #{handler => self(), end_stream => false})`, call `h2:send_data(Conn, Sid, Msg, false)` repeatedly and `h2:send_data(Conn, Sid, <<>>, true)` to half-close the send side; the receive side stays open for response DATA and trailers. The server mirrors this with `h2:send_response/4`, `h2:send_data/4` and `h2:send_trailers/3`.
+- Ownership: a call process registers its handler per stream; `h2:controlling_process/2` is not required per call, and an exiting call process does not take down the connection or sibling streams.
+- Receive backpressure: `#{flow_control => manual}` plus `h2:consume/3` gate WINDOW_UPDATE on consumer progress, bounding in-flight data to one window when streaming from an untrusted peer.
+- Send backpressure: `h2:send_data/5` with `#{block => Timeout}` blocks until the window opens (`ok`) or the deadline elapses (`{error, timeout}`); the default path returns `{error, send_buffer_full}` past the per-stream buffer cap.
+- Cancel/teardown: `h2:cancel/2,3` emits RST_STREAM and the peer's handler receives `{stream_reset, Sid, Code}`; `goaway` and `closed` reach the handler too. Deadline/cancel map to RST_STREAM `CANCEL`; `grpc-status` rides in trailers.
 
 ## Intentionally out of scope
 

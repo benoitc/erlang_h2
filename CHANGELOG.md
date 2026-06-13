@@ -4,6 +4,33 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+### Added
+
+- gRPC bidirectional streaming support. A dedicated per-call process can own a
+  single stream's events without owning the connection, while many calls
+  multiplex one connection.
+  - Per-stream event routing now covers every event type. `set_stream_handler/3`
+    routes `{response,...}`, `{data,...}`, `{trailers,...}`, `{informational,...}`
+    and `{stream_reset,...}` to the handler, and replays in arrival order any
+    events buffered before registration (previously only DATA was buffered, and
+    response/trailers went only to the owner). `h2:request(Conn, Headers,
+    #{handler => Pid})' sets the handler at stream creation to avoid the
+    registration race.
+  - Receive-side backpressure: `#{flow_control => manual}' stops auto-replenishing
+    the stream receive window on dispatch; `h2:consume(Conn, StreamId, N)' sends
+    the WINDOW_UPDATE after the consumer has processed N bytes, bounding a slow
+    consumer to one window instead of an unbounded mailbox.
+  - Send-side backpressure: `h2:send_data/5' with `#{block => Timeout}' blocks
+    until the peer's window accepts the data (`ok') or the deadline passes
+    (`{error, timeout}'). The default non-blocking path still returns
+    `{error, send_buffer_full}' once the per-stream buffer cap is reached.
+  - Teardown is delivered per stream: a stream handler now also receives
+    `{goaway, Last, Code}' and `{closed, Reason}', so a bidi call process learns
+    its connection is going away. `cancel/2,3' RST_STREAM continues to reach the
+    peer handler as `{stream_reset, StreamId, Code}'.
+  - All additions are opt-in; default streams and the existing client/server and
+    WebSocket-over-h2 (extended CONNECT) APIs are unchanged.
+
 ## [0.9.0] - 2026-06-06
 
 ### Changed
