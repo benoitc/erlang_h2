@@ -4,6 +4,17 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-06-13
+
+### Documentation
+
+- Documented gRPC bidirectional streaming in the README and the `h2` module docs:
+  per-stream handlers, half-close, receive backpressure (`consume/3`), blocking
+  send (`send_data/5`), and cancel / goaway / closed delivery to the handler.
+- Fixed ex_doc autolink warnings for private functions referenced in the
+  changelog so the docs build clean.
+- Synced the README install snippet to the current version.
+
 ## [0.10.0] - 2026-06-13
 
 ### Added
