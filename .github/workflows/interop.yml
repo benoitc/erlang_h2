@@ -27,3 +27,46 @@ jobs:
         with:
           name: interop-logs
           path: _build/test/logs
+
+  grpc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '29.0'
+          rebar3-version: '3.25.0'
+      - name: Install grpcurl
+        run: |
+          curl -sSL -o /tmp/grpcurl.tar.gz \
+            https://github.com/fullstorydev/grpcurl/releases/download/v1.9.3/grpcurl_1.9.3_linux_x86_64.tar.gz
+          tar -xzf /tmp/grpcurl.tar.gz -C /usr/local/bin grpcurl
+          grpcurl --version
+      - run: rebar3 ct --suite=test/h2_grpc_interop_SUITE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grpc-interop-logs
+          path: _build/test/logs
+
+  grpc-client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '29.0'
+          rebar3-version: '3.25.0'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install grpcio
+        run: |
+          python3 -m pip install --quiet grpcio
+          python3 -c "import grpc; print('grpcio', grpc.__version__)"
+      - run: rebar3 ct --suite=test/h2_grpc_client_interop_SUITE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grpc-client-interop-logs
+          path: _build/test/logs
