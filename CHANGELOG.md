@@ -125,7 +125,7 @@ Security and concurrency hardening pass driven by a multi-agent audit. Several b
 - **Per-stream send-buffer cap (High).** `Stream#stream.send_buffer` is capped at `?MAX_SEND_BUFFER_BYTES` (1 MB). A peer that stalls its receive window now gets `{error, send_buffer_full}` instead of growing the connection process unbounded.
 - **Acceptor mailbox drain (High).** ssl and tcp acceptor loops drain queued `{'EXIT', _, _}` after every accept. Pre-fix every closed connection left an EXIT message in the trapping acceptor; on a busy server the mailbox grew without bound.
 - **TLS server hardening (High).** `start_server` honors top-level `verify` (default `verify_none`), rejects `verify_peer` without `cacerts` (`{error, verify_peer_requires_cacerts}`), accepts an `ssl_opts` override list, and defaults `honor_cipher_order` to `true`.
-- **Demo escript path traversal.** `h2_server:safe_path/2` uses `filelib:safe_relative_path/2`; URL-encoded `%2e%2e` and normalised escapes (`/a/../../etc/passwd`) are now rejected.
+- **Demo escript path traversal.** The `h2_server` escript's `safe_path` helper uses `filelib:safe_relative_path/2`; URL-encoded `%2e%2e` and normalised escapes (`/a/../../etc/passwd`) are now rejected.
 
 ### Breaking
 
@@ -159,7 +159,7 @@ Security and concurrency hardening pass driven by a multi-agent audit. Several b
 
 - `set_active/2` on a closed socket no longer crashes the gen_statem with `badmatch`; the connection stops cleanly with `{shutdown, {socket_error, _}}`.
 - `cancel_timer` uses synchronous cancel + flushes any already-delivered `{timeout, Ref, _}` so stale messages cannot match a future reused timer.
-- `h2_listener:loop/4` and `h2:server_connection_loop/2` `logger:debug` unknown messages instead of silently dropping.
+- The `h2_listener` accept loop and the `h2` server connection loop `logger:debug` unknown messages instead of silently dropping.
 
 ## [0.5.0] - 2026-04-19
 
