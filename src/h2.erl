@@ -57,6 +57,17 @@
 %%
 %% Server handler receives direct calls.
 %%
+%% == Bidirectional streaming (gRPC) ==
+%%
+%% A per-call process can own a single stream's events without owning the
+%% connection, so many calls multiplex one connection. Pass `#{handler => Pid}'
+%% to request/3 (or call set_stream_handler/3,4) to route every event for that
+%% stream to Pid; events that arrive before registration are buffered and
+%% replayed in order. send_data/4 can be called repeatedly and half-closes with
+%% `send_data(Conn, Sid, <<>>, true)' while the receive side stays open. For
+%% backpressure use `#{flow_control => manual}' plus consume/3 on receive, and
+%% send_data/5 with `#{block => Timeout}' on send. See the README for an example.
+%%
 -module(h2).
 
 -include("h2.hrl").

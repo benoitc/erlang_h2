@@ -6,6 +6,7 @@ HTTP/2 client and server for Erlang/OTP.
 - **RFC 7541** HPACK with static + dynamic tables and Huffman coding.
 - **RFC 7540 §8.3** CONNECT tunnel mode for bidirectional byte streams.
 - **RFC 8441** Extended CONNECT (`:protocol` pseudo-header) for bootstrapping WebSockets and similar protocols over HTTP/2.
+- **gRPC-style bidirectional streaming**: interleaved DATA both ways on one stream, per-stream event handlers owned by per-call processes, receive/send backpressure, and trailers.
 - ALPN `h2` over TLS 1.2+ by default; cleartext (`h2c` over plain TCP) also supported.
 - Owner-process event messages (`{h2, Conn, Event}`) mirroring the [`quic_h3`](https://github.com/benoitc/erlang_quic) HTTP/3 API so cross-protocol code stays symmetric.
 
@@ -15,7 +16,7 @@ Add to `rebar.config`:
 
 ```erlang
 {deps, [
-    {h2, "0.9.0", {git, "https://github.com/benoitc/erlang_h2.git", {tag, "0.9.0"}}}
+    {h2, "0.10.0", {git, "https://github.com/benoitc/erlang_h2.git", {tag, "0.10.0"}}}
 ]}.
 ```
 
@@ -49,6 +50,8 @@ Messages delivered to the owner process:
 | `{h2, Conn, {stream_reset, StreamId, ErrorCode}}` | peer sent RST_STREAM |
 | `{h2, Conn, {goaway, LastStreamId, ErrorCode}}` | peer is shutting down |
 | `{h2, Conn, {closed, Reason}}` | connection closed |
+
+By default these go to the connection owner. Register a per-stream handler (see [Bidirectional streaming](#bidirectional-streaming-grpc)) to route a single stream's events to a dedicated process instead, so many concurrent calls can be driven independently over one connection.
 
 Options to `h2:connect/3`:
 
@@ -193,6 +196,61 @@ ok = h2:send_data(Conn, Sid, FrameBytes, false).
 ```
 
 If the peer never advertised the setting, `h2:request/3` returns `{error, extended_connect_disabled}`. Server handlers see `:protocol` in the request `Headers` argument. Tunnel semantics (no body length, no trailers) apply once the 2xx is sent.
+
+## Bidirectional streaming (gRPC)
+
+A gRPC call is one HTTP/2 stream where both peers send interleaved DATA, the client half-closes with `END_STREAM` on its last DATA while still receiving, and the server ends with trailers carrying `grpc-status`. Each call runs in its own process that owns *its* stream's events without owning the connection, so many calls multiplex one connection.
+
+Pass `#{handler => Pid}` at request time to route every event for that stream (`response`, `data`, `trailers`, `informational`, `stream_reset`) to `Pid` from creation, race-free:
+
+```erlang
+%% Client call process
+{ok, Sid} = h2:request(Conn, [
+    {<<":method">>, <<"POST">>},
+    {<<":scheme">>, <<"https">>},
+    {<<":path">>, <<"/pkg.Service/BidiMethod">>},
+    {<<":authority">>, <<"localhost">>},
+    {<<"content-type">>, <<"application/grpc">>},
+    {<<"te">>, <<"trailers">>}
+], #{handler => self(), end_stream => false}),
+receive {h2, Conn, {response, Sid, 200, _}} -> ok end,
+[ok = h2:send_data(Conn, Sid, Msg, false) || Msg <- OutMsgs],
+ok = h2:send_data(Conn, Sid, <<>>, true),     %% half-close, keep receiving
+{InMsgs, Trailers} = collect(Conn, Sid).       %% data frames, then {trailers, ...}
+```
+
+```erlang
+%% Server handler: stream out while reading inbound, end with trailers
+fun(Conn, Sid, _Method, _Path, _Headers) ->
+    ok = h2:set_stream_handler(Conn, Sid, self()),
+    ok = h2:send_response(Conn, Sid, 200, [{<<"content-type">>, <<"application/grpc">>}]),
+    ok = bidi_loop(Conn, Sid),                  %% send_data / receive {data, ...} interleaved
+    ok = h2:send_trailers(Conn, Sid, [{<<"grpc-status">>, <<"0">>}])
+end.
+```
+
+`h2:set_stream_handler/3,4` works after the stream exists too: any events that arrived before registration are buffered and replayed to the handler in order, never dropped to the owner.
+
+**Receive backpressure.** By default the stream receive window is replenished on dispatch, so a slow handler's mailbox can grow unbounded. Pass `#{flow_control => manual}` (at request time or in `set_stream_handler/4`) and call `h2:consume/3` after processing, so `WINDOW_UPDATE` tracks consumer progress:
+
+```erlang
+{ok, Sid} = h2:request(Conn, Headers, #{handler => self(), flow_control => manual}),
+%% ... after handling N received bytes:
+ok = h2:consume(Conn, Sid, N).
+```
+
+**Send backpressure.** `h2:send_data/4` buffers when the peer's window is shut and returns `{error, send_buffer_full}` once the per-stream cap is reached (non-blocking; back off and retry). For a blocking send, `h2:send_data/5` with `#{block => Timeout}` waits until the window accepts the data, returning `ok` or `{error, timeout}`:
+
+```erlang
+case h2:send_data(Conn, Sid, Msg, false, #{block => 5000}) of
+    ok              -> ok;
+    {error, timeout} -> h2:cancel(Conn, Sid)
+end.
+```
+
+**Cancel and teardown.** `h2:cancel/2,3` sends `RST_STREAM`; the peer's stream handler receives `{stream_reset, Sid, Code}` (deadline/cancel map to `CANCEL`). A stream handler is also told about connection-wide `{goaway, ...}` and `{closed, Reason}`, so a call process learns of disconnect and can clean up without owning the connection.
+
+The message framing (the 5-byte length prefix and protobuf) is the application's concern; h2 carries the HTTP/2 stream, flow control, and trailers. See `test/h2_grpc_tests.erl` for a full loopback example and `test/h2_grpc_interop_SUITE.erl` / `test/h2_grpc_client_interop_SUITE.erl` for interop against real gRPC peers.
 
 ## Using with Ranch
 
