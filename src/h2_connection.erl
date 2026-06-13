@@ -112,6 +112,11 @@
     %% an optional timeout timer ref. Replied `ok` on drain, `{error, timeout}` on
     %% timer fire. Empty for the default non-blocking send path.
     send_waiters = [] :: [{term(), reference() | undefined}],
+    %% Trailers queued behind still-buffered DATA: send_trailers carries
+    %% END_STREAM, so it must not overtake DATA waiting on the flow-control
+    %% window. Held here and emitted once the send_buffer drains (RFC 9113 §5.1
+    %% ordering). undefined when no trailers are pending.
+    pending_trailers :: undefined | [{binary(), binary()}],
     %% RFC 7540 §8.3: stream is a CONNECT tunnel — DATA frames carry raw
     %% bytes, END_STREAM is half-close, no trailers, no CL/TE on response.
     tunnel = false :: boolean(),
@@ -2665,20 +2670,37 @@ release_send_waiter_timeout(TimerRef, #state{streams = Streams} = State) ->
         end
     end, State, Streams).
 
-%% Drain one chunk and then release any blocking-send waiters that became
-%% satisfied. The single choke point used by every flush trigger.
+%% Drain one chunk, release any satisfied blocking-send waiters, then emit any
+%% trailers that were queued behind the buffered DATA. The single choke point
+%% used by every flush trigger.
 flush_stream(StreamId, State) ->
     case flush_stream_one_chunk(StreamId, State) of
-        {ok, State1} -> {ok, release_send_waiters_if_drained(StreamId, State1)};
-        {error, _Reason, _State1} = Err -> Err
+        {ok, State1} ->
+            State2 = release_send_waiters_if_drained(StreamId, State1),
+            maybe_flush_pending_trailers(StreamId, State2);
+        {error, _Reason, _State1} = Err ->
+            Err
     end.
 
-handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams, encode_context = EncCtx} = State) ->
+%% Once a stream's send_buffer has fully drained, emit any trailers that were
+%% deferred by handle_send_trailers so END_STREAM never overtakes the DATA.
+maybe_flush_pending_trailers(StreamId, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream{send_buffer = <<>>, pending_end_stream = false,
+                     pending_trailers = Trailers} = Stream}
+          when Trailers =/= undefined ->
+            emit_trailers_frame(StreamId, Trailers, Stream, State);
+        _ ->
+            {ok, State}
+    end.
+
+handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, #stream{tunnel = true}} ->
             %% RFC 7540 §8.3: trailers are forbidden on a CONNECT tunnel.
             {keep_state, State, [{reply, From, {error, tunnel_no_trailers}}]};
-        {ok, #stream{state = StreamState} = Stream} when StreamState == open; StreamState == half_closed_remote ->
+        {ok, #stream{state = StreamState, send_buffer = Buffer} = Stream}
+          when StreamState == open; StreamState == half_closed_remote ->
             case validate_trailers(Trailers, true) of
                 {error, _} = Err ->
                     {keep_state, State, [{reply, From, Err}]};
@@ -2687,35 +2709,25 @@ handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams, encode_
                 {error, _} = SErr ->
                     {keep_state, State, [{reply, From, SErr}]};
                 ok ->
-            %% Encode trailers
-            {HeaderBlock, EncCtx1} = h2_hpack:encode(Trailers, EncCtx),
-
-            %% Send HEADERS frame with END_STREAM
-            case send_header_block(StreamId, HeaderBlock, true, State) of
-                {error, SendReason} ->
-                    {stop_and_reply,
-                     {shutdown, {send_failed, SendReason}},
-                     [{reply, From, {error, SendReason}}],
-                     State};
-                ok ->
-                    %% Update stream state
-                    Stream1 = Stream#stream{
-                        state = case StreamState of
-                            open -> half_closed_local;
-                            half_closed_remote -> closed
-                        end
-                    },
-
-                    State0 = put_stream(StreamId, Stream1, State),
-                    State1 = State0#state{encode_context = EncCtx1},
-
-                    case Stream1#stream.state of
-                        closed ->
-                            State2 = close_stream(StreamId, end_stream, State1),
-                            {keep_state, State2, [{reply, From, ok}]};
-                        _ ->
-                            {keep_state, State1, [{reply, From, ok}]}
-                    end
+            case Buffer of
+                <<>> ->
+                    %% Nothing buffered: emit the trailers (END_STREAM) now.
+                    case emit_trailers_frame(StreamId, Trailers, Stream, State) of
+                        {ok, State1} ->
+                            {keep_state, State1, [{reply, From, ok}]};
+                        {error, SendReason, State1} ->
+                            {stop_and_reply,
+                             {shutdown, {send_failed, SendReason}},
+                             [{reply, From, {error, SendReason}}],
+                             State1}
+                    end;
+                _ ->
+                    %% DATA still draining under the flow-control window: queue the
+                    %% trailers so END_STREAM goes out strictly after that DATA.
+                    %% flush_stream/2 emits them once the buffer empties.
+                    Stream1 = Stream#stream{pending_trailers = Trailers},
+                    {keep_state, put_stream(StreamId, Stream1, State),
+                     [{reply, From, ok}]}
             end
             end
             end;
@@ -2723,6 +2735,33 @@ handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams, encode_
             {keep_state, State, [{reply, From, {error, invalid_stream_state}}]};
         error ->
             {keep_state, State, [{reply, From, {error, unknown_stream}}]}
+    end.
+
+%% Encode and write a trailers HEADERS frame with END_STREAM, transitioning the
+%% stream and closing it when both sides are done. Shared by the immediate path
+%% and the deferred (post-drain) path in maybe_flush_pending_trailers/2.
+emit_trailers_frame(StreamId, Trailers,
+                    #stream{state = StreamState} = Stream,
+                    #state{encode_context = EncCtx} = State) ->
+    {HeaderBlock, EncCtx1} = h2_hpack:encode(Trailers, EncCtx),
+    case send_header_block(StreamId, HeaderBlock, true, State) of
+        {error, Reason} ->
+            {error, Reason, State};
+        ok ->
+            NewStreamState = case StreamState of
+                open               -> half_closed_local;
+                half_closed_remote -> closed;
+                _                  -> StreamState
+            end,
+            Stream1 = Stream#stream{state = NewStreamState,
+                                    pending_trailers = undefined},
+            State1 = put_stream(StreamId, Stream1,
+                                State#state{encode_context = EncCtx1}),
+            State2 = case NewStreamState of
+                closed -> close_stream(StreamId, end_stream, State1);
+                _      -> State1
+            end,
+            {ok, State2}
     end.
 
 handle_cancel_stream(From, StreamId, ErrorCode, #state{streams = Streams} = State) ->

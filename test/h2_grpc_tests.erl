@@ -309,6 +309,88 @@ ownership_isolation() ->
     _ = h2:close(Client),
     ok = h2:stop_server(Server).
 
+%% ---------------------------------------------------------------------------
+%% Stress: small window + small frame size forces fragmentation + refills
+%% ---------------------------------------------------------------------------
+
+small_window_bidi_test_() ->
+    {timeout, 60, fun small_window_bidi/0}.
+
+small_window_bidi() ->
+    %% Tiny window on both sides: every 8 KiB message is sent in ~2 KiB slices
+    %% with a WINDOW_UPDATE refill between them, in both directions, exercising
+    %% the chunking + flush paths under the new dispatch code (auto flow control).
+    Settings = #{initial_window_size => 2048, max_frame_size => 16384},
+    {Server, Port} = start_server_with(echo_fun(), Settings),
+    {ok, Client} = connect_with(Port, Settings),
+    ok = h2:wait_connected(Client),
+    {ok, Sid} = h2:request(Client, grpc_headers(Port),
+                           #{handler => self(), end_stream => false}),
+    receive {h2, Client, {response, Sid, 200, _}} -> ok
+    after 5000 -> error(no_response) end,
+    Msgs = [crypto:strong_rand_bytes(8192) || _ <- lists:seq(1, 5)],
+    Got = echo_exchange(Client, Sid, Msgs, 30000),
+    ?assertEqual(iolist_to_binary(Msgs), Got),
+    _ = h2:close(Client),
+    ok = h2:stop_server(Server).
+
+%% ---------------------------------------------------------------------------
+%% Stress: many concurrent multiplexed bidi streams on one connection
+%% ---------------------------------------------------------------------------
+
+concurrent_streams_test_() ->
+    {timeout, 60, fun concurrent_streams/0}.
+
+concurrent_streams() ->
+    K = 20,
+    {Server, Port} = start_server(echo_fun()),
+    {ok, Client} = connect(Port),
+    ok = h2:wait_connected(Client),
+    Test = self(),
+    %% Each call runs in its own process owning only its stream's events.
+    _Workers = [spawn(fun() -> concurrent_worker(Test, Client, Port, I) end)
+                || I <- lists:seq(1, K)],
+    Results = [receive {worker_done, I, R} -> {I, R}
+               after 20000 -> error({worker_timeout, I}) end
+               || I <- lists:seq(1, K)],
+    [?assertEqual({I, ok}, lists:keyfind(I, 1, Results)) || I <- lists:seq(1, K)],
+    ?assert(is_process_alive(Client)),
+    _ = h2:close(Client),
+    ok = h2:stop_server(Server).
+
+concurrent_worker(Test, Client, Port, I) ->
+    Msg = <<"stream-", (integer_to_binary(I))/binary>>,
+    {ok, Sid} = h2:request(Client, grpc_headers(Port),
+                           #{handler => self(), end_stream => false}),
+    receive {h2, Client, {response, Sid, 200, _}} -> ok
+    after 10000 -> exit(no_response) end,
+    Got = echo_exchange(Client, Sid, [Msg], 10000),
+    R = case Got of Msg -> ok; Other -> {mismatch, Other} end,
+    Test ! {worker_done, I, R}.
+
+%% ---------------------------------------------------------------------------
+%% Stress: high message count one way then the other (ordering / leak)
+%% ---------------------------------------------------------------------------
+
+high_message_count_test_() ->
+    {timeout, 60, fun high_message_count/0}.
+
+high_message_count() ->
+    N = 10000,
+    {Server, Port} = start_server(echo_fun()),
+    {ok, Client} = connect(Port),
+    ok = h2:wait_connected(Client),
+    {ok, Sid} = h2:request(Client, grpc_headers(Port),
+                           #{handler => self(), end_stream => false}),
+    receive {h2, Client, {response, Sid, 200, _}} -> ok
+    after 5000 -> error(no_response) end,
+    Msgs = [<<(integer_to_binary(I))/binary, $;>> || I <- lists:seq(1, N)],
+    Got = echo_exchange(Client, Sid, Msgs, 30000),
+    %% Exact concatenation equality proves all N arrived in order, none lost.
+    ?assertEqual(iolist_to_binary(Msgs), Got),
+    _ = h2:close(Client),
+    ok = h2:stop_server(Server).
+
 %% ===========================================================================
 %% Helpers
 %% ===========================================================================
@@ -424,5 +506,52 @@ teardown_collector(Test, Conn) ->
 
 idle() ->
     receive _ -> idle() end.
+
+%% A protobuf-agnostic gRPC echo handler: mirror the inbound DATA byte stream
+%% back out, end with grpc-status: 0 trailers.
+echo_fun() ->
+    fun(Conn, Sid, _M, _P, _H) ->
+        ok = h2:set_stream_handler(Conn, Sid, self()),
+        ok = h2:send_response(Conn, Sid, 200,
+                              [{<<"content-type">>, <<"application/grpc">>}]),
+        echo_loop(Conn, Sid)
+    end.
+
+echo_loop(Conn, Sid) ->
+    receive
+        {h2, Conn, {data, Sid, <<>>, true}} ->
+            ok = h2:send_trailers(Conn, Sid, [{<<"grpc-status">>, <<"0">>}]);
+        {h2, Conn, {data, Sid, Bytes, true}} ->
+            ok = h2:send_data(Conn, Sid, Bytes, false),
+            ok = h2:send_trailers(Conn, Sid, [{<<"grpc-status">>, <<"0">>}]);
+        {h2, Conn, {data, Sid, Bytes, false}} ->
+            ok = h2:send_data(Conn, Sid, Bytes, false),
+            echo_loop(Conn, Sid);
+        {h2, Conn, _Other} ->
+            echo_loop(Conn, Sid)
+    after 30000 ->
+        ok
+    end.
+
+%% Send all messages (half-closing on the last) and collect the echoed bytes.
+echo_exchange(Client, Sid, Msgs, Timeout) ->
+    send_msgs(Client, Sid, Msgs),
+    {Got, _Trailers} = collect_until_trailers(Client, Sid, [], Timeout),
+    iolist_to_binary(Got).
+
+send_msgs(Client, Sid, [Last]) ->
+    ok = h2:send_data(Client, Sid, Last, true);
+send_msgs(Client, Sid, [M | Rest]) ->
+    ok = h2:send_data(Client, Sid, M, false),
+    send_msgs(Client, Sid, Rest).
+
+start_server_with(Handler, Settings) ->
+    {ok, _} = application:ensure_all_started(h2),
+    {ok, Server} = h2:start_server(0, #{handler => Handler, transport => tcp,
+                                        settings => Settings}),
+    {Server, h2:server_port(Server)}.
+
+connect_with(Port, Settings) ->
+    h2:connect("127.0.0.1", Port, #{transport => tcp, settings => Settings}).
 
 -endif.

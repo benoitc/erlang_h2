@@ -12,8 +12,10 @@
 
 -define(WINDOW, 65535).
 -define(TYPE_DATA, 0).
+-define(TYPE_HEADERS, 1).
 -define(TYPE_RST, 3).
 -define(TYPE_WINDOW_UPDATE, 8).
+-define(FLAG_END_STREAM, 16#1).
 %% RFC 7540 §7: CANCEL error code (mirrors ?CANCEL in include/h2.hrl).
 -define(CANCEL, 16#8).
 
@@ -126,6 +128,75 @@ blocking_send_no_data_vector() ->
     trace_off(ServerConn),
     _ = h2:close(Client),
     ok = h2:stop_server(Server).
+
+%% ---------------------------------------------------------------------------
+%% Trailers must not overtake DATA buffered behind a shut window
+%% ---------------------------------------------------------------------------
+
+trailers_after_buffered_data_vector_test_() ->
+    {timeout, 30, fun trailers_after_buffered_data_vector/0}.
+
+trailers_after_buffered_data_vector() ->
+    Test = self(),
+    Handler = fun(Conn, Sid, _M, _P, _H) ->
+        Test ! {server_conn, Conn, Sid, self()},
+        receive go -> ok after 5000 -> ok end,
+        ok = h2:send_response(Conn, Sid, 200, []),
+        %% Fill exactly one window so the next DATA cannot flush yet.
+        ok = h2:send_data(Conn, Sid, crypto:strong_rand_bytes(?WINDOW), false),
+        Test ! window_filled,
+        receive emit -> ok after 5000 -> ok end,
+        %% This DATA is buffered (window shut); the trailers carry END_STREAM and
+        %% must be queued behind it, not jump ahead.
+        ok = h2:send_data(Conn, Sid, <<"tail">>, false),
+        ok = h2:send_trailers(Conn, Sid, [{<<"grpc-status">>, <<"0">>}]),
+        Test ! queued,
+        timer:sleep(500)
+    end,
+    {Server, Port} = start_server(Handler),
+    {ok, Client} = connect(Port),
+    ok = h2:wait_connected(Client),
+    {ok, Sid} = h2:request(Client, get_headers(Port),
+                           #{handler => self(), flow_control => manual,
+                             end_stream => true}),
+    {ServerConn, Sid, HandlerPid} =
+        receive {server_conn, C, S, HP} -> {C, S, HP} after 5000 -> error(no_server_conn) end,
+    HandlerPid ! go,
+    receive window_filled -> ok after 5000 -> error(no_fill) end,
+    _ = drain_idle(Client, Sid, <<>>, 300),
+    %% Trace, then trigger the buffered send_data + send_trailers.
+    trace_on(ServerConn),
+    HandlerPid ! emit,
+    receive queued -> ok after 5000 -> error(not_queued) end,
+    %% While the window is shut: neither the tail DATA nor the trailers (a HEADERS
+    %% frame with END_STREAM) may appear on the wire.
+    ShutFrames = collect_frames(ServerConn, 300),
+    ?assertEqual([], [F || {?TYPE_DATA, _, S, _} = F <- ShutFrames, S =:= Sid]),
+    ?assertEqual([], [F || {?TYPE_HEADERS, Fl, S, _} = F <- ShutFrames,
+                           S =:= Sid, Fl band ?FLAG_END_STREAM =/= 0]),
+    %% Reopen the window: the tail DATA must go out, then the END_STREAM trailers.
+    ok = h2:consume(Client, Sid, ?WINDOW),
+    OpenFrames = [F || {Type, _, S, _} = F <- collect_frames(ServerConn, 500),
+                       S =:= Sid, (Type =:= ?TYPE_DATA orelse Type =:= ?TYPE_HEADERS)],
+    trace_off(ServerConn),
+    %% Order: at least one DATA, then a HEADERS(END_STREAM), DATA strictly first.
+    Types = [Type || {Type, _, _, _} <- OpenFrames],
+    ?assert(lists:member(?TYPE_DATA, Types)),
+    ?assert(lists:member(?TYPE_HEADERS, Types)),
+    DataIdx = index_of(?TYPE_DATA, Types),
+    HdrIdx  = index_of(?TYPE_HEADERS, Types),
+    ?assert(DataIdx < HdrIdx),
+    %% The trailers HEADERS carries END_STREAM.
+    [{?TYPE_HEADERS, HdrFlags, _, _} | _] =
+        [F || {?TYPE_HEADERS, _, _, _} = F <- OpenFrames],
+    ?assert(HdrFlags band ?FLAG_END_STREAM =/= 0),
+    _ = h2:close(Client),
+    ok = h2:stop_server(Server).
+
+index_of(X, List) -> index_of(X, List, 1).
+index_of(X, [X | _], I) -> I;
+index_of(X, [_ | T], I) -> index_of(X, T, I + 1);
+index_of(_, [], _)      -> not_found.
 
 %% ===========================================================================
 %% Helpers

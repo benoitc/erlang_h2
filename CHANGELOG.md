@@ -31,6 +31,14 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
   - All additions are opt-in; default streams and the existing client/server and
     WebSocket-over-h2 (extended CONNECT) APIs are unchanged.
 
+### Fixed
+
+- `send_trailers/3` no longer lets the trailers (END_STREAM) overtake DATA still
+  buffered behind a closed flow-control window. The trailers are now queued and
+  emitted once the send buffer drains, so a `send_data` then `send_trailers`
+  sequence under backpressure (e.g. a gRPC server response) cannot drop the tail
+  of the body. Surfaced by the small-window bidi stress test.
+
 ## [0.9.0] - 2026-06-06
 
 ### Changed
