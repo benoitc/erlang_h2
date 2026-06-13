@@ -4,6 +4,8 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-13
+
 ### Added
 
 - gRPC bidirectional streaming support. A dedicated per-call process can own a
