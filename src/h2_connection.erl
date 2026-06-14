@@ -1868,9 +1868,11 @@ extract_request_headers(Headers) ->
     Method = proplists:get_value(<<":method">>, Headers, <<"GET">>),
     Path = proplists:get_value(<<":path">>, Headers, <<"/">>),
     %% Strip pseudo-headers from the user-visible list, except `:protocol`
-    %% (RFC 8441) so handlers can read the Extended CONNECT protocol token.
+    %% (RFC 8441) and `:authority` so adapters can preserve the request
+    %% authority on their request object.
     OtherHeaders = lists:filter(
         fun({<<":protocol">>, _}) -> true;
+           ({<<":authority">>, _}) -> true;
            ({N, _}) -> not is_pseudo_header(N)
         end, Headers),
     {Method, Path, OtherHeaders}.
