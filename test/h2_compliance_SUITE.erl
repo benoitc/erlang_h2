@@ -129,7 +129,8 @@
     send_buffer_full_when_peer_stalls_window_test/1,
     set_stream_handler_default_replays_buffer_test/1,
     large_body_yields_to_inbound_frames_test/1,
-    tls_transport_tag_detected_test/1
+    tls_transport_tag_detected_test/1,
+    request_preserves_authority_and_scheme_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -269,7 +270,8 @@ groups() ->
             send_buffer_full_when_peer_stalls_window_test,
             set_stream_handler_default_replays_buffer_test,
             large_body_yields_to_inbound_frames_test,
-            tls_transport_tag_detected_test
+            tls_transport_tag_detected_test,
+            request_preserves_authority_and_scheme_test
         ]}
     ].
 
@@ -1700,6 +1702,51 @@ extended_connect_round_trip_test(Config) ->
     ok = h2:send_data(Conn, Sid, <<"bye">>, true),
     receive {h2, Conn, {data, Sid, <<"bye">>, true}} -> ok
     after 2000 -> ct:fail(no_final_echo) end,
+    h2:close(Conn),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% A normal (non-CONNECT) request must expose `:authority` and `:scheme` in the
+%% handler header list so adapters can reconstruct the request authority/scheme.
+%% `:method`/`:path` stay stripped (delivered as separate fields).
+request_preserves_authority_and_scheme_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef -> h2:stop_server(OldRef)
+    end,
+    Self = self(),
+    Handler = fun(Conn, Sid, <<"GET">>, _Path, Headers) ->
+        Self ! {req_headers, Sid,
+                proplists:get_value(<<":authority">>, Headers),
+                proplists:get_value(<<":scheme">>, Headers),
+                proplists:get_value(<<":method">>, Headers),
+                proplists:get_value(<<":path">>, Headers)},
+        h2:send_response(Conn, Sid, 200, []),
+        h2:send_data(Conn, Sid, <<>>, true)
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert => ?config(cert_file, Config),
+        key => ?config(key_file, Config),
+        handler => Handler
+    }),
+    Port = h2:server_port(Ref),
+    {ok, Conn} = h2:connect("localhost", Port, #{ssl_opts => [{verify, verify_none}]}),
+    {ok, Sid} = h2:request(Conn, [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"example.test:443">>}
+    ]),
+    receive
+        {req_headers, Sid, Authority, Scheme, MethodPseudo, PathPseudo} ->
+            ?assertEqual(<<"example.test:443">>, Authority),
+            ?assertEqual(<<"https">>, Scheme),
+            ?assertEqual(undefined, MethodPseudo),
+            ?assertEqual(undefined, PathPseudo)
+    after 2000 -> ct:fail(no_request_seen_by_server) end,
+    receive {h2, Conn, {response, Sid, 200, _}} -> ok
+    after 2000 -> ct:fail(no_response) end,
     h2:close(Conn),
     h2:stop_server(Ref),
     drain_exits(),

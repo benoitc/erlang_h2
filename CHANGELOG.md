@@ -4,6 +4,15 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+### Changed
+
+- Server request delivery now keeps `:authority` and `:scheme` in the handler
+  `Headers` list (previously only `:protocol` survived). Adapters can reconstruct
+  the request authority/scheme for virtual hosting and reverse-proxy use without
+  relying on a `host` header, which a compliant client may omit. `:method` and
+  `:path` are still passed as separate fields. Consumers that forward or reflect
+  the header list should strip these pseudo-headers first.
+
 ## [0.10.1] - 2026-06-13
 
 ### Documentation

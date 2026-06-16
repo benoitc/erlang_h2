@@ -1868,12 +1868,17 @@ extract_request_headers(Headers) ->
     Method = proplists:get_value(<<":method">>, Headers, <<"GET">>),
     Path = proplists:get_value(<<":path">>, Headers, <<"/">>),
     %% Strip pseudo-headers from the user-visible list, except `:protocol`
-    %% (RFC 8441) and `:authority` so adapters can preserve the request
-    %% authority on their request object.
+    %% (RFC 8441), `:authority` and `:scheme`. Adapters need these to
+    %% reconstruct the request authority/scheme for virtual hosting and
+    %% reverse-proxy use; a compliant client may send `:authority` without a
+    %% `host` header, so it is not always recoverable otherwise. Consumers
+    %% that forward or reflect the header list MUST strip these pseudo-headers
+    %% first. `:method` and `:path` are already exposed as separate fields.
     OtherHeaders = lists:filter(
         fun({<<":protocol">>, _}) -> true;
            ({<<":authority">>, _}) -> true;
-           ({N, _}) -> not is_pseudo_header(N)
+           ({<<":scheme">>, _})    -> true;
+           ({Name, _})             -> not is_pseudo_header(Name)
         end, Headers),
     {Method, Path, OtherHeaders}.
 
@@ -3407,4 +3412,27 @@ header_value_validation_test_() ->
                    check_lowercase_names([{<<>>, <<"v">>}])),
      ?_assertEqual(ok,
                    check_lowercase_names([{<<"x">>, <<"ok">>}]))].
+
+extract_request_headers_test_() ->
+    Req = [{<<":method">>, <<"GET">>},
+           {<<":scheme">>, <<"https">>},
+           {<<":authority">>, <<"example.com:443">>},
+           {<<":path">>, <<"/index">>},
+           {<<":protocol">>, <<"websocket">>},
+           {<<"accept">>, <<"text/html">>}],
+    {Method, Path, Other} = extract_request_headers(Req),
+    [%% :method and :path become separate fields.
+     ?_assertEqual(<<"GET">>, Method),
+     ?_assertEqual(<<"/index">>, Path),
+     %% :authority/:scheme/:protocol survive for adapters.
+     ?_assertEqual(<<"example.com:443">>, proplists:get_value(<<":authority">>, Other)),
+     ?_assertEqual(<<"https">>, proplists:get_value(<<":scheme">>, Other)),
+     ?_assertEqual(<<"websocket">>, proplists:get_value(<<":protocol">>, Other)),
+     %% :method/:path are stripped from the header list.
+     ?_assertEqual(undefined, proplists:get_value(<<":method">>, Other)),
+     ?_assertEqual(undefined, proplists:get_value(<<":path">>, Other)),
+     %% Regular headers pass through.
+     ?_assertEqual(<<"text/html">>, proplists:get_value(<<"accept">>, Other)),
+     %% Defaults when :method/:path absent.
+     ?_assertEqual({<<"GET">>, <<"/">>, []}, extract_request_headers([]))].
 -endif.

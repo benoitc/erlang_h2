@@ -129,6 +129,17 @@ Options to `h2:start_server/2,3`:
 
 A module handler (`handler => {Mod, Args}`) is also supported; `Mod:handle_request/5` receives the same arguments.
 
+The `Headers` argument is the request header list with pseudo-headers stripped, except `:authority`, `:scheme`, and `:protocol`, which are kept so adapters can reconstruct the request authority/scheme (a compliant client may send `:authority` and no `host` header) and read the Extended CONNECT token. `:method` and `:path` are already passed as the separate `Method`/`Path` arguments. Read what you need and strip these pseudo-headers before exposing the list as ordinary application headers:
+
+```erlang
+Handler = fun(Conn, StreamId, Method, Path, Headers) ->
+    Authority  = proplists:get_value(<<":authority">>, Headers),
+    Scheme     = proplists:get_value(<<":scheme">>, Headers),
+    AppHeaders = [{K, V} || {<<C, _/binary>> = K, V} <- Headers, C =/= $:],
+    my_app:handle(Conn, StreamId, Method, Path, Scheme, Authority, AppHeaders)
+end.
+```
+
 ### Scaling the acceptor pool
 
 Each accepted socket runs its own `h2_connection` gen_statem, so concurrency on established connections scales with BEAM schedulers. The `acceptors` opt only sizes the pool of processes blocked in `ssl:transport_accept` / `gen_tcp:accept` on the shared listen socket — raise it when the incoming connection rate (not in-flight traffic) is the bottleneck:
@@ -195,7 +206,7 @@ receive {h2, Conn, {response, Sid, 200, _}} -> ok end,
 ok = h2:send_data(Conn, Sid, FrameBytes, false).
 ```
 
-If the peer never advertised the setting, `h2:request/3` returns `{error, extended_connect_disabled}`. Server handlers see `:protocol` in the request `Headers` argument. Tunnel semantics (no body length, no trailers) apply once the 2xx is sent.
+If the peer never advertised the setting, `h2:request/3` returns `{error, extended_connect_disabled}`. Server handlers read `:protocol` from the request `Headers` argument (alongside `:authority`/`:scheme`; see [Server](#server)). Tunnel semantics (no body length, no trailers) apply once the 2xx is sent.
 
 ## Bidirectional streaming (gRPC)
 
