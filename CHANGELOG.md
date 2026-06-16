@@ -4,6 +4,8 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-06-16
+
 ### Changed
 
 - Server request delivery now keeps `:authority` and `:scheme` in the handler
