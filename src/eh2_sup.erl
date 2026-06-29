@@ -1,4 +1,4 @@
--module(h2_sup).
+-module(eh2_sup).
 -behaviour(supervisor).
 
 -export([start_link/0, start_listener/1]).
@@ -14,10 +14,10 @@ init([]) ->
     SupFlags = #{strategy => simple_one_for_one,
                  intensity => 10,
                  period => 10},
-    Child = #{id => h2_listener,
-              start => {h2_listener, start_link, []},
+    Child = #{id => eh2_listener,
+              start => {eh2_listener, start_link, []},
               restart => temporary,
               shutdown => 5000,
               type => worker,
-              modules => [h2_listener]},
+              modules => [eh2_listener]},
     {ok, {SupFlags, [Child]}}.

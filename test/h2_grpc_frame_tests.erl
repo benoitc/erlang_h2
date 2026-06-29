@@ -1,6 +1,6 @@
 %% @doc White-box frame "vectors" for the gRPC bidi flow-control and cancel
 %% paths. Where h2_grpc_tests asserts observable behaviour, this module traces
-%% h2_connection:sock_send/2 and decodes the exact frames on the wire, pinning:
+%% eh2_connection:sock_send/2 and decodes the exact frames on the wire, pinning:
 %%   * manual flow control emits NO stream WINDOW_UPDATE until consume/3, then
 %%     exactly one carrying the acked increment;
 %%   * cancel/2 emits exactly one RST_STREAM with error code CANCEL (0x8);
@@ -224,12 +224,12 @@ post_headers(Port) ->
 
 trace_on(Conn) ->
     1 = erlang:trace(Conn, true, [call]),
-    erlang:trace_pattern({h2_connection, sock_send, 2}, true, [local]),
+    erlang:trace_pattern({eh2_connection, sock_send, 2}, true, [local]),
     ok.
 
 trace_off(Conn) ->
     erlang:trace(Conn, false, [call]),
-    erlang:trace_pattern({h2_connection, sock_send, 2}, false, [local]),
+    erlang:trace_pattern({eh2_connection, sock_send, 2}, false, [local]),
     ok.
 
 %% Collect traced socket writes for IdleMs of quiet, decode them into frames.
@@ -239,7 +239,7 @@ collect_frames(Conn, IdleMs) ->
 
 collect_writes(Conn, IdleMs, Acc) ->
     receive
-        {trace, Conn, call, {h2_connection, sock_send, [_S, IoData]}} ->
+        {trace, Conn, call, {eh2_connection, sock_send, [_S, IoData]}} ->
             collect_writes(Conn, IdleMs, [iolist_to_binary(IoData) | Acc])
     after IdleMs ->
         lists:reverse(Acc)

@@ -1,7 +1,7 @@
 %% @doc HTTP/2 Public API
 %%
 %% This module provides the public API for HTTP/2 client and server operations.
-%% It wraps the h2_connection state machine with a clean interface.
+%% It wraps the eh2_connection state machine with a clean interface.
 %%
 %% == Client Usage ==
 %%
@@ -101,7 +101,7 @@
 -type stream_id() :: non_neg_integer().
 -type headers() :: [{binary(), binary()}].
 -type status() :: 100..599.
--type error_code() :: h2_error:error_code().
+-type error_code() :: eh2_error:error_code().
 -type server_ref() :: {pid(), reference(), inet:port_number()}.
 
 -type connect_opts() :: #{
@@ -111,7 +111,7 @@
     key => binary() | string(),
     cacerts => [binary()],
     verify => verify_none | verify_peer,
-    settings => h2_settings:settings(),
+    settings => eh2_settings:settings(),
     timeout => timeout(),
     connect_timeout => timeout(),
     sync => boolean()
@@ -132,7 +132,7 @@
     ip => inet:ip_address(),
     inet6 => boolean(),
     handler := fun((connection(), stream_id(), binary(), binary(), headers()) -> any()),
-    settings => h2_settings:settings(),
+    settings => eh2_settings:settings(),
     acceptors => pos_integer(),
     %% RFC 8441: when true, advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1 and
     %% accept Extended CONNECT requests carrying the `:protocol` pseudo-header.
@@ -221,7 +221,7 @@ connect_tcp(Host, Port, Opts, Timeout) ->
 start_connection(Mode, Socket, Opts) ->
     ConnOpts = maps:with([settings], Opts),
     Timeout = maps:get(timeout, Opts, ?DEFAULT_TIMEOUT_MS),
-    case h2_connection:start_link(Mode, Socket, ConnOpts) of
+    case eh2_connection:start_link(Mode, Socket, ConnOpts) of
         {ok, Pid} ->
             %% Transfer socket ownership to connection process
             Transport = case is_ssl_socket(Socket) of
@@ -234,16 +234,16 @@ start_connection(Mode, Socket, Opts) ->
             end,
             case TransferResult of
                 ok ->
-                    _ = h2_connection:activate(Pid),
-                    case h2_connection:wait_connected(Pid, Timeout) of
+                    _ = eh2_connection:activate(Pid),
+                    case eh2_connection:wait_connected(Pid, Timeout) of
                         ok ->
                             {ok, Pid};
                         {error, Reason} ->
-                            ignore_errors(fun() -> h2_connection:close(Pid) end),
+                            ignore_errors(fun() -> eh2_connection:close(Pid) end),
                             {error, Reason}
                     end;
                 {error, TransferReason} ->
-                    ignore_errors(fun() -> h2_connection:close(Pid) end),
+                    ignore_errors(fun() -> eh2_connection:close(Pid) end),
                     ignore_errors(fun() -> close_socket(Transport, Socket) end),
                     {error, {controlling_process_failed, TransferReason}}
             end;
@@ -270,11 +270,11 @@ is_ssl_socket(_) ->
 %% @doc Wait for a client connection to reach the connected state.
 -spec wait_connected(connection()) -> ok | {error, term()}.
 wait_connected(Conn) ->
-    h2_connection:wait_connected(Conn).
+    eh2_connection:wait_connected(Conn).
 
 -spec wait_connected(connection(), timeout()) -> ok | {error, term()}.
 wait_connected(Conn, Timeout) ->
-    h2_connection:wait_connected(Conn, Timeout).
+    eh2_connection:wait_connected(Conn, Timeout).
 
 %% @doc Send an HTTP/2 request with pre-built headers (matches quic_h3:request/2).
 %% Headers should include pseudo-headers (:method, :path, :scheme, :authority).
@@ -301,14 +301,14 @@ request(Conn, Headers, Opts) ->
     case maps:get(protocol, Opts, undefined) of
         undefined ->
             EndStream = maps:get(end_stream, Opts, true),
-            h2_connection:send_request_headers(Conn, Headers, EndStream, StreamOpts);
+            eh2_connection:send_request_headers(Conn, Headers, EndStream, StreamOpts);
         Protocol when is_binary(Protocol) ->
             Headers1 = case proplists:is_defined(<<":protocol">>, Headers) of
                 true  -> Headers;
                 false -> inject_protocol_pseudo(Headers, Protocol)
             end,
             EndStream = maps:get(end_stream, Opts, false),
-            h2_connection:send_request_headers(Conn, Headers1, EndStream, StreamOpts)
+            eh2_connection:send_request_headers(Conn, Headers1, EndStream, StreamOpts)
     end.
 
 %% Project the per-stream creation options out of the user opts map.
@@ -334,18 +334,18 @@ inject_protocol_pseudo(Headers, Protocol) ->
 -spec request(connection(), binary(), binary(), headers()) ->
     {ok, stream_id()} | {error, term()}.
 request(Conn, <<"CONNECT">> = Method, Path, Headers) ->
-    h2_connection:send_request(Conn, Method, Path, Headers, false);
+    eh2_connection:send_request(Conn, Method, Path, Headers, false);
 request(Conn, Method, Path, Headers) ->
-    h2_connection:send_request(Conn, Method, Path, Headers, true).
+    eh2_connection:send_request(Conn, Method, Path, Headers, true).
 
 %% @doc Send an HTTP/2 request with body.
 %% Sends HEADERS without END_STREAM, then sends DATA with END_STREAM.
 -spec request(connection(), binary(), binary(), headers(), binary()) ->
     {ok, stream_id()} | {error, term()}.
 request(Conn, Method, Path, Headers, Body) ->
-    case h2_connection:send_request(Conn, Method, Path, Headers, false) of
+    case eh2_connection:send_request(Conn, Method, Path, Headers, false) of
         {ok, StreamId} ->
-            case h2_connection:send_data(Conn, StreamId, Body, true) of
+            case eh2_connection:send_data(Conn, StreamId, Body, true) of
                 ok -> {ok, StreamId};
                 {error, Reason} -> {error, Reason}
             end;
@@ -399,7 +399,7 @@ start_server_ssl(Port, Opts) ->
                         enable_connect_protocol => EnableConnectProtocol,
                         ref => Ref
                     },
-                    case h2_sup:start_listener(#{
+                    case eh2_sup:start_listener(#{
                         transport => ssl,
                         listen_socket => ListenSocket,
                         acceptor_count => NumAcceptors,
@@ -480,7 +480,7 @@ start_server_tcp(Port, Opts) ->
                         enable_connect_protocol => EnableConnectProtocol,
                         ref => Ref
                     },
-                    case h2_sup:start_listener(#{
+                    case eh2_sup:start_listener(#{
                         transport => tcp,
                         listen_socket => ListenSocket,
                         acceptor_count => NumAcceptors,
@@ -504,7 +504,7 @@ start_server_tcp(Port, Opts) ->
 %% @doc Stop an HTTP/2 server.
 -spec stop_server(server_ref()) -> ok.
 stop_server({ListenerPid, Ref, _Port}) ->
-    h2_listener:stop(ListenerPid, Ref).
+    eh2_listener:stop(ListenerPid, Ref).
 
 %% @doc Return the TCP port the server is actually listening on.
 -spec server_port(server_ref()) -> inet:port_number().
@@ -582,14 +582,14 @@ handle_server_connection(Socket, Handler, Settings, Transport, EnableConnectProt
         ssl -> fun ssl:close/1;
         gen_tcp -> fun gen_tcp:close/1
     end,
-    case h2_connection:start_link(server, Socket, self(), ConnOpts) of
+    case eh2_connection:start_link(server, Socket, self(), ConnOpts) of
         {ok, Conn} ->
             case TransferFn(Socket, Conn) of
                 ok ->
-                    _ = h2_connection:activate(Conn),
+                    _ = eh2_connection:activate(Conn),
                     server_connection_loop(Conn, Handler);
                 {error, _} ->
-                    ignore_errors(fun() -> h2_connection:close(Conn) end),
+                    ignore_errors(fun() -> eh2_connection:close(Conn) end),
                     ignore_errors(fun() -> CloseFn(Socket) end)
             end;
         {error, _Reason} ->
@@ -669,7 +669,7 @@ invoke_handler(Module, Conn, StreamId, Method, Path, Headers) when is_atom(Modul
 -spec send_response(connection(), stream_id(), status(), headers()) ->
     ok | {error, term()}.
 send_response(Conn, StreamId, Status, Headers) ->
-    h2_connection:send_response(Conn, StreamId, Status, Headers).
+    eh2_connection:send_response(Conn, StreamId, Status, Headers).
 
 %% @doc Send a complete response (headers + full body) in a single call. This is
 %% the fast path for the common request/response case: one message to the
@@ -680,10 +680,10 @@ send_response(Conn, StreamId, Status, Headers) ->
 -spec respond(connection(), stream_id(), status(), headers(), binary()) ->
     ok | {error, term()}.
 respond(Conn, StreamId, Status, Headers, Body) ->
-    case h2_connection:respond(Conn, StreamId, Status, Headers, Body) of
+    case eh2_connection:respond(Conn, StreamId, Status, Headers, Body) of
         need_fallback ->
-            case h2_connection:send_response(Conn, StreamId, Status, Headers) of
-                ok  -> h2_connection:send_data(Conn, StreamId, Body, true);
+            case eh2_connection:send_response(Conn, StreamId, Status, Headers) of
+                ok  -> eh2_connection:send_data(Conn, StreamId, Body, true);
                 Err -> Err
             end;
         Result ->
@@ -697,7 +697,7 @@ respond(Conn, StreamId, Status, Headers, Body) ->
 %% @doc Send data on a stream.
 -spec send_data(connection(), stream_id(), binary()) -> ok | {error, term()}.
 send_data(Conn, StreamId, Data) ->
-    h2_connection:send_data(Conn, StreamId, Data).
+    eh2_connection:send_data(Conn, StreamId, Data).
 
 %% @doc Send data on a stream with end_stream flag.
 %%
@@ -707,7 +707,7 @@ send_data(Conn, StreamId, Data) ->
 %% without bound. For a blocking variant see send_data/5.
 -spec send_data(connection(), stream_id(), binary(), boolean()) -> ok | {error, term()}.
 send_data(Conn, StreamId, Data, EndStream) ->
-    h2_connection:send_data(Conn, StreamId, Data, EndStream).
+    eh2_connection:send_data(Conn, StreamId, Data, EndStream).
 
 %% @doc Send data with per-call options. Pass `#{block => Timeout}' (ms or
 %% `infinity') to block until the peer's window accepts the data, returning `ok',
@@ -716,7 +716,7 @@ send_data(Conn, StreamId, Data, EndStream) ->
 -spec send_data(connection(), stream_id(), binary(), boolean(), map()) ->
     ok | {error, term()}.
 send_data(Conn, StreamId, Data, EndStream, Opts) ->
-    h2_connection:send_data(Conn, StreamId, Data, EndStream, Opts).
+    eh2_connection:send_data(Conn, StreamId, Data, EndStream, Opts).
 
 %% @doc Acknowledge consumption of ByteCount received bytes on a manual
 %% flow-control stream, replenishing its receive window. Receive-side
@@ -724,22 +724,22 @@ send_data(Conn, StreamId, Data, EndStream, Opts) ->
 %% peer's WINDOW_UPDATE on consumer progress. No-op on auto-mode streams.
 -spec consume(connection(), stream_id(), non_neg_integer()) -> ok | {error, term()}.
 consume(Conn, StreamId, ByteCount) ->
-    h2_connection:consume(Conn, StreamId, ByteCount).
+    eh2_connection:consume(Conn, StreamId, ByteCount).
 
 %% @doc Send trailers on a stream.
 -spec send_trailers(connection(), stream_id(), headers()) -> ok | {error, term()}.
 send_trailers(Conn, StreamId, Trailers) ->
-    h2_connection:send_trailers(Conn, StreamId, Trailers).
+    eh2_connection:send_trailers(Conn, StreamId, Trailers).
 
 %% @doc Cancel a stream.
 -spec cancel(connection(), stream_id()) -> ok | {error, term()}.
 cancel(Conn, StreamId) ->
-    h2_connection:cancel_stream(Conn, StreamId).
+    eh2_connection:cancel_stream(Conn, StreamId).
 
 %% @doc Cancel a stream with a specific error code.
 -spec cancel(connection(), stream_id(), error_code()) -> ok | {error, term()}.
 cancel(Conn, StreamId, ErrorCode) ->
-    h2_connection:cancel_stream(Conn, StreamId, ErrorCode).
+    eh2_connection:cancel_stream(Conn, StreamId, ErrorCode).
 
 %% @deprecated Use {@link cancel/2} instead.
 -spec cancel_stream(connection(), stream_id()) -> ok | {error, term()}.
@@ -772,46 +772,46 @@ cancel_stream(Conn, StreamId, ErrorCode) ->
 -spec set_stream_handler(connection(), stream_id(), pid()) ->
     ok | {ok, [{binary(), boolean()}]} | {error, term()}.
 set_stream_handler(Conn, StreamId, Pid) ->
-    h2_connection:set_stream_handler(Conn, StreamId, Pid).
+    eh2_connection:set_stream_handler(Conn, StreamId, Pid).
 
 -spec set_stream_handler(connection(), stream_id(), pid(), map()) ->
     ok | {ok, [{binary(), boolean()}]} | {error, term()}.
 set_stream_handler(Conn, StreamId, Pid, Opts) ->
-    h2_connection:set_stream_handler(Conn, StreamId, Pid, Opts).
+    eh2_connection:set_stream_handler(Conn, StreamId, Pid, Opts).
 
 -spec unset_stream_handler(connection(), stream_id()) -> ok.
 unset_stream_handler(Conn, StreamId) ->
-    h2_connection:unset_stream_handler(Conn, StreamId).
+    eh2_connection:unset_stream_handler(Conn, StreamId).
 
 %% @doc Initiate graceful connection shutdown.
 -spec goaway(connection()) -> ok | {error, term()}.
 goaway(Conn) ->
-    h2_connection:send_goaway(Conn).
+    eh2_connection:send_goaway(Conn).
 
 %% @doc Initiate connection shutdown with error code.
 -spec goaway(connection(), error_code()) -> ok | {error, term()}.
 goaway(Conn, ErrorCode) ->
-    h2_connection:send_goaway(Conn, ErrorCode).
+    eh2_connection:send_goaway(Conn, ErrorCode).
 
 %% @doc Close the connection immediately.
 -spec close(connection()) -> ok.
 close(Conn) ->
-    h2_connection:close(Conn).
+    eh2_connection:close(Conn).
 
 %% @doc Get local settings.
--spec get_settings(connection()) -> h2_settings:settings().
+-spec get_settings(connection()) -> eh2_settings:settings().
 get_settings(Conn) ->
-    h2_connection:get_settings(Conn).
+    eh2_connection:get_settings(Conn).
 
 %% @doc Get peer settings.
--spec get_peer_settings(connection()) -> h2_settings:settings().
+-spec get_peer_settings(connection()) -> eh2_settings:settings().
 get_peer_settings(Conn) ->
-    h2_connection:get_peer_settings(Conn).
+    eh2_connection:get_peer_settings(Conn).
 
 %% @doc Transfer connection ownership.
 -spec controlling_process(connection(), pid()) -> ok | {error, term()}.
 controlling_process(Conn, NewOwner) ->
-    h2_connection:controlling_process(Conn, NewOwner).
+    eh2_connection:controlling_process(Conn, NewOwner).
 
 %% ============================================================================
 %% Internal Functions

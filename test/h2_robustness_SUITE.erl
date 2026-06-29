@@ -51,14 +51,14 @@ pre_settings_ack_response(Config) ->
     {ok, S} = gen_tcp:connect({127,0,0,1}, Port,
                               [binary, {active, false}, {packet, raw}, {nodelay, true}]),
     Preface = <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>,
-    Settings = h2_frame:encode(h2_frame:settings([])),
+    Settings = eh2_frame:encode(eh2_frame:settings([])),
     ok = gen_tcp:send(S, <<Preface/binary, Settings/binary>>),
     Hdrs = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>},
             {<<":scheme">>, <<"http">>}, {<<":authority">>, <<"127.0.0.1">>}],
-    {HB, _} = h2_hpack:encode(Hdrs, h2_hpack:new_context(4096)),
-    ok = gen_tcp:send(S, h2_frame:encode(h2_frame:headers(1, HB, true))),
+    {HB, _} = eh2_hpack:encode(Hdrs, eh2_hpack:new_context(4096)),
+    ok = gen_tcp:send(S, eh2_frame:encode(eh2_frame:headers(1, HB, true))),
     timer:sleep(50),  %% ensure the server dispatches our request pre-ACK
-    ok = gen_tcp:send(S, h2_frame:encode(h2_frame:settings_ack())),
+    ok = gen_tcp:send(S, eh2_frame:encode(eh2_frame:settings_ack())),
     {Status, Body} = recv_response(S, <<>>, undefined, <<>>, erlang:monotonic_time(millisecond)),
     ?assertEqual(200, Status),
     ?assertEqual(<<"Hello, World!">>, Body),
@@ -69,9 +69,9 @@ recv_response(S, Buf, Status, Body, T0) ->
     case (erlang:monotonic_time(millisecond) - T0) > 4000 of
         true -> ct:fail({timeout, no_response, Status, Body});
         false ->
-            case h2_frame:decode(Buf, 16384) of
+            case eh2_frame:decode(Buf, 16384) of
                 {ok, {headers, 1, HB, _End, _EH}, Rest} ->
-                    {ok, Decoded, _} = h2_hpack:decode(HB, h2_hpack:new_context(4096)),
+                    {ok, Decoded, _} = eh2_hpack:decode(HB, eh2_hpack:new_context(4096)),
                     St = binary_to_integer(proplists:get_value(<<":status">>, Decoded)),
                     recv_response(S, Rest, St, Body, T0);
                 {ok, {data, 1, D, true, _}, _Rest} ->

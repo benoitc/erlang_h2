@@ -21,10 +21,10 @@ run([TotalS, WinS]) ->
     {ok, S} = gen_tcp:connect({127,0,0,1}, Port,
                               [binary, {active, false}, {packet, raw}, {nodelay, true}]),
     Pre = <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>,
-    Set = h2_frame:encode(h2_frame:settings([])),
-    Ack = h2_frame:encode(h2_frame:settings_ack()),
+    Set = eh2_frame:encode(eh2_frame:settings([])),
+    Ack = eh2_frame:encode(eh2_frame:settings_ack()),
     ok = gen_tcp:send(S, <<Pre/binary, Set/binary, Ack/binary>>),
-    Ctx = h2_hpack:new_context(4096),
+    Ctx = eh2_hpack:new_context(4096),
     %% warm up (not traced)
     drive(S, Ctx, Win, min(Win, 2000)),
     %% traced run
@@ -54,7 +54,7 @@ loop(S, B, C, N, Sent, Done, Total, W) ->
     end.
 
 drain(B, C) ->
-    case h2_frame:decode(B, 16384) of
+    case eh2_frame:decode(B, 16384) of
         {ok, {data, _, _, true, _}, R} -> drain(R, C+1);
         {ok, _F, R} -> drain(R, C);
         _ -> {C, B}
@@ -64,6 +64,6 @@ send_n(_S, N, 0, C) -> {C, N};
 send_n(S, N, K, C) ->
     H = [{<<":method">>,<<"GET">>},{<<":path">>,<<"/">>},
          {<<":scheme">>,<<"http">>},{<<":authority">>,<<"127.0.0.1">>}],
-    {HB, C1} = h2_hpack:encode(H, C),
-    ok = gen_tcp:send(S, h2_frame:encode(h2_frame:headers(N, HB, true))),
+    {HB, C1} = eh2_hpack:encode(H, C),
+    ok = gen_tcp:send(S, eh2_frame:encode(eh2_frame:headers(N, HB, true))),
     send_n(S, N+2, K-1, C1).

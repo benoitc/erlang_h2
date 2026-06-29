@@ -324,7 +324,7 @@ init_per_testcase(_TestCase, Config) ->
     end.
 
 end_per_testcase(_TestCase, Config) ->
-    %% Server-side h2_connection processes started on accepted sockets are
+    %% Server-side eh2_connection processes started on accepted sockets are
     %% linked to the caller; trap exits so their teardown surfaces as
     %% messages we can drain instead of killing us.
     Prev = process_flag(trap_exit, true),
@@ -860,7 +860,7 @@ ping_test(Config) ->
         ssl_opts => [{verify, verify_none}]
     }),
 
-    %% PING is handled internally by h2_connection
+    %% PING is handled internally by eh2_connection
     %% Just verify connection still works after some time
     timer:sleep(100),
 
@@ -1906,10 +1906,10 @@ extended_connect_server_rejects_when_disabled_test(Config) ->
                               {verify, verify_none}], 5000),
     %% Preface + empty SETTINGS.
     ok = ssl:send(Sock, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:settings([]))),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:settings([]))),
     %% Drain server SETTINGS, then ACK it.
     _ = read_first_settings(Sock),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:settings_ack())),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:settings_ack())),
     %% Send Extended CONNECT HEADERS on stream 1.
     Headers = [
         {<<":method">>, <<"CONNECT">>},
@@ -1918,8 +1918,8 @@ extended_connect_server_rejects_when_disabled_test(Config) ->
         {<<":authority">>, <<"localhost">>},
         {<<":protocol">>, <<"websocket">>}
     ],
-    {Block, _Ctx} = h2_hpack:encode(Headers, h2_hpack:new_context()),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, false))),
+    {Block, _Ctx} = eh2_hpack:encode(Headers, eh2_hpack:new_context()),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:headers(1, Block, false))),
     %% Expect RST_STREAM with PROTOCOL_ERROR (= 1) on stream 1.
     case wait_for_rst_stream(Sock, 1, 3000) of
         {ok, ErrorCode} ->
@@ -1961,9 +1961,9 @@ informational_end_stream_rejected_test(Config) ->
     _Srv = spawn(fun() ->
         {ok, S} = raw_tls_accept(LS),
         fake_server_await_headers(S),
-        {Block, _} = h2_hpack:encode([{<<":status">>, <<"103">>}],
-                                     h2_hpack:new_context()),
-        ok = ssl:send(S, h2_frame:encode(h2_frame:headers(1, Block, true))),
+        {Block, _} = eh2_hpack:encode([{<<":status">>, <<"103">>}],
+                                     eh2_hpack:new_context()),
+        ok = ssl:send(S, eh2_frame:encode(eh2_frame:headers(1, Block, true))),
         %% Read the client's RST_STREAM back on this socket.
         Result = wait_for_rst_stream(S, 1, 3000),
         Parent ! {srv_rst, Result},
@@ -2020,8 +2020,8 @@ authority_userinfo_rejected_inbound_test(Config) ->
         {<<":path">>, <<"/">>},
         {<<":authority">>, <<"bob@localhost">>}
     ],
-    {Block, _Ctx} = h2_hpack:encode(Headers, h2_hpack:new_context()),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    {Block, _Ctx} = eh2_hpack:encode(Headers, eh2_hpack:new_context()),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:headers(1, Block, true))),
     case wait_for_rst_stream(Sock, 1, 3000) of
         {ok, ErrorCode} -> ?assertEqual(1, ErrorCode);
         timeout -> ct:fail(no_rst_stream)
@@ -2051,8 +2051,8 @@ extended_connect_bad_protocol_token_rejected_test(Config) ->
         {<<":authority">>, <<"localhost">>},
         {<<":protocol">>, <<"web socket">>}   %% space → not a token
     ],
-    {Block, _Ctx} = h2_hpack:encode(Headers, h2_hpack:new_context()),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, false))),
+    {Block, _Ctx} = eh2_hpack:encode(Headers, eh2_hpack:new_context()),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:headers(1, Block, false))),
     case wait_for_rst_stream(Sock, 1, 3000) of
         {ok, ErrorCode} -> ?assertEqual(1, ErrorCode);
         timeout -> ct:fail(no_rst_stream)
@@ -2104,9 +2104,9 @@ raw_h2_client(Port) ->
                               {alpn_advertised_protocols, [<<"h2">>]},
                               {verify, verify_none}], 5000),
     ok = ssl:send(Sock, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:settings([]))),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:settings([]))),
     _ = read_first_settings(Sock),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:settings_ack())),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:settings_ack())),
     {ok, Sock}.
 
 %% RFC 9113 §5.1: a stream closed via END_STREAM accepts only PRIORITY; any
@@ -2121,14 +2121,14 @@ closed_stream_headers_triggers_goaway_test(Config) ->
         {<<":path">>, <<"/">>},
         {<<":authority">>, <<"localhost">>}
     ],
-    {Block, Ctx1} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    {Block, Ctx1} = eh2_hpack:encode(Headers, eh2_hpack:new_context()),
     %% Open + close stream 1 via END_STREAM.
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:headers(1, Block, true))),
     %% Wait for the server's response + END_STREAM on stream 1.
     ok = drain_until_end_stream(Sock, 1, 3000),
     %% Send a second HEADERS on the now-closed stream. Spec mandates GOAWAY.
-    {Block2, _} = h2_hpack:encode(Headers, Ctx1),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block2, true))),
+    {Block2, _} = eh2_hpack:encode(Headers, Ctx1),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:headers(1, Block2, true))),
     case wait_for_goaway(Sock, 3000) of
         {ok, ErrorCode} -> ?assertEqual(5, ErrorCode);  %% STREAM_CLOSED
         timeout         -> ct:fail(no_goaway)
@@ -2146,10 +2146,10 @@ closed_stream_data_triggers_goaway_test(Config) ->
         {<<":path">>, <<"/">>},
         {<<":authority">>, <<"localhost">>}
     ],
-    {Block, _Ctx1} = h2_hpack:encode(Headers, h2_hpack:new_context()),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    {Block, _Ctx1} = eh2_hpack:encode(Headers, eh2_hpack:new_context()),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:headers(1, Block, true))),
     ok = drain_until_end_stream(Sock, 1, 3000),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:data(1, <<"junk">>, false))),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:data(1, <<"junk">>, false))),
     case wait_for_goaway(Sock, 3000) of
         {ok, ErrorCode} -> ?assertEqual(5, ErrorCode);  %% STREAM_CLOSED
         timeout         -> ct:fail(no_goaway)
@@ -2168,13 +2168,13 @@ rst_closed_stream_headers_triggers_rst_test(Config) ->
         {<<":path">>, <<"/">>},
         {<<":authority">>, <<"localhost">>}
     ],
-    {Block, Ctx1} = h2_hpack:encode(Headers, h2_hpack:new_context()),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    {Block, Ctx1} = eh2_hpack:encode(Headers, eh2_hpack:new_context()),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:headers(1, Block, true))),
     %% Close the stream ourselves with RST_STREAM.
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:rst_stream(1, 8))),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:rst_stream(1, 8))),
     %% Now send HEADERS on the rst-closed stream — expect RST_STREAM.
-    {Block2, _} = h2_hpack:encode(Headers, Ctx1),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block2, true))),
+    {Block2, _} = eh2_hpack:encode(Headers, Ctx1),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:headers(1, Block2, true))),
     case wait_for_rst_or_goaway(Sock, 3000) of
         {rst, ErrorCode} -> ?assertEqual(5, ErrorCode);  %% STREAM_CLOSED
         {goaway, _}      -> ct:fail(expected_stream_error_got_connection);
@@ -2192,10 +2192,10 @@ rst_closed_stream_data_triggers_rst_test(Config) ->
         {<<":path">>, <<"/">>},
         {<<":authority">>, <<"localhost">>}
     ],
-    {Block, _} = h2_hpack:encode(Headers, h2_hpack:new_context()),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:rst_stream(1, 8))),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:data(1, <<"junk">>, false))),
+    {Block, _} = eh2_hpack:encode(Headers, eh2_hpack:new_context()),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:headers(1, Block, true))),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:rst_stream(1, 8))),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:data(1, <<"junk">>, false))),
     case wait_for_rst_or_goaway(Sock, 3000) of
         {rst, ErrorCode} -> ?assertEqual(5, ErrorCode);
         {goaway, _}      -> ct:fail(expected_stream_error_got_connection);
@@ -2216,11 +2216,11 @@ closed_stream_continuation_triggers_goaway_test(Config) ->
         {<<":path">>, <<"/">>},
         {<<":authority">>, <<"localhost">>}
     ],
-    {Block, Ctx1} = h2_hpack:encode(Headers, h2_hpack:new_context()),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    {Block, Ctx1} = eh2_hpack:encode(Headers, eh2_hpack:new_context()),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:headers(1, Block, true))),
     ok = drain_until_end_stream(Sock, 1, 3000),
-    {Block2, _} = h2_hpack:encode(Headers, Ctx1),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:continuation(1, Block2, true))),
+    {Block2, _} = eh2_hpack:encode(Headers, Ctx1),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:continuation(1, Block2, true))),
     case wait_for_goaway(Sock, 3000) of
         {ok, _ErrorCode} -> ok;  %% STREAM_CLOSED or PROTOCOL_ERROR both acceptable
         timeout          -> ct:fail(no_goaway)
@@ -2255,13 +2255,13 @@ max_concurrent_streams_refuses_excess_test(Config) ->
         {<<":path">>, <<"/">>},
         {<<":authority">>, <<"localhost">>}
     ],
-    Ctx0 = h2_hpack:new_context(),
-    {Block1, Ctx1} = h2_hpack:encode(Headers, Ctx0),
+    Ctx0 = eh2_hpack:new_context(),
+    {Block1, Ctx1} = eh2_hpack:encode(Headers, Ctx0),
     %% Stream 1 open (no END_STREAM): counts toward the limit.
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block1, false))),
-    {Block3, _} = h2_hpack:encode(Headers, Ctx1),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:headers(1, Block1, false))),
+    {Block3, _} = eh2_hpack:encode(Headers, Ctx1),
     %% Stream 3 would push us over max=1 → expect RST_STREAM(REFUSED_STREAM=7).
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(3, Block3, true))),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:headers(3, Block3, true))),
     case wait_for_rst_or_goaway(Sock, 3000) of
         {rst, ErrorCode} -> ?assertEqual(7, ErrorCode);
         Other            -> ct:fail({expected_rst_refused, Other})
@@ -2281,7 +2281,7 @@ client_rejects_enable_push_one_test(Config) ->
         {ok, S}  = ssl:handshake(Tr, 5000),
         _ = ssl:recv(S, byte_size(<<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>), 5000),
         %% Send SETTINGS with enable_push=1 — forbidden toward a client.
-        ok = ssl:send(S, h2_frame:encode(h2_frame:settings([{enable_push, 1}]))),
+        ok = ssl:send(S, eh2_frame:encode(eh2_frame:settings([{enable_push, 1}]))),
         Result = wait_for_goaway(S, 3000),
         Parent ! {goaway_result, Result},
         ssl:close(S)
@@ -2312,8 +2312,8 @@ head_response_with_content_length_accepted_test(Config) ->
         {ok, S} = raw_tls_accept(LS),
         fake_server_await_headers(S),
         Hdrs = [{<<":status">>, <<"200">>}, {<<"content-length">>, <<"1234">>}],
-        {Block, _} = h2_hpack:encode(Hdrs, h2_hpack:new_context()),
-        ok = ssl:send(S, h2_frame:encode(h2_frame:headers(1, Block, true))),
+        {Block, _} = eh2_hpack:encode(Hdrs, eh2_hpack:new_context()),
+        ok = ssl:send(S, eh2_frame:encode(eh2_frame:headers(1, Block, true))),
         Parent ! done_sending,
         timer:sleep(500),
         ssl:close(S)
@@ -2336,9 +2336,9 @@ body_forbidden_response_without_end_stream_rejected_test(Config) ->
         {ok, S} = raw_tls_accept(LS),
         fake_server_await_headers(S),
         Hdrs = [{<<":status">>, <<"204">>}],
-        {Block, _} = h2_hpack:encode(Hdrs, h2_hpack:new_context()),
+        {Block, _} = eh2_hpack:encode(Hdrs, eh2_hpack:new_context()),
         %% HEADERS without END_STREAM — not allowed for 204.
-        ok = ssl:send(S, h2_frame:encode(h2_frame:headers(1, Block, false))),
+        ok = ssl:send(S, eh2_frame:encode(eh2_frame:headers(1, Block, false))),
         timer:sleep(500),
         ssl:close(S)
     end),
@@ -2401,7 +2401,7 @@ unknown_frame_type_is_ignored_test(Config) ->
     ok = ssl:send(Sock, Bad),
     %% Follow with a PING — if the unknown frame was ignored, we get a PING ACK.
     PingData = <<1,2,3,4,5,6,7,8>>,
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:ping(PingData))),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:ping(PingData))),
     ?assertEqual({ok, PingData}, wait_for_ping_ack(Sock, 3000)),
     ssl:close(Sock),
     ok.
@@ -2411,7 +2411,7 @@ unknown_frame_type_is_ignored_test(Config) ->
 window_update_on_idle_stream_triggers_goaway_test(Config) ->
     Port = ?config(port, Config),
     {ok, Sock} = raw_h2_client(Port),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:window_update(99, 1024))),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:window_update(99, 1024))),
     case wait_for_goaway(Sock, 3000) of
         {ok, ErrorCode} -> ?assertEqual(1, ErrorCode);  %% PROTOCOL_ERROR
         timeout         -> ct:fail(no_goaway)
@@ -2438,7 +2438,7 @@ push_promise_gets_stream_reset_test(Config) ->
         {ok, S} = raw_tls_accept(LS),
         Hdrs = [{<<":method">>, <<"GET">>}, {<<":scheme">>, <<"https">>},
                 {<<":path">>, <<"/">>}, {<<":authority">>, <<"l">>}],
-        {Block, _} = h2_hpack:encode(Hdrs, h2_hpack:new_context()),
+        {Block, _} = eh2_hpack:encode(Hdrs, eh2_hpack:new_context()),
         Payload = <<0:1, 2:31, Block/binary>>,
         Len = byte_size(Payload),
         Frame = <<Len:24, 5:8, 16#4:8, 0:1, 1:31, Payload/binary>>,
@@ -2482,7 +2482,7 @@ ping_flood_triggers_enhance_your_calm_test(Config) ->
     Port = ?config(port, Config),
     {ok, Sock} = raw_h2_client(Port),
     %% PING payload must be 8 bytes.
-    PingFrame = h2_frame:encode(h2_frame:ping(<<0,0,0,0,0,0,0,0>>)),
+    PingFrame = eh2_frame:encode(eh2_frame:ping(<<0,0,0,0,0,0,0,0>>)),
     [ssl:send(Sock, PingFrame) || _ <- lists:seq(1, 40)],
     case wait_for_goaway(Sock, 3000) of
         {ok, ErrorCode} -> ?assertEqual(11, ErrorCode);  %% ENHANCE_YOUR_CALM
@@ -2505,7 +2505,7 @@ continuation_flood_triggers_enhance_your_calm_test(Config) ->
         {<<":path">>, <<"/">>},
         {<<":authority">>, <<"localhost">>}
     ],
-    {Block, _} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    {Block, _} = eh2_hpack:encode(Headers, eh2_hpack:new_context()),
     HeadersLen = byte_size(Block),
     HeadersFrame = <<HeadersLen:24, 16#1:8, 16#0:8, 0:1, 1:31, Block/binary>>,
     ok = ssl:send(Sock, HeadersFrame),
@@ -2584,14 +2584,14 @@ large_body_yields_to_inbound_frames_test(Config) ->
         {<<":path">>, <<"/">>},
         {<<":authority">>, <<"localhost">>}
     ],
-    {Block, _} = h2_hpack:encode(Headers, h2_hpack:new_context()),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    {Block, _} = eh2_hpack:encode(Headers, eh2_hpack:new_context()),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:headers(1, Block, true))),
     %% Drain a few DATA frames + WINDOW_UPDATE ack credit, then send a PING.
     PingData = <<9,8,7,6,5,4,3,2>>,
     ok = drain_and_credit(Sock, 1, 2000),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:ping(PingData))),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:window_update(0, 1024 * 1024))),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:window_update(1, 1024 * 1024))),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:ping(PingData))),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:window_update(0, 1024 * 1024))),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:window_update(1, 1024 * 1024))),
     ?assertEqual({ok, PingData}, wait_for_ping_ack(Sock, 5000)),
     %% Server's send_data must have completed with ok.
     receive {server_send_result, ok} -> ok
@@ -2708,8 +2708,8 @@ send_buffer_full_when_peer_stalls_window_test(Config) ->
         {<<":path">>, <<"/">>},
         {<<":authority">>, <<"localhost">>}
     ],
-    {Block, _} = h2_hpack:encode(Headers, h2_hpack:new_context()),
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    {Block, _} = eh2_hpack:encode(Headers, eh2_hpack:new_context()),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:headers(1, Block, true))),
     receive
         {send_result, {error, send_buffer_full}} -> ok;
         {send_result, Other} -> ct:fail({expected_send_buffer_full, Other})
@@ -2786,7 +2786,7 @@ goaway_closes_tcp_socket_test(Config) ->
     Port = ?config(port, Config),
     {ok, Sock} = raw_h2_client(Port),
     %% Force a connection error: WINDOW_UPDATE on an idle stream id.
-    ok = ssl:send(Sock, h2_frame:encode(h2_frame:window_update(99, 1024))),
+    ok = ssl:send(Sock, eh2_frame:encode(eh2_frame:window_update(99, 1024))),
     case wait_for_goaway(Sock, 3000) of
         {ok, _ErrorCode} -> ok;
         timeout          -> ct:fail(no_goaway)
@@ -2838,7 +2838,7 @@ headers_priority_self_dependency_is_stream_error_test(Config) ->
         {<<":path">>, <<"/">>},
         {<<":authority">>, <<"localhost">>}
     ],
-    {Block, _} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    {Block, _} = eh2_hpack:encode(Headers, eh2_hpack:new_context()),
     %% HEADERS with PRIORITY flag (0x20) + END_HEADERS (0x4) + END_STREAM (0x1).
     %% Priority payload: Exclusive=0, StreamDep=1, Weight=15 (= 16).
     Priority = <<0:1, 1:31, 15:8>>,
@@ -2862,7 +2862,7 @@ send_request_without_host_omits_authority_test(Config) ->
     spawn_link(fun() ->
         {ok, S} = raw_tls_accept(LS),
         Block = read_headers_block(S),
-        {ok, Decoded, _} = h2_hpack:decode(Block, h2_hpack:new_context()),
+        {ok, Decoded, _} = eh2_hpack:decode(Block, eh2_hpack:new_context()),
         Parent ! {headers, Decoded},
         timer:sleep(200),
         ssl:close(S)
@@ -2963,9 +2963,9 @@ raw_tls_accept(LS) ->
     %% Read client preface, expect its SETTINGS, send ours + ACK theirs.
     {ok, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>} =
         ssl:recv(S, byte_size(<<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>), 5000),
-    ok = ssl:send(S, h2_frame:encode(h2_frame:settings([]))),
+    ok = ssl:send(S, eh2_frame:encode(eh2_frame:settings([]))),
     _ = drain_frames_until_settings(S),
-    ok = ssl:send(S, h2_frame:encode(h2_frame:settings_ack())),
+    ok = ssl:send(S, eh2_frame:encode(eh2_frame:settings_ack())),
     {ok, S}.
 
 %% Read frames until we see the client's SETTINGS (non-ACK) then ACK any
@@ -3038,7 +3038,7 @@ receive_full_response_with_trailers(Conn, StreamId, Timeout, Status, Headers, Bo
         {error, timeout}
     end.
 
-%% Regression guard: h2_connection:init/1 classifies its socket by the
+%% Regression guard: eh2_connection:init/1 classifies its socket by the
 %% `sslsocket' tag, not by tuple arity. OTP 26+ widened sslsocket from a
 %% 3-tuple to an 8-tuple; the old pattern match silently fell through to
 %% `gen_tcp' and later crashed in `prim_inet:setopts/2'. This test fails

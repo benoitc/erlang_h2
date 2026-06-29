@@ -11,7 +11,7 @@
 %% 10   | 4      | 30          | 0-1073741823
 %% 11   | 8      | 62          | 0-4611686018427387903
 %%
--module(h2_varint).
+-module(eh2_varint).
 
 -export([encode/1, decode/1, decode_with_rest/1]).
 -export([encoded_size/1]).

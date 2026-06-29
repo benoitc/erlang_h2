@@ -25,9 +25,9 @@ conn(Parent, I, Port, NStreams) ->
     {ok, S} = gen_tcp:connect({127,0,0,1}, Port,
                               [binary, {active, false}, {packet, raw}, {nodelay, true}]),
     Preface = <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>,
-    Settings = h2_frame:encode(h2_frame:settings([])),
-    Ack = h2_frame:encode(h2_frame:settings_ack()),
-    Ctx0 = h2_hpack:new_context(4096),
+    Settings = eh2_frame:encode(eh2_frame:settings([])),
+    Ack = eh2_frame:encode(eh2_frame:settings_ack()),
+    Ctx0 = eh2_hpack:new_context(4096),
     {Burst, _} = lists:foldl(
         fun(K, {Acc, Ctx}) ->
             Sid = 1 + 2*(K-1),
@@ -35,8 +35,8 @@ conn(Parent, I, Port, NStreams) ->
                     {<<":path">>, <<"/">>},
                     {<<":scheme">>, <<"http">>},
                     {<<":authority">>, <<"127.0.0.1">>}],
-            {HB, Ctx1} = h2_hpack:encode(Hdrs, Ctx),
-            Frame = h2_frame:encode(h2_frame:headers(Sid, HB, true)),
+            {HB, Ctx1} = eh2_hpack:encode(Hdrs, Ctx),
+            Frame = eh2_frame:encode(eh2_frame:headers(Sid, HB, true)),
             {<<Acc/binary, Frame/binary>>, Ctx1}
         end, {<<>>, Ctx0}, lists:seq(1, NStreams)),
     ok = gen_tcp:send(S, <<Preface/binary, Settings/binary, Ack/binary, Burst/binary>>),
@@ -56,7 +56,7 @@ read_loop(S, Acc, Total) ->
 
 classify(Bin) -> classify(Bin, 0, 0, 0, 0).
 classify(Bin, H, D, R, G) ->
-    case h2_frame:decode(Bin, 16384) of
+    case eh2_frame:decode(Bin, 16384) of
         {ok, Frame, Rest} ->
             case element(1, Frame) of
                 headers      -> classify(Rest, H+1, D, R, G);

@@ -4,7 +4,7 @@
 %%
 %% Usage:
 %% ```
-%% h2_client URL [options]
+%% eh2_client URL [options]
 %%
 %% Options:
 %%   -X, --method METHOD   HTTP method (default: GET)
@@ -20,7 +20,7 @@
 %%   -h, --help            Show this help
 %% '''
 %%
--module(h2_client).
+-module(eh2_client).
 
 -export([main/1]).
 
@@ -176,7 +176,7 @@ parse_url_parts(Rest, Scheme) ->
 
 usage() ->
     io:format(
-        "Usage: h2_client URL [OPTIONS]~n"
+        "Usage: eh2_client URL [OPTIONS]~n"
         "~n"
         "HTTP/2 reference client~n"
         "~n"
@@ -197,10 +197,10 @@ usage() ->
         "  -h, --help            Show this help~n"
         "~n"
         "Examples:~n"
-        "  h2_client https://localhost:8443/~n"
-        "  h2_client https://example.com/ -v~n"
-        "  h2_client https://example.com/api -X POST -d '{\"key\":\"value\"}'~n"
-        "  h2_client https://localhost:8443/ --insecure~n"
+        "  eh2_client https://localhost:8443/~n"
+        "  eh2_client https://example.com/ -v~n"
+        "  eh2_client https://example.com/api -X POST -d '{\"key\":\"value\"}'~n"
+        "  eh2_client https://localhost:8443/ --insecure~n"
         "~n",
         [?DEFAULT_TIMEOUT]).
 

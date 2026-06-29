@@ -4,7 +4,7 @@
 %%
 %% Usage:
 %% ```
-%% h2_server --cert cert.pem --key key.pem [options]
+%% eh2_server --cert cert.pem --key key.pem [options]
 %%
 %% Options:
 %%   -p, --port PORT       Listen port (default: 8443)
@@ -16,7 +16,7 @@
 %%   -h, --help            Show this help
 %% '''
 %%
--module(h2_server).
+-module(eh2_server).
 
 -include_lib("kernel/include/file.hrl").
 
@@ -110,7 +110,7 @@ parse_args([Unknown|_], _Opts) ->
 
 usage() ->
     io:format(
-        "Usage: h2_server --cert FILE --key FILE [OPTIONS]~n"
+        "Usage: eh2_server --cert FILE --key FILE [OPTIONS]~n"
         "~n"
         "HTTP/2 reference server~n"
         "~n"
@@ -126,8 +126,8 @@ usage() ->
         "  -h, --help            Show this help~n"
         "~n"
         "Examples:~n"
-        "  h2_server --cert server.pem --key server-key.pem~n"
-        "  h2_server --cert server.pem --key server-key.pem --port 443 --echo~n"
+        "  eh2_server --cert server.pem --key server-key.pem~n"
+        "  eh2_server --cert server.pem --key server-key.pem --port 443 --echo~n"
         "~n",
         [?DEFAULT_PORT]).
 

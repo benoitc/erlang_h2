@@ -8,7 +8,7 @@
 %% - Huffman coding: Optional string compression
 %% - Integer encoding: Variable-length prefix encoding
 %%
--module(h2_hpack).
+-module(eh2_hpack).
 
 -export([new_context/0, new_context/1]).
 -export([encode/2, decode/2]).

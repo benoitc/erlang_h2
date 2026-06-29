@@ -1,7 +1,7 @@
 %% @doc Listener process: owns the listen socket and supervises the
-%% acceptor pool. Runs under `h2_sup' so the listener outlives the
+%% acceptor pool. Runs under `eh2_sup' so the listener outlives the
 %% process that called `h2:start_server/2'.
--module(h2_listener).
+-module(eh2_listener).
 
 -export([start_link/1, stop/2]).
 -export([init/2]).
@@ -45,7 +45,7 @@ loop(Transport, ListenSocket, AcceptorPids, Ref) ->
         {'EXIT', Pid, _Reason} ->
             loop(Transport, ListenSocket, lists:delete(Pid, AcceptorPids), Ref);
         Other ->
-            logger:debug("h2_listener: unexpected message ~tp", [Other]),
+            logger:debug("eh2_listener: unexpected message ~tp", [Other]),
             loop(Transport, ListenSocket, AcceptorPids, Ref)
     end.
 

@@ -1,7 +1,7 @@
 %% @doc Tests for the incrementally maintained stream counters in
-%% h2_connection. The invariant is that active_stream_count /
+%% eh2_connection. The invariant is that active_stream_count /
 %% peer_active_stream_count always equal a fresh fold over the live `streams`
-%% map (h2_connection:verify_stream_counts/1). Because put_stream/3 updates the
+%% map (eh2_connection:verify_stream_counts/1). Because put_stream/3 updates the
 %% counters atomically with every map write, the invariant must hold at every
 %% point, so we drive a mix of stream terminations and assert it on both ends.
 -module(h2_stream_count_tests).
@@ -49,8 +49,8 @@ stream_count_invariant() ->
     timer:sleep(500),
     ServerConn = receive {server_conn, C} -> C after 2000 -> error(no_server_conn) end,
 
-    ?assertEqual(ok, h2_connection:verify_stream_counts(Client)),
-    ?assertEqual(ok, h2_connection:verify_stream_counts(ServerConn)),
+    ?assertEqual(ok, eh2_connection:verify_stream_counts(Client)),
+    ?assertEqual(ok, eh2_connection:verify_stream_counts(ServerConn)),
 
     _ = h2:close(Client),
     ok = h2:stop_server(Server),

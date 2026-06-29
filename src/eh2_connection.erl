@@ -12,7 +12,7 @@
 %% - goaway_received: Peer initiated shutdown
 %% - closing: Connection closing
 %%
--module(h2_connection).
+-module(eh2_connection).
 -behaviour(gen_statem).
 
 %% API
@@ -156,9 +156,9 @@
     buffer = <<>> :: binary(),
 
     %% Settings
-    local_settings :: h2_settings:settings(),
-    peer_settings :: h2_settings:settings(),
-    pending_settings = [] :: [h2_settings:settings()],
+    local_settings :: eh2_settings:settings(),
+    peer_settings :: eh2_settings:settings(),
+    pending_settings = [] :: [eh2_settings:settings()],
 
     %% Cached peer settings values accessed on every frame / new stream.
     %% Refreshed whenever peer_settings changes (apply_peer_settings/2).
@@ -167,8 +167,8 @@
     peer_max_concurrent_streams = ?DEFAULT_MAX_CONCURRENT_STREAMS :: non_neg_integer() | unlimited,
 
     %% HPACK contexts
-    encode_context :: h2_hpack:context(),
-    decode_context :: h2_hpack:context(),
+    encode_context :: eh2_hpack:context(),
+    decode_context :: eh2_hpack:context(),
 
     %% Streams
     streams = #{} :: #{non_neg_integer() => #stream{}},
@@ -408,12 +408,12 @@ close(Conn) ->
     gen_statem:stop(Conn).
 
 %% @doc Get local settings.
--spec get_settings(pid()) -> h2_settings:settings().
+-spec get_settings(pid()) -> eh2_settings:settings().
 get_settings(Conn) ->
     gen_statem:call(Conn, get_settings).
 
 %% @doc Get peer settings.
--spec get_peer_settings(pid()) -> h2_settings:settings().
+-spec get_peer_settings(pid()) -> eh2_settings:settings().
 get_peer_settings(Conn) ->
     gen_statem:call(Conn, get_peer_settings).
 
@@ -449,9 +449,9 @@ init({Mode, Socket, Owner, Opts}) ->
         false -> #{}
     end,
     LocalSettings = maps:merge(
-        maps:merge(h2_settings:default(), UserSettings),
+        maps:merge(eh2_settings:default(), UserSettings),
         ConnectProtoSettings#{enable_push => 0}),
-    PeerSettings = h2_settings:default(),
+    PeerSettings = eh2_settings:default(),
 
     %% Scheme depends on transport: TCP → http, TLS → https.
     Scheme = case Transport of
@@ -460,8 +460,8 @@ init({Mode, Socket, Owner, Opts}) ->
     end,
 
     %% Initialize HPACK contexts
-    EncodeCtx = h2_hpack:new_context(h2_settings:get(header_table_size, PeerSettings)),
-    DecodeCtx = h2_hpack:new_context(h2_settings:get(header_table_size, LocalSettings)),
+    EncodeCtx = eh2_hpack:new_context(eh2_settings:get(header_table_size, PeerSettings)),
+    DecodeCtx = eh2_hpack:new_context(eh2_settings:get(header_table_size, LocalSettings)),
 
     %% RFC 9113 §6.9.2: SETTINGS_INITIAL_WINDOW_SIZE only affects stream
     %% flow-control windows; the connection window is fixed at 65535 octets
@@ -474,9 +474,9 @@ init({Mode, Socket, Owner, Opts}) ->
         owner = Owner,
         local_settings = LocalSettings,
         peer_settings = PeerSettings,
-        peer_max_frame_size = h2_settings:get(max_frame_size, PeerSettings),
-        peer_initial_window_size = h2_settings:get(initial_window_size, PeerSettings),
-        peer_max_concurrent_streams = h2_settings:get(max_concurrent_streams, PeerSettings),
+        peer_max_frame_size = eh2_settings:get(max_frame_size, PeerSettings),
+        peer_initial_window_size = eh2_settings:get(initial_window_size, PeerSettings),
+        peer_max_concurrent_streams = eh2_settings:get(max_concurrent_streams, PeerSettings),
         encode_context = EncodeCtx,
         decode_context = DecodeCtx,
         next_stream_id = case Mode of client -> 1; server -> 2 end,
@@ -496,8 +496,8 @@ terminate(Reason, _StateName, #state{socket = Socket, transport = Transport, goa
     %% Send GOAWAY if not already sent
     case GoawaySent of
         false ->
-            Frame = h2_frame:goaway(0, no_error, <<>>),
-            _ = sock_send(State, h2_frame:encode_iodata(Frame));
+            Frame = eh2_frame:goaway(0, no_error, <<>>),
+            _ = sock_send(State, eh2_frame:encode_iodata(Frame));
         true ->
             ok
     end,
@@ -874,8 +874,8 @@ check_preface(Buffer) ->
     end.
 
 process_frames(StateName, #state{buffer = Buffer, local_settings = Local} = State) ->
-    MaxFrameSize = h2_settings:get(max_frame_size, Local),
-    case h2_frame:decode(Buffer, MaxFrameSize) of
+    MaxFrameSize = eh2_settings:get(max_frame_size, Local),
+    case eh2_frame:decode(Buffer, MaxFrameSize) of
         {ok, Frame, Rest} ->
             case handle_frame(StateName, Frame, State#state{buffer = Rest}) of
                 {ok, NewStateName, NewState} ->
@@ -964,7 +964,7 @@ handle_frame(StateName, {settings_ack}, State) ->
 handle_frame(_StateName, {ping, Data}, State) ->
     case bump_flood_counter(ping, State) of
         {ok, State1} ->
-            Frame = h2_frame:ping_ack(Data),
+            Frame = eh2_frame:ping_ack(Data),
             case send_frame(Frame, State1) of
                 ok -> {ok, connected, State1};
                 {error, Reason} ->
@@ -979,7 +979,7 @@ handle_frame(_StateName, {ping_ack, _Data}, State) ->
     {ok, connected, State};
 
 handle_frame(StateName, {goaway, LastStreamId, ErrorCodeInt, _DebugData}, State) ->
-    ErrorCode = h2_error:name(ErrorCodeInt),
+    ErrorCode = eh2_error:name(ErrorCodeInt),
     notify_owner({h2, self(), {goaway, LastStreamId, ErrorCode}}, State),
     %% Also tell each per-stream handler so a bidi call process (which owns its
     %% stream's events but not the connection) learns the connection is going away.
@@ -1058,7 +1058,7 @@ handle_frame(_StateName, {rst_stream, StreamId, ErrorCode},
             case WasSeen of
                 true ->
                     State0a = dispatch_stream_event(StreamId, {stream_reset, StreamId,
-                                             h2_error:name(ErrorCode)}, State0),
+                                             eh2_error:name(ErrorCode)}, State0),
                     State1 = close_stream(StreamId, rst, State0a),
                     {ok, connected, State1};
                 false ->
@@ -1093,15 +1093,15 @@ handle_frame(_StateName, {unknown_frame, _Type, _Flags, _StreamId, _Payload}, St
 handle_settings(Settings, #state{mode = Mode, peer_settings = OldSettings} = State) ->
     %% Decode and validate settings. Validation is mode-aware so a client
     %% receiving SETTINGS_ENABLE_PUSH=1 can reject per RFC 9113 §6.5.2.
-    case h2_settings:decode(encode_settings_list(Settings)) of
+    case eh2_settings:decode(encode_settings_list(Settings)) of
         {ok, NewSettings} ->
-            case h2_settings:validate(NewSettings, Mode) of
+            case eh2_settings:validate(NewSettings, Mode) of
                 ok ->
                     %% Merge and apply
-                    MergedSettings = h2_settings:merge(OldSettings, NewSettings),
+                    MergedSettings = eh2_settings:merge(OldSettings, NewSettings),
                     case apply_peer_settings(MergedSettings, State) of
                         {ok, State1} ->
-                            case send_frame(h2_frame:settings_ack(), State1) of
+                            case send_frame(eh2_frame:settings_ack(), State1) of
                                 ok ->
                                     NewStateName = case State1#state.settings_acked of
                                         true -> connected;
@@ -1132,12 +1132,12 @@ encode_settings_list(Settings) ->
 
 apply_peer_settings(Settings, #state{encode_context = EncCtx, streams = Streams,
                                       peer_settings = OldSettings} = State) ->
-    PeerTableSize = h2_settings:get(header_table_size, Settings),
+    PeerTableSize = eh2_settings:get(header_table_size, Settings),
     AppliedTableSize = min(PeerTableSize, ?MAX_PEER_HEADER_TABLE_SIZE),
-    EncCtx1 = h2_hpack:set_max_table_size(AppliedTableSize, EncCtx),
+    EncCtx1 = eh2_hpack:set_max_table_size(AppliedTableSize, EncCtx),
 
-    OldWindow = h2_settings:get(initial_window_size, OldSettings),
-    NewWindow = h2_settings:get(initial_window_size, Settings),
+    OldWindow = eh2_settings:get(initial_window_size, OldSettings),
+    NewWindow = eh2_settings:get(initial_window_size, Settings),
     Delta = NewWindow - OldWindow,
     %% RFC 7540 §6.9.2: if the change makes any stream's flow-control window
     %% exceed 2^31-1, treat as connection FLOW_CONTROL_ERROR.
@@ -1153,9 +1153,9 @@ apply_peer_settings(Settings, #state{encode_context = EncCtx, streams = Streams,
             end, Streams),
             {ok, State#state{
                 peer_settings = Settings,
-                peer_max_frame_size = h2_settings:get(max_frame_size, Settings),
+                peer_max_frame_size = eh2_settings:get(max_frame_size, Settings),
                 peer_initial_window_size = NewWindow,
-                peer_max_concurrent_streams = h2_settings:get(max_concurrent_streams, Settings),
+                peer_max_concurrent_streams = eh2_settings:get(max_concurrent_streams, Settings),
                 encode_context = EncCtx1,
                 streams = Streams1
             }}
@@ -1163,16 +1163,16 @@ apply_peer_settings(Settings, #state{encode_context = EncCtx, streams = Streams,
 
 apply_local_settings(Settings, #state{decode_context = DecCtx, local_settings = Prev} = State) ->
     %% Update HPACK decoder table size
-    NewTableSize = h2_settings:get(header_table_size, Settings),
-    OldTableSize = h2_settings:get(header_table_size, Prev),
-    DecCtx1 = h2_hpack:set_max_table_size(NewTableSize, DecCtx),
+    NewTableSize = eh2_settings:get(header_table_size, Settings),
+    OldTableSize = eh2_settings:get(header_table_size, Prev),
+    DecCtx1 = eh2_hpack:set_max_table_size(NewTableSize, DecCtx),
     %% RFC 7541 §6.3: peer-advertised limit (= our SETTINGS_HEADER_TABLE_SIZE)
     %% caps any size update the peer's encoder may send.
-    DecCtx1a = h2_hpack:set_peer_max_table_size(NewTableSize, DecCtx1),
+    DecCtx1a = eh2_hpack:set_peer_max_table_size(NewTableSize, DecCtx1),
     %% RFC 7541 §4.2: when we reduce HEADER_TABLE_SIZE, the peer's next
     %% header block MUST start with a size update at or below the new max.
     DecCtx2 = case NewTableSize < OldTableSize of
-        true -> h2_hpack:mark_pending_size_update(DecCtx1a);
+        true -> eh2_hpack:mark_pending_size_update(DecCtx1a);
         false -> DecCtx1a
     end,
     State#state{
@@ -1262,7 +1262,7 @@ handle_headers_new(StreamId, HeaderBlock, EndStream, EndHeaders, Mode, State) ->
 %% limit). Idle, reserved, and closed do not count. We only check the local
 %% setting because exceeding it is what the spec scopes to REFUSED_STREAM.
 peer_stream_limit_exceeded(Mode, #state{local_settings = Settings} = State) ->
-    case h2_settings:get(max_concurrent_streams, Settings) of
+    case eh2_settings:get(max_concurrent_streams, Settings) of
         unlimited -> false;
         N when is_integer(N) ->
             count_peer_active_streams(Mode, State) >= N
@@ -1316,7 +1316,7 @@ handle_continuation(StreamId, HeaderBlock, EndHeaders,
     end.
 
 decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_context = DecCtx, mode = Mode} = State) ->
-    case h2_hpack:decode(HeaderBlock, DecCtx) of
+    case eh2_hpack:decode(HeaderBlock, DecCtx) of
         {ok, Headers, DecCtx1} ->
             State1 = State#state{decode_context = DecCtx1},
             %% RFC 9113 §6.5.2: enforce our advertised MAX_HEADER_LIST_SIZE.
@@ -1904,7 +1904,7 @@ header_list_size(Headers) ->
 
 %% Enforce peer-advertised SETTINGS_MAX_HEADER_LIST_SIZE before encoding.
 check_peer_max_header_list_size(Headers, #state{peer_settings = PS}) ->
-    case h2_settings:get(max_header_list_size, PS) of
+    case eh2_settings:get(max_header_list_size, PS) of
         unlimited -> ok;
         Max when is_integer(Max) ->
             case header_list_size(Headers) > Max of
@@ -1915,7 +1915,7 @@ check_peer_max_header_list_size(Headers, #state{peer_settings = PS}) ->
 
 %% Enforce our SETTINGS_MAX_HEADER_LIST_SIZE on received decoded headers.
 check_local_max_header_list_size(Headers, #state{local_settings = LS}) ->
-    case h2_settings:get(max_header_list_size, LS) of
+    case eh2_settings:get(max_header_list_size, LS) of
         unlimited -> ok;
         Max when is_integer(Max) ->
             case header_list_size(Headers) > Max of
@@ -2102,7 +2102,7 @@ maybe_send_conn_window_update(_DataSize, #state{recv_conn_window_size = ConnWind
             ConnIncrement = Target - ConnWindow,
             %% Best-effort: a dead socket will surface via {tcp_closed,_} /
             %% {ssl_closed,_} momentarily and terminate the connection.
-            _ = send_frame(h2_frame:window_update(0, ConnIncrement), State),
+            _ = send_frame(eh2_frame:window_update(0, ConnIncrement), State),
             State#state{recv_conn_window_size = ConnWindow + ConnIncrement};
         false ->
             State
@@ -2110,7 +2110,7 @@ maybe_send_conn_window_update(_DataSize, #state{recv_conn_window_size = ConnWind
 
 maybe_send_window_update(StreamId, DataSize, #state{local_settings = Settings,
                                                      streams = Streams} = State) ->
-    InitialWindow = h2_settings:get(initial_window_size, Settings),
+    InitialWindow = eh2_settings:get(initial_window_size, Settings),
     Threshold = InitialWindow div 2,
     case maps:find(StreamId, Streams) of
         %% Manual flow control (RFC 9113 §6.9): do NOT auto-replenish. Track the
@@ -2122,7 +2122,7 @@ maybe_send_window_update(StreamId, DataSize, #state{local_settings = Settings,
         {ok, #stream{recv_window_size = StreamWindow} = Stream} when StreamWindow < Threshold ->
             StreamIncrement = InitialWindow - StreamWindow,
             %% Best-effort: dead socket surfaces via {tcp_closed,_} / {ssl_closed,_}.
-            _ = send_frame(h2_frame:window_update(StreamId, StreamIncrement), State),
+            _ = send_frame(eh2_frame:window_update(StreamId, StreamIncrement), State),
             Stream1 = Stream#stream{recv_window_size = StreamWindow + StreamIncrement},
             State#state{streams = maps:put(StreamId, Stream1, Streams)};
         _ ->
@@ -2139,7 +2139,7 @@ handle_consume(From, StreamId, ByteCount, #state{streams = Streams} = State) ->
             Ack = min(ByteCount, Unacked),
             case Ack > 0 of
                 true ->
-                    _ = send_frame(h2_frame:window_update(StreamId, Ack), State),
+                    _ = send_frame(eh2_frame:window_update(StreamId, Ack), State),
                     Stream1 = Stream#stream{recv_window_size = StreamWindow + Ack,
                                             unacked = Unacked - Ack},
                     State1 = State#state{streams = maps:put(StreamId, Stream1, Streams)},
@@ -2200,9 +2200,9 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
                         {error, _} = SErr ->
                             {keep_state, State, [{reply, From, SErr}]};
                         ok ->
-                    {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
+                    {HeaderBlock, EncCtx1} = eh2_hpack:encode(AllHeaders, EncCtx),
 
-                    RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
+                    RecvWindow = eh2_settings:get(initial_window_size, State#state.local_settings),
                     StreamState = case EndStream of
                         true -> half_closed_local;
                         false -> open
@@ -2262,7 +2262,7 @@ handle_send_request_headers(From, Headers, EndStream, Opts,
                 _ when Method =/= <<"CONNECT">> ->
                     {error, extended_connect_method};
                 _ ->
-                    case h2_settings:get(enable_connect_protocol, PeerSettings) of
+                    case eh2_settings:get(enable_connect_protocol, PeerSettings) of
                         1 -> ok;
                         _ -> {error, extended_connect_disabled}
                     end
@@ -2279,8 +2279,8 @@ handle_send_request_headers(From, Headers, EndStream, Opts,
                 {error, _} = SErr ->
                     {keep_state, State, [{reply, From, SErr}]};
                 ok ->
-            {HeaderBlock, EncCtx1} = h2_hpack:encode(Headers, EncCtx),
-            RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
+            {HeaderBlock, EncCtx1} = eh2_hpack:encode(Headers, EncCtx),
+            RecvWindow = eh2_settings:get(initial_window_size, State#state.local_settings),
             StreamState = case EndStream of true -> half_closed_local; false -> open end,
             {Handler, DispatchMode, FlowControl} = stream_opts(Opts),
             %% RFC 7540 §8.3 / RFC 8441: tunnel only opens on the 2xx response.
@@ -2366,7 +2366,7 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
                         {error, _} = SErr ->
                             {keep_state, State, [{reply, From, SErr}]};
                         ok ->
-                    {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
+                    {HeaderBlock, EncCtx1} = eh2_hpack:encode(AllHeaders, EncCtx),
                     %% RFC 9110 §9.3.2 / §15.4: body-forbidden responses
                     %% (HEAD / 204 / 304) terminate at the header block —
                     %% end the stream here so later send_data is a no-op
@@ -2439,7 +2439,7 @@ handle_respond(From, StreamId, Status, Headers, Body,
                 {error, _} = SErr ->
                     {keep_state, State, [{reply, From, SErr}]};
                 ok ->
-            {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
+            {HeaderBlock, EncCtx1} = eh2_hpack:encode(AllHeaders, EncCtx),
             BodyForbidden = ReqMethod =:= <<"HEAD">>
                             orelse Status =:= 204 orelse Status =:= 304,
             HeadersFit = byte_size(HeaderBlock) =< MaxFrameSize,
@@ -2465,8 +2465,8 @@ handle_respond(From, StreamId, Status, Headers, Body,
                 andalso BodySize =< ConnWindow
                 andalso BodySize =< StreamWindow
                 andalso BodySize =< ?MAX_COALESCED_BODY_BYTES ->
-                    IoData = [h2_frame:encode(
-                                h2_frame:headers(StreamId, HeaderBlock, false))
+                    IoData = [eh2_frame:encode(
+                                eh2_frame:headers(StreamId, HeaderBlock, false))
                               | data_frames(StreamId, Body, MaxFrameSize, true)],
                     case sock_send(State, IoData) of
                         ok ->
@@ -2522,20 +2522,20 @@ finish_respond(From, StreamId, #stream{window_size = StreamWindow} = Stream,
 send_header_block(StreamId, HeaderBlock, EndStream, #state{peer_max_frame_size = MaxFrameSize} = State) ->
     case byte_size(HeaderBlock) =< MaxFrameSize of
         true ->
-            send_frame(h2_frame:headers(StreamId, HeaderBlock, EndStream), State);
+            send_frame(eh2_frame:headers(StreamId, HeaderBlock, EndStream), State);
         false ->
             <<First:MaxFrameSize/binary, Rest/binary>> = HeaderBlock,
-            case send_frame(h2_frame:headers(StreamId, First, EndStream, false), State) of
+            case send_frame(eh2_frame:headers(StreamId, First, EndStream, false), State) of
                 ok -> send_continuations(StreamId, Rest, MaxFrameSize, State);
                 {error, _} = Err -> Err
             end
     end.
 
 send_continuations(StreamId, Rest, MaxFrameSize, State) when byte_size(Rest) =< MaxFrameSize ->
-    send_frame(h2_frame:continuation(StreamId, Rest, true), State);
+    send_frame(eh2_frame:continuation(StreamId, Rest, true), State);
 send_continuations(StreamId, Rest, MaxFrameSize, State) ->
     <<Chunk:MaxFrameSize/binary, More/binary>> = Rest,
-    case send_frame(h2_frame:continuation(StreamId, Chunk, false), State) of
+    case send_frame(eh2_frame:continuation(StreamId, Chunk, false), State) of
         ok -> send_continuations(StreamId, More, MaxFrameSize, State);
         {error, _} = Err -> Err
     end.
@@ -2547,12 +2547,12 @@ send_continuations(StreamId, Rest, MaxFrameSize, State) ->
 data_frames(_StreamId, <<>>, _MaxFrameSize, false) ->
     [];
 data_frames(StreamId, <<>>, _MaxFrameSize, true) ->
-    [h2_frame:encode_iodata({data, StreamId, <<>>, true})];
+    [eh2_frame:encode_iodata({data, StreamId, <<>>, true})];
 data_frames(StreamId, Bin, MaxFrameSize, End) when byte_size(Bin) =< MaxFrameSize ->
-    [h2_frame:encode_iodata({data, StreamId, Bin, End})];
+    [eh2_frame:encode_iodata({data, StreamId, Bin, End})];
 data_frames(StreamId, Bin, MaxFrameSize, End) ->
     <<Chunk:MaxFrameSize/binary, Rest/binary>> = Bin,
-    [h2_frame:encode_iodata({data, StreamId, Chunk, false})
+    [eh2_frame:encode_iodata({data, StreamId, Chunk, false})
      | data_frames(StreamId, Rest, MaxFrameSize, End)].
 
 %% RFC 7540 §8.3: forbidden on a 2xx CONNECT response.
@@ -2750,7 +2750,7 @@ handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams} = State
 emit_trailers_frame(StreamId, Trailers,
                     #stream{state = StreamState} = Stream,
                     #state{encode_context = EncCtx} = State) ->
-    {HeaderBlock, EncCtx1} = h2_hpack:encode(Trailers, EncCtx),
+    {HeaderBlock, EncCtx1} = eh2_hpack:encode(Trailers, EncCtx),
     case send_header_block(StreamId, HeaderBlock, true, State) of
         {error, Reason} ->
             {error, Reason, State};
@@ -2965,7 +2965,7 @@ get_or_create_stream(StreamId, #state{streams = Streams,
         {ok, Stream} ->
             Stream;
         error ->
-            RecvWindow = h2_settings:get(initial_window_size, LocalSettings),
+            RecvWindow = eh2_settings:get(initial_window_size, LocalSettings),
             #stream{
                 id = StreamId,
                 state = idle,
@@ -3178,7 +3178,7 @@ flush_stream_one_chunk(StreamId, #state{streams = Streams,
 %% Emit an empty DATA frame with END_STREAM=1 to half-close the stream on
 %% the wire. Used when send_data was called with empty payload + EndStream.
 emit_end_stream_data(StreamId, #stream{state = StreamState} = Stream, State) ->
-    Frame = h2_frame:data(StreamId, <<>>, true),
+    Frame = eh2_frame:data(StreamId, <<>>, true),
     case send_frame(Frame, State) of
         {error, Reason} ->
             {error, Reason, State};
@@ -3209,7 +3209,7 @@ send_preface(State) ->
     send_settings_frame(State).
 
 send_settings_frame(#state{local_settings = Settings, pending_settings = Pending} = State) ->
-    Frame = h2_frame:settings(settings_to_list(Settings)),
+    Frame = eh2_frame:settings(settings_to_list(Settings)),
     %% Best-effort like the preface above: if the peer has already closed,
     %% the imminent {tcp_closed,_} / {ssl_closed,_} will tear us down and
     %% reply {error, _} to any wait_connected callers.
@@ -3218,9 +3218,9 @@ send_settings_frame(#state{local_settings = Settings, pending_settings = Pending
 
 settings_to_list(Settings) ->
     maps:fold(fun(Key, Value, Acc) ->
-        case h2_settings:setting_id(Key) of
+        case eh2_settings:setting_id(Key) of
             undefined -> Acc;
-            Id -> [{Id, h2_settings:encode_value(Value)} | Acc]
+            Id -> [{Id, eh2_settings:encode_value(Value)} | Acc]
         end
     end, [], Settings).
 
@@ -3229,7 +3229,7 @@ settings_to_list(Settings) ->
 %% socket has died.
 send_frame(Frame, State) ->
     %% iodata: DATA payloads are sent without an extra body copy.
-    sock_send(State, h2_frame:encode_iodata(Frame)).
+    sock_send(State, eh2_frame:encode_iodata(Frame)).
 
 %% Single socket-write choke point. Every frame and coalesced batch goes through
 %% here, so one Transport:send maps to one socket write (and the test traces this
@@ -3238,13 +3238,13 @@ sock_send(#state{socket = Socket, transport = Transport}, IoData) ->
     Transport:send(Socket, IoData).
 
 send_goaway_frame(LastStreamId, ErrorCode, State) ->
-    Frame = h2_frame:goaway(LastStreamId, ErrorCode, <<>>),
-    _ = sock_send(State, h2_frame:encode_iodata(Frame)),
+    Frame = eh2_frame:goaway(LastStreamId, ErrorCode, <<>>),
+    _ = sock_send(State, eh2_frame:encode_iodata(Frame)),
     State#state{goaway_sent = true, goaway_error = ErrorCode}.
 
 send_rst_stream(StreamId, ErrorCode, State) ->
-    Frame = h2_frame:rst_stream(StreamId, ErrorCode),
-    _ = sock_send(State, h2_frame:encode_iodata(Frame)),
+    Frame = eh2_frame:rst_stream(StreamId, ErrorCode),
+    _ = sock_send(State, eh2_frame:encode_iodata(Frame)),
     ok.
 
 %% ============================================================================

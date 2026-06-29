@@ -25,14 +25,14 @@ conn(Parent, I, Port, Win, Total) ->
     {ok, S} = gen_tcp:connect({127,0,0,1}, Port,
                               [binary, {active, false}, {packet, raw}, {nodelay, true}]),
     Preface = <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>,
-    Settings = h2_frame:encode(h2_frame:settings([])),
+    Settings = eh2_frame:encode(eh2_frame:settings([])),
     ok = gen_tcp:send(S, <<Preface/binary, Settings/binary>>),
-    Ctx = h2_hpack:new_context(4096),
+    Ctx = eh2_hpack:new_context(4096),
     %% Open initial window of streams (ids 1,3,5,...)
     Initial = min(Win, Total),
     {Ctx1, NextId} = send_n(S, 1, Initial, Ctx),
     timer:sleep(20),  %% let server dispatch our requests while still in `settings`
-    ok = gen_tcp:send(S, h2_frame:encode(h2_frame:settings_ack())),
+    ok = gen_tcp:send(S, eh2_frame:encode(eh2_frame:settings_ack())),
     Sent = Initial,
     Res = (catch loop(S, <<>>, Ctx1, NextId, Sent, 0, Total, Win)),
     Parent ! {result, I, Res}.
@@ -69,7 +69,7 @@ loop(S, Buf, Ctx, NextId, Sent, Done, Total, Win) ->
 
 %% Decode all complete frames in Buf; count DATA-with-endstream as completions.
 drain(Buf, Completed, Goaway, Rst) ->
-    case h2_frame:decode(Buf, 16384) of
+    case eh2_frame:decode(Buf, 16384) of
         {ok, Frame, Rest} ->
             case Frame of
                 {data, _Sid, _D, true, _Sz}    -> drain(Rest, Completed+1, Goaway, Rst);
@@ -88,8 +88,8 @@ send_n(_S, NextId, 0, Ctx) -> {Ctx, NextId};
 send_n(S, NextId, N, Ctx) ->
     Hdrs = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>},
             {<<":scheme">>, <<"http">>}, {<<":authority">>, <<"127.0.0.1">>}],
-    {HB, Ctx1} = h2_hpack:encode(Hdrs, Ctx),
-    Frame = h2_frame:encode(h2_frame:headers(NextId, HB, true)),
+    {HB, Ctx1} = eh2_hpack:encode(Hdrs, Ctx),
+    Frame = eh2_frame:encode(eh2_frame:headers(NextId, HB, true)),
     ok = gen_tcp:send(S, Frame),
     send_n(S, NextId + 2, N - 1, Ctx1).
 

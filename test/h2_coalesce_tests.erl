@@ -68,11 +68,11 @@ write_count() ->
     {ServerConn, HandlerPid} =
         receive {server_conn, C, HP} -> {C, HP} after 5000 -> error(no_server_conn) end,
     1 = erlang:trace(ServerConn, true, [call]),
-    erlang:trace_pattern({h2_connection, sock_send, 2}, true, [local]),
+    erlang:trace_pattern({eh2_connection, sock_send, 2}, true, [local]),
     HandlerPid ! go,
     {Got, Writes} = collect_writes(Client, Sid, ServerConn, <<>>, []),
     erlang:trace(ServerConn, false, [call]),
-    erlang:trace_pattern({h2_connection, sock_send, 2}, false, [local]),
+    erlang:trace_pattern({eh2_connection, sock_send, 2}, false, [local]),
     ?assertEqual(Body, Got),
     DataWrites = [W || W <- Writes, count_data_frames(W) > 0],
     %% Exactly one DATA-bearing write...
@@ -109,7 +109,7 @@ collect_body(Conn, Sid, Acc) ->
 
 collect_writes(Conn, Sid, ServerConn, Body, Writes) ->
     receive
-        {trace, ServerConn, call, {h2_connection, sock_send, [_S, IoData]}} ->
+        {trace, ServerConn, call, {eh2_connection, sock_send, [_S, IoData]}} ->
             collect_writes(Conn, Sid, ServerConn, Body,
                            [iolist_to_binary(IoData) | Writes]);
         {h2, Conn, {data, Sid, Data, true}} ->
@@ -125,7 +125,7 @@ collect_writes(Conn, Sid, ServerConn, Body, Writes) ->
 
 drain_traces(ServerConn, Writes) ->
     receive
-        {trace, ServerConn, call, {h2_connection, sock_send, [_S, IoData]}} ->
+        {trace, ServerConn, call, {eh2_connection, sock_send, [_S, IoData]}} ->
             drain_traces(ServerConn, [iolist_to_binary(IoData) | Writes])
     after 300 ->
         Writes

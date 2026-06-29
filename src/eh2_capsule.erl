@@ -12,7 +12,7 @@
 %%
 %% Type and Length are QUIC variable-length integers.
 %%
--module(h2_capsule).
+-module(eh2_capsule).
 
 -export([encode/2, decode/1, decode_all/1]).
 -export([encode_type/1, decode_type/1]).
@@ -46,8 +46,8 @@ datagram(Payload) ->
 encode(Type, Payload) when is_atom(Type) ->
     encode(encode_type(Type), Payload);
 encode(Type, Payload) when is_integer(Type) ->
-    TypeBin = h2_varint:encode(Type),
-    LengthBin = h2_varint:encode(byte_size(Payload)),
+    TypeBin = eh2_varint:encode(Type),
+    LengthBin = eh2_varint:encode(byte_size(Payload)),
     <<TypeBin/binary, LengthBin/binary, Payload/binary>>.
 
 %% @doc Convert capsule type atom to integer.
@@ -62,11 +62,11 @@ encode_type(datagram) -> ?DATAGRAM.
 %% Returns {ok, {Type, Payload}, Rest} | {more, N} | {error, Reason}
 -spec decode(binary()) -> {ok, capsule(), binary()} | {more, pos_integer()} | {error, term()}.
 decode(Bin) ->
-    case h2_varint:decode(Bin) of
+    case eh2_varint:decode(Bin) of
         {error, incomplete} ->
             {more, 1};
         {ok, Type, Rest1} ->
-            case h2_varint:decode(Rest1) of
+            case eh2_varint:decode(Rest1) of
                 {error, incomplete} ->
                     {more, 1};
                 {ok, Length, Rest2} ->

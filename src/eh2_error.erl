@@ -2,7 +2,7 @@
 %%
 %% Error codes are 32-bit integers used in RST_STREAM and GOAWAY frames.
 %%
--module(h2_error).
+-module(eh2_error).
 
 -export([code/1, name/1, format/1]).
 

@@ -13,7 +13,7 @@
 %% |                   Frame Payload (0...)                        |
 %% +---------------------------------------------------------------+
 %%
--module(h2_frame).
+-module(eh2_frame).
 
 -export([encode/1, encode_iodata/1, decode/1, decode/2, decode_header/1]).
 -export([data/3, data/4]).
@@ -109,7 +109,7 @@ priority(StreamId, Exclusive, DependsOn, Weight) ->
 %% @doc Create a RST_STREAM frame.
 -spec rst_stream(non_neg_integer(), non_neg_integer() | atom()) -> frame_data().
 rst_stream(StreamId, ErrorCode) when is_atom(ErrorCode) ->
-    rst_stream(StreamId, h2_error:code(ErrorCode));
+    rst_stream(StreamId, eh2_error:code(ErrorCode));
 rst_stream(StreamId, ErrorCode) ->
     {rst_stream, StreamId, ErrorCode}.
 
@@ -141,7 +141,7 @@ ping_ack(Data) when byte_size(Data) =:= 8 ->
 %% @doc Create a GOAWAY frame.
 -spec goaway(non_neg_integer(), non_neg_integer() | atom(), binary()) -> frame_data().
 goaway(LastStreamId, ErrorCode, DebugData) when is_atom(ErrorCode) ->
-    goaway(LastStreamId, h2_error:code(ErrorCode), DebugData);
+    goaway(LastStreamId, eh2_error:code(ErrorCode), DebugData);
 goaway(LastStreamId, ErrorCode, DebugData) ->
     {goaway, LastStreamId, ErrorCode, DebugData}.
 

@@ -4,7 +4,7 @@
 %% HTTP/2 endpoints. Each setting is identified by a 16-bit identifier
 %% and has a 32-bit value.
 %%
--module(h2_settings).
+-module(eh2_settings).
 
 -export([default/0, encode/1, decode/1]).
 -export([get/2, set/3, merge/2]).

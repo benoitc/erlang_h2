@@ -34,8 +34,8 @@ run_proper(Property, NumTests) ->
 prop_integer_roundtrip() ->
     ?FORALL({Value, Prefix}, {hpack_integer(), range(1, 8)},
         begin
-            Encoded = h2_hpack:encode_integer(Value, Prefix),
-            {ok, Decoded, <<>>} = h2_hpack:decode_integer(Encoded, Prefix),
+            Encoded = eh2_hpack:encode_integer(Value, Prefix),
+            {ok, Decoded, <<>>} = eh2_hpack:decode_integer(Encoded, Prefix),
             Value =:= Decoded
         end).
 
@@ -43,8 +43,8 @@ prop_integer_roundtrip() ->
 prop_huffman_roundtrip() ->
     ?FORALL(Str, printable_binary(),
         begin
-            Encoded = h2_hpack:huffman_encode(Str),
-            {ok, Decoded} = h2_hpack:huffman_decode(Encoded),
+            Encoded = eh2_hpack:huffman_encode(Str),
+            {ok, Decoded} = eh2_hpack:huffman_decode(Encoded),
             Str =:= Decoded
         end).
 
@@ -52,9 +52,9 @@ prop_huffman_roundtrip() ->
 prop_hpack_roundtrip() ->
     ?FORALL(Headers, headers_list(),
         begin
-            Ctx = h2_hpack:new_context(),
-            {Encoded, _Ctx1} = h2_hpack:encode(Headers, Ctx),
-            {ok, Decoded, _Ctx2} = h2_hpack:decode(Encoded, h2_hpack:new_context()),
+            Ctx = eh2_hpack:new_context(),
+            {Encoded, _Ctx1} = eh2_hpack:encode(Headers, Ctx),
+            {ok, Decoded, _Ctx2} = eh2_hpack:decode(Encoded, eh2_hpack:new_context()),
             Headers =:= Decoded
         end).
 
@@ -62,8 +62,8 @@ prop_hpack_roundtrip() ->
 prop_frame_roundtrip() ->
     ?FORALL(Frame, frame(),
         begin
-            Encoded = h2_frame:encode(Frame),
-            {ok, Decoded, <<>>} = h2_frame:decode(Encoded),
+            Encoded = eh2_frame:encode(Frame),
+            {ok, Decoded, <<>>} = eh2_frame:decode(Encoded),
             frames_equal(Frame, Decoded)
         end).
 
@@ -71,9 +71,9 @@ prop_frame_roundtrip() ->
 prop_frame_data_roundtrip() ->
     ?FORALL({StreamId, Data, EndStream}, {stream_id(), binary(), boolean()},
         begin
-            Frame = h2_frame:data(StreamId, Data, EndStream),
-            Encoded = h2_frame:encode(Frame),
-            {ok, Decoded, <<>>} = h2_frame:decode(Encoded),
+            Frame = eh2_frame:data(StreamId, Data, EndStream),
+            Encoded = eh2_frame:encode(Frame),
+            {ok, Decoded, <<>>} = eh2_frame:decode(Encoded),
             %% Decoder now reports padded payload size; unpadded DATA has
             %% FlowControlled = byte_size(Data).
             Decoded =:= {data, StreamId, Data, EndStream, byte_size(Data)}
@@ -83,8 +83,8 @@ prop_frame_data_roundtrip() ->
 prop_settings_roundtrip() ->
     ?FORALL(Settings, settings_map(),
         begin
-            Encoded = h2_settings:encode(Settings),
-            {ok, Decoded} = h2_settings:decode(Encoded),
+            Encoded = eh2_settings:encode(Settings),
+            {ok, Decoded} = eh2_settings:decode(Encoded),
             %% Check that all encoded settings are present in decoded
             maps:fold(fun(Key, Value, Acc) ->
                 Acc andalso (maps:get(Key, Decoded, Value) =:= Value)
@@ -168,37 +168,37 @@ frame() ->
 
 data_frame() ->
     ?LET({StreamId, Data, EndStream}, {stream_id(), binary(), boolean()},
-        h2_frame:data(StreamId, Data, EndStream)).
+        eh2_frame:data(StreamId, Data, EndStream)).
 
 headers_frame() ->
     ?LET({StreamId, HeaderBlock, EndStream}, {stream_id(), binary(), boolean()},
-        h2_frame:headers(StreamId, HeaderBlock, EndStream)).
+        eh2_frame:headers(StreamId, HeaderBlock, EndStream)).
 
 priority_frame() ->
     ?LET({StreamId, Exclusive, DependsOn, Weight},
          {stream_id(), boolean(), stream_id(), range(1, 256)},
-        h2_frame:priority(StreamId, Exclusive, DependsOn, Weight)).
+        eh2_frame:priority(StreamId, Exclusive, DependsOn, Weight)).
 
 rst_stream_frame() ->
     ?LET({StreamId, ErrorCode}, {stream_id(), error_code()},
-        h2_frame:rst_stream(StreamId, ErrorCode)).
+        eh2_frame:rst_stream(StreamId, ErrorCode)).
 
 settings_frame() ->
     ?LET(Settings, settings_list(),
-        h2_frame:settings(Settings)).
+        eh2_frame:settings(Settings)).
 
 ping_frame() ->
     ?LET(Data, binary(8),
-        h2_frame:ping(Data)).
+        eh2_frame:ping(Data)).
 
 goaway_frame() ->
     ?LET({LastStreamId, ErrorCode, DebugData},
          {non_neg_integer(), error_code(), binary()},
-        h2_frame:goaway(LastStreamId, ErrorCode, DebugData)).
+        eh2_frame:goaway(LastStreamId, ErrorCode, DebugData)).
 
 window_update_frame() ->
     ?LET({StreamId, Increment}, {non_neg_integer(), range(1, 2147483647)},
-        h2_frame:window_update(StreamId, Increment)).
+        eh2_frame:window_update(StreamId, Increment)).
 
 %% @doc Generate error code
 error_code() ->
@@ -224,7 +224,7 @@ setting() ->
         {6, range(0, 1000000)}   %% MAX_HEADER_LIST_SIZE
     ]).
 
-%% @doc Generate settings map for h2_settings
+%% @doc Generate settings map for eh2_settings
 settings_map() ->
     ?LET(Pairs, list(settings_pair()),
         maps:from_list(Pairs)).
@@ -259,7 +259,7 @@ normalize_frame({headers, StreamId, HeaderBlock, EndStream, EndHeaders, Priority
 normalize_frame({priority, StreamId, Exclusive, DependsOn, Weight}) ->
     {priority, StreamId, Exclusive, DependsOn, Weight};
 normalize_frame({rst_stream, StreamId, ErrorCode}) when is_atom(ErrorCode) ->
-    {rst_stream, StreamId, h2_error:code(ErrorCode)};
+    {rst_stream, StreamId, eh2_error:code(ErrorCode)};
 normalize_frame({rst_stream, StreamId, ErrorCode}) ->
     {rst_stream, StreamId, ErrorCode};
 normalize_frame({settings, Settings}) ->
@@ -271,7 +271,7 @@ normalize_frame({ping, Data}) ->
 normalize_frame({ping_ack, Data}) ->
     {ping_ack, Data};
 normalize_frame({goaway, LastStreamId, ErrorCode, DebugData}) when is_atom(ErrorCode) ->
-    {goaway, LastStreamId, h2_error:code(ErrorCode), DebugData};
+    {goaway, LastStreamId, eh2_error:code(ErrorCode), DebugData};
 normalize_frame({goaway, LastStreamId, ErrorCode, DebugData}) ->
     {goaway, LastStreamId, ErrorCode, DebugData};
 normalize_frame({window_update, StreamId, Increment}) ->
