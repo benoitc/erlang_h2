@@ -1463,7 +1463,17 @@ commit_server_initial(StreamId, Stream, Headers, Protocol, ExpectedCL, EndStream
     State2 = State1#state{last_peer_stream_id =
                             max(StreamId, State1#state.last_peer_stream_id)},
     notify_owner({h2, self(), {request, StreamId, Method, Path, OtherHeaders}}, State2),
-    {ok, connected, State2}.
+    %% END_STREAM on the request HEADERS means the request has no body. Emit
+    %% the trailing empty DATA event (buffered until a stream handler
+    %% registers) so handlers waiting on end-of-stream don't hang. Mirrors
+    %% finalize_client_initial and quic_h3.
+    case EndStream of
+        true ->
+            State3 = dispatch_stream_event(StreamId, {data, StreamId, <<>>, true}, State2),
+            {ok, connected, State3};
+        false ->
+            {ok, connected, State2}
+    end.
 
 handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State) ->
     case parse_content_length(Headers) of
@@ -2665,6 +2675,21 @@ release_send_waiters_if_drained(StreamId, #state{streams = Streams} = State) ->
             State
     end.
 
+%% Fail every parked blocking-send caller of a stream that is closing.
+%% Reason maps the close cause: `rst' → {error, stream_reset},
+%% `end_stream' → {error, stream_closed}.
+fail_send_waiters(#stream{send_waiters = []}, _Reason) ->
+    ok;
+fail_send_waiters(#stream{send_waiters = Waiters}, Reason) ->
+    Error = case Reason of
+        rst -> {error, stream_reset};
+        _ -> {error, stream_closed}
+    end,
+    lists:foreach(fun({From, TimerRef}) ->
+        ok = cancel_timer(TimerRef),
+        gen_statem:reply(From, Error)
+    end, Waiters).
+
 %% Fire {error, timeout} to the parked caller whose timer expired and drop it.
 release_send_waiter_timeout(TimerRef, #state{streams = Streams} = State) ->
     maps:fold(fun(StreamId, #stream{send_waiters = Waiters} = Stream, AccState) ->
@@ -3023,8 +3048,15 @@ close_stream(StreamId, Reason, #state{streams = Streams} = State0) ->
     %% (idempotent: a stream already closed has Old = closed, delta 0).
     State = case maps:find(StreamId, Streams) of
         {ok, Stream} ->
+            %% A blocking send_data/5 caller parked on this stream can never
+            %% be satisfied once the stream closes: flush_stream/2 (the only
+            %% release path besides its timeout timer) no longer runs for a
+            %% closed stream, so an infinity-blocked sender would hang for
+            %% the connection's lifetime. Fail the waiters instead.
+            fail_send_waiters(Stream, Reason),
             put_stream(StreamId,
-                       Stream#stream{state = closed, closed_reason = Reason},
+                       Stream#stream{state = closed, closed_reason = Reason,
+                                     send_waiters = []},
                        State0);
         error ->
             State0

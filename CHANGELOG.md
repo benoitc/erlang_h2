@@ -4,6 +4,20 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-07-04
+
+### Fixed
+
+- A blocking `send_data/5` caller parked on flow control is now released with
+  `{error, stream_reset}` (peer or local RST_STREAM) or `{error, stream_closed}`
+  when the stream closes. Previously the waiter list was dropped on close, so a
+  sender blocked with `#{block => infinity}` hung for the connection's lifetime
+  when the peer cancelled the stream mid-backpressure.
+- A server request whose HEADERS frame carries END_STREAM now delivers the
+  trailing `{data, StreamId, <<>>, true}` event to the stream handler, so
+  handlers waiting on end-of-stream don't hang on body-less requests. This
+  mirrors the client-side behaviour and quic_h3.
+
 ## [0.10.2] - 2026-06-16
 
 ### Changed
