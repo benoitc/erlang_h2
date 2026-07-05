@@ -435,6 +435,53 @@ blocked_sender_released_on_reset() ->
     ok = h2:stop_server(Server).
 
 %% ---------------------------------------------------------------------------
+%% A blocking send whose data fully drains must return ok even when the
+%% drain of the closing END_STREAM chunk is what closes the stream (peer
+%% already half-closed): close_stream settles drained waiters with ok.
+%% ---------------------------------------------------------------------------
+
+blocked_sender_ok_when_drained_test_() ->
+    {timeout, 30, fun blocked_sender_ok_when_drained/0}.
+
+blocked_sender_ok_when_drained() ->
+    Test = self(),
+    Handler = fun(Conn, Sid, _M, _P, _H) ->
+        %% manual flow control, exhaust the client's window before consuming
+        ok = h2:set_stream_handler(Conn, Sid, self(), #{flow_control => manual}),
+        ok = h2:send_response(Conn, Sid, 200, []),
+        %% the server side ends first: the client stream goes half_closed_remote
+        ok = h2:send_trailers(Conn, Sid, [{<<"grpc-status">>, <<"0">>}]),
+        Test ! {server_stream, Conn, Sid, self()},
+        receive consume -> ok = h2:consume(Conn, Sid, ?WINDOW + 100) end,
+        receive stop -> ok after 30000 -> ok end
+    end,
+    {Server, Port} = start_server(Handler),
+    {ok, Client} = connect(Port),
+    ok = h2:wait_connected(Client),
+    {ok, Sid} = h2:request(Client, grpc_headers(Port),
+                           #{handler => self(), end_stream => false}),
+    {_SrvConn, _SrvSid, SrvPid} =
+        receive {server_stream, C, S, P} -> {C, S, P}
+        after 5000 -> error(no_server_stream) end,
+    %% exhaust the stream window, then park a blocking half-closing send
+    _ = h2:send_data(Client, Sid, binary:copy(<<0>>, ?WINDOW), false),
+    Parked = spawn(fun() ->
+        Test ! {parked_result,
+                h2:send_data(Client, Sid, <<"tail">>, true, #{block => infinity})}
+    end),
+    timer:sleep(300),
+    ?assert(erlang:is_process_alive(Parked)),
+    %% reopen the window: the tail drains with END_STREAM, which closes the
+    %% stream (peer already ended) and must settle the waiter with ok
+    SrvPid ! consume,
+    ?assertEqual(ok,
+                 receive {parked_result, R} -> R
+                 after 5000 -> error(blocked_sender_not_released) end),
+    SrvPid ! stop,
+    _ = h2:close(Client),
+    ok = h2:stop_server(Server).
+
+%% ---------------------------------------------------------------------------
 %% END_STREAM on the request HEADERS delivers the trailing empty DATA event
 %% to the stream handler, mirroring the client side and quic_h3.
 %% ---------------------------------------------------------------------------

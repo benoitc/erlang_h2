@@ -2675,19 +2675,24 @@ release_send_waiters_if_drained(StreamId, #state{streams = Streams} = State) ->
             State
     end.
 
-%% Fail every parked blocking-send caller of a stream that is closing.
-%% Reason maps the close cause: `rst' → {error, stream_reset},
-%% `end_stream' → {error, stream_closed}.
-fail_send_waiters(#stream{send_waiters = []}, _Reason) ->
+%% Settle every parked blocking-send caller of a stream that is closing.
+%% When the send buffer fully drained, their data was sent (e.g. the closing
+%% END_STREAM chunk on a half_closed_remote stream reaches close_stream before
+%% flush_stream gets to release them), so reply `ok'. Otherwise the data is
+%% stuck in the buffer forever, reply an error mapping the close cause:
+%% `rst' → {error, stream_reset}, `end_stream' → {error, stream_closed}.
+settle_send_waiters(#stream{send_waiters = []}, _Reason) ->
     ok;
-fail_send_waiters(#stream{send_waiters = Waiters}, Reason) ->
-    Error = case Reason of
-        rst -> {error, stream_reset};
-        _ -> {error, stream_closed}
+settle_send_waiters(#stream{send_buffer = Buffer, pending_end_stream = PendingEnd,
+                            send_waiters = Waiters}, Reason) ->
+    Reply = if
+        Buffer =:= <<>>, PendingEnd =:= false -> ok;
+        Reason =:= rst -> {error, stream_reset};
+        true -> {error, stream_closed}
     end,
     lists:foreach(fun({From, TimerRef}) ->
         ok = cancel_timer(TimerRef),
-        gen_statem:reply(From, Error)
+        gen_statem:reply(From, Reply)
     end, Waiters).
 
 %% Fire {error, timeout} to the parked caller whose timer expired and drop it.
@@ -3052,8 +3057,8 @@ close_stream(StreamId, Reason, #state{streams = Streams} = State0) ->
             %% be satisfied once the stream closes: flush_stream/2 (the only
             %% release path besides its timeout timer) no longer runs for a
             %% closed stream, so an infinity-blocked sender would hang for
-            %% the connection's lifetime. Fail the waiters instead.
-            fail_send_waiters(Stream, Reason),
+            %% the connection's lifetime. Settle the waiters instead.
+            settle_send_waiters(Stream, Reason),
             put_stream(StreamId,
                        Stream#stream{state = closed, closed_reason = Reason,
                                      send_waiters = []},
