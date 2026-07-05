@@ -4,6 +4,16 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-07-05
+
+### Fixed
+
+- A blocking `send_data/5` whose data fully drained no longer gets
+  `{error, stream_closed}` when the drain of its closing END_STREAM chunk is
+  what closes the stream (peer already half-closed). `close_stream` now
+  settles parked waiters by buffer state: `ok` when the send buffer drained,
+  the close-reason error otherwise. Regression introduced in 0.10.3.
+
 ## [0.10.3] - 2026-07-04
 
 ### Fixed
