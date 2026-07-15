@@ -4,6 +4,8 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-15
+
 ### Added
 
 - `h2:peername/1` returns the peer's `{IpAddress, Port}` for a live
