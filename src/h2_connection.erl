@@ -26,7 +26,7 @@
 -export([send_trailers/3]).
 -export([cancel_stream/2, cancel_stream/3]).
 -export([send_goaway/1, send_goaway/2, close/1]).
--export([get_settings/1, get_peer_settings/1]).
+-export([get_settings/1, get_peer_settings/1, peername/1]).
 -export([controlling_process/2]).
 -export([verify_stream_counts/1]).
 
@@ -416,6 +416,12 @@ get_settings(Conn) ->
 -spec get_peer_settings(pid()) -> h2_settings:settings().
 get_peer_settings(Conn) ->
     gen_statem:call(Conn, get_peer_settings).
+
+%% @doc Return the address of the connection's peer.
+-spec peername(pid()) ->
+    {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+peername(Conn) ->
+    gen_statem:call(Conn, peername).
 
 %% @doc Transfer ownership of the connection.
 -spec controlling_process(pid(), pid()) -> ok | {error, term()}.
@@ -2924,6 +2930,8 @@ handle_call_early(From, Request, StateName, #state{waiters = Waiters} = State) -
             {keep_state, State, [{reply, From, State#state.local_settings}]};
         get_peer_settings ->
             {keep_state, State, [{reply, From, State#state.peer_settings}]};
+        peername ->
+            {keep_state, State, [{reply, From, do_peername(State)}]};
         {controlling_process, NewOwner} ->
             {keep_state, swap_owner_monitor(NewOwner, State),
              [{reply, From, ok}]};
@@ -2937,12 +2945,21 @@ handle_call_common(From, Request, _StateName, State) ->
             {keep_state, State, [{reply, From, State#state.local_settings}]};
         get_peer_settings ->
             {keep_state, State, [{reply, From, State#state.peer_settings}]};
+        peername ->
+            {keep_state, State, [{reply, From, do_peername(State)}]};
         {controlling_process, NewOwner} ->
             {keep_state, swap_owner_monitor(NewOwner, State),
              [{reply, From, ok}]};
         _ ->
             {keep_state, State, [{reply, From, {error, unknown_request}}]}
     end.
+
+do_peername(#state{socket = undefined}) ->
+    {error, not_connected};
+do_peername(#state{socket = Socket, transport = gen_tcp}) ->
+    inet:peername(Socket);
+do_peername(#state{socket = Socket, transport = ssl}) ->
+    ssl:peername(Socket).
 
 handle_common(info, {'EXIT', Owner, Reason}, _StateName, #state{owner = Owner} = State) ->
     {stop, {shutdown, {owner_exit, Reason}}, State};

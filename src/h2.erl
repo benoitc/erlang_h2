@@ -93,7 +93,7 @@
 -export([set_stream_handler/3, set_stream_handler/4, unset_stream_handler/2]).
 -export([goaway/1, goaway/2]).
 -export([close/1]).
--export([get_settings/1, get_peer_settings/1]).
+-export([get_settings/1, get_peer_settings/1, peername/1]).
 -export([controlling_process/2]).
 
 %% Types
@@ -807,6 +807,12 @@ get_settings(Conn) ->
 -spec get_peer_settings(connection()) -> h2_settings:settings().
 get_peer_settings(Conn) ->
     h2_connection:get_peer_settings(Conn).
+
+%% @doc Return the address of the connection's peer.
+-spec peername(connection()) ->
+    {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+peername(Conn) ->
+    h2_connection:peername(Conn).
 
 %% @doc Transfer connection ownership.
 -spec controlling_process(connection(), pid()) -> ok | {error, term()}.

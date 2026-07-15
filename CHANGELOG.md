@@ -4,6 +4,13 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+### Added
+
+- `h2:peername/1` returns the peer's `{IpAddress, Port}` for a live
+  connection (server or client side), reading the underlying socket via
+  `inet:peername`/`ssl:peername`. Enables SIP Via received/rport for
+  embedders built on h2.
+
 ## [0.10.4] - 2026-07-05
 
 ### Fixed

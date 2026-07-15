@@ -130,7 +130,8 @@
     set_stream_handler_default_replays_buffer_test/1,
     large_body_yields_to_inbound_frames_test/1,
     tls_transport_tag_detected_test/1,
-    request_preserves_authority_and_scheme_test/1
+    request_preserves_authority_and_scheme_test/1,
+    server_peername_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -271,7 +272,8 @@ groups() ->
             set_stream_handler_default_replays_buffer_test,
             large_body_yields_to_inbound_frames_test,
             tls_transport_tag_detected_test,
-            request_preserves_authority_and_scheme_test
+            request_preserves_authority_and_scheme_test,
+            server_peername_test
         ]}
     ].
 
@@ -3056,6 +3058,38 @@ tls_transport_tag_detected_test(Config) ->
     %% surfaces the classification regression clearly.
     ?assertEqual(ssl, element(4, Data)),
     h2:close(Conn),
+    ok.
+
+%% h2:peername/1 on a server-side TLS connection returns the remote client's
+%% real loopback address, not {error, _}.
+server_peername_test(Config) ->
+    CertFile = ?config(cert_file, Config),
+    KeyFile = ?config(key_file, Config),
+    Self = self(),
+    Handler = fun(Conn, StreamId, _Method, _Path, _Headers) ->
+        Self ! {server_conn, Conn},
+        h2:send_response(Conn, StreamId, 200,
+                         [{<<"content-type">>, <<"text/plain">>}]),
+        h2:send_data(Conn, StreamId, <<"ok">>, true)
+    end,
+    {ok, Server} = h2:start_server(0, #{cert    => CertFile,
+                                        key     => KeyFile,
+                                        handler => Handler}),
+    Port = h2:server_port(Server),
+    {ok, Client} = h2:connect("localhost", Port, #{
+        ssl_opts => [{verify, verify_none},
+                     {alpn_advertised_protocols, [<<"h2">>]}]
+    }),
+    ok = h2:wait_connected(Client),
+
+    {ok, _} = h2:request(Client, <<"GET">>, <<"/">>,
+                         [{<<"host">>, list_to_binary("localhost:" ++ integer_to_list(Port))}]),
+
+    ServerConn = receive {server_conn, C} -> C after 2000 -> error(no_server_conn) end,
+    ?assertMatch({ok, {{127,0,0,1}, _ClientPort}}, h2:peername(ServerConn)),
+
+    h2:close(Client),
+    ok = h2:stop_server(Server),
     ok.
 
 generate_test_certs(Dir) ->

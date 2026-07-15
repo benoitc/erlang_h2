@@ -69,6 +69,7 @@ h2:respond/5            %% combined headers+body fast path (one call, one write)
 %% Inspection
 h2:get_settings/1
 h2:get_peer_settings/1
+h2:peername/1
 ```
 
 See the README for usage snippets and `src/h2.erl` for full edoc.
