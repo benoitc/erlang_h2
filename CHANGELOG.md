@@ -4,6 +4,25 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-11
+
+### Added
+
+- `h2:serve_socket/2` runs the server connection loop over a socket the caller
+  already accepted and handshook, so an embedder can own a single TLS listener,
+  resolve ALPN itself, and dispatch `h2` here while sending `http/1.1`
+  elsewhere. Takes the same `server_opts()` map as `start_server/2` and derives
+  its connection options through the same code, so the two cannot drift. ALPN is
+  not re-validated. Accepts a plain `gen_tcp` socket too, served as
+  prior-knowledge h2c. Socket ownership transfers to the returned pid, which is
+  linked to the caller.
+
+### Changed
+
+- The TLS handshake now runs in the per-connection process instead of the
+  acceptor. A slow or stalled client no longer holds up that acceptor's accept
+  queue. `start_server/2` behaviour is otherwise unchanged.
+
 ## [0.11.0] - 2026-07-15
 
 ### Added

@@ -16,7 +16,7 @@ Add to `rebar.config`:
 
 ```erlang
 {deps, [
-    {h2, "0.11.0", {git, "https://github.com/benoitc/erlang_h2.git", {tag, "0.11.0"}}}
+    {h2, "0.12.0", {git, "https://github.com/benoitc/erlang_h2.git", {tag, "0.12.0"}}}
 ]}.
 ```
 
@@ -265,7 +265,7 @@ The message framing (the 5-byte length prefix and protobuf) is the application's
 
 ## Using with Ranch
 
-The built-in `h2:start_server/2` runs its own acceptor pool. To plug into an existing Ranch listener instead, use `h2_connection` directly — it's a normal `gen_statem` you hand a socket to. A minimal Ranch protocol module:
+The built-in `h2:start_server/2` runs its own acceptor pool. To plug into an existing Ranch listener instead, hand the accepted socket to `h2:serve_socket/2`. A minimal Ranch protocol module:
 
 ```erlang
 -module(h2_ranch_protocol).
@@ -275,25 +275,15 @@ The built-in `h2:start_server/2` runs its own acceptor pool. To plug into an exi
 start_link(Ref, Transport, Opts) ->
     {ok, spawn_link(fun() -> init(Ref, Transport, Opts) end)}.
 
-init(Ref, Transport, #{handler := Handler} = Opts) ->
-    {ok, Socket}  = ranch:handshake(Ref),
-    TransportMod  = case Transport of ranch_ssl -> ssl; ranch_tcp -> gen_tcp end,
-    ConnOpts      = #{settings => maps:get(settings, Opts, #{}),
-                      enable_connect_protocol => maps:get(enable_connect_protocol, Opts, false)},
-    {ok, Conn}    = h2_connection:start_link(server, Socket, self(), ConnOpts),
-    ok            = TransportMod:controlling_process(Socket, Conn),
-    _             = h2_connection:activate(Conn),
-    server_loop(Conn, Handler).
-
-server_loop(Conn, Handler) ->
-    receive
-        {h2, Conn, {request, Sid, M, P, H}} ->
-            spawn(fun() -> Handler(Conn, Sid, M, P, H) end),
-            server_loop(Conn, Handler);
-        {h2, Conn, {closed, _}} -> ok;
-        _                        -> server_loop(Conn, Handler)
-    end.
+init(Ref, _Transport, Opts) ->
+    {ok, Socket} = ranch:handshake(Ref),
+    {ok, Conn}   = h2:serve_socket(Socket, Opts),
+    %% Ranch counts this process as the connection; outlive the h2 one.
+    MRef = erlang:monitor(process, Conn),
+    receive {'DOWN', MRef, process, Conn, _} -> ok end.
 ```
+
+`Opts` is the same map `h2:start_server/2` takes — `serve_socket/2` reads `handler`, `settings`, and `enable_connect_protocol` from it.
 
 Wire it up:
 
@@ -306,7 +296,7 @@ Wire it up:
     #{handler => fun my_app:handle/5}).
 ```
 
-Ranch owns draining, acceptor-pool sizing, and metrics; `h2_connection` handles h2 semantics. Public primitives used: `h2_connection:start_link/4` and `h2_connection:activate/1`.
+Ranch owns draining, acceptor-pool sizing, and metrics; h2 handles h2 semantics.
 
 ## Coexisting with HTTP/1.1
 
@@ -323,19 +313,30 @@ case h2:connect(Host, 443) of
 end.
 ```
 
-**Dual-stack server.** Advertise both protocols on the listener and dispatch by ALPN result. With the Ranch snippet above:
+**Dual-stack server.** Own the listener yourself, advertise both protocols, and hand the `h2` connections to `h2:serve_socket/2` — same map `start_server/2` takes, over a socket you already accepted and handshook:
 
 ```erlang
-init(Ref, ranch_ssl, Opts) ->
-    {ok, Socket} = ranch:handshake(Ref),
+{ok, Listen} = ssl:listen(8443, [{certfile, "cert.pem"}, {keyfile, "key.pem"},
+                                 {alpn_preferred_protocols, [<<"h2">>, <<"http/1.1">>]},
+                                 {active, false}, {mode, binary}]),
+
+accept(Listen, Opts) ->
+    {ok, Sock} = ssl:transport_accept(Listen),
+    spawn(fun() -> dispatch(Sock, Opts) end),
+    accept(Listen, Opts).
+
+dispatch(Sock, Opts) ->
+    {ok, Socket} = ssl:handshake(Sock, 30000),
     case ssl:negotiated_protocol(Socket) of
-        {ok, <<"h2">>}       -> start_h2(Socket, Opts);
-        {ok, <<"http/1.1">>} -> start_http1(Socket, Opts);   %% e.g. cowboy / elli
+        {ok, <<"h2">>}       -> h2:serve_socket(Socket, Opts);
+        {ok, <<"http/1.1">>} -> my_http1:serve(Socket);
         _                    -> ssl:close(Socket)
     end.
 ```
 
-Listener `alpn_preferred_protocols` becomes `[<<"h2">>, <<"http/1.1">>]`. One port, TLS picks per connection.
+One port, TLS picks per connection. Handshake in the per-connection process, not the accept loop, so a stalled client can't block the queue.
+
+`serve_socket/2` returns `{ok, Pid}` and takes ownership of the socket — don't read, write, or close it afterwards. `Pid` is spawned **linked** to the caller: a clean disconnect exits `normal`, a connection failure propagates unless you trap exits, and your death tears the connection down. Call it from the process whose lifetime the connection should follow. ALPN is not re-checked; you already resolved it. A plain `gen_tcp` socket works too and is served as prior-knowledge h2c.
 
 **Cleartext `Upgrade: h2c` from HTTP/1.1.** Deprecated by RFC 9113 and not supported. Use prior-knowledge h2c instead — both peers agree out of band that the connection is plaintext h2:
 
