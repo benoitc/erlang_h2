@@ -79,6 +79,7 @@
 
 %% Server API
 -export([start_server/2, start_server/3, stop_server/1, server_port/1]).
+-export([serve_socket/2]).
 -export([send_response/4]).
 -export([respond/5]).
 
@@ -386,8 +387,6 @@ start_server_ssl(Port, Opts) ->
                 {error, _} = OptsErr -> OptsErr;
                 {ok, SSLOpts} ->
             NumAcceptors = maps:get(acceptors, Opts, erlang:system_info(schedulers)),
-            Settings = maps:get(settings, Opts, #{}),
-            EnableConnectProtocol = maps:get(enable_connect_protocol, Opts, false),
             case ssl:listen(Port, SSLOpts) of
                 {ok, ListenSocket} ->
                     {ok, {_, BoundPort}} = ssl:sockname(ListenSocket),
@@ -395,8 +394,7 @@ start_server_ssl(Port, Opts) ->
                     ServerState = #{
                         listen_socket => ListenSocket,
                         handler => Handler,
-                        settings => Settings,
-                        enable_connect_protocol => EnableConnectProtocol,
+                        conn_opts => conn_opts(Opts),
                         ref => Ref
                     },
                     case h2_sup:start_listener(#{
@@ -460,8 +458,6 @@ start_server_tcp(Port, Opts) ->
     case maps:find(handler, Opts) of
         {ok, Handler} ->
             NumAcceptors = maps:get(acceptors, Opts, erlang:system_info(schedulers)),
-            Settings = maps:get(settings, Opts, #{}),
-            EnableConnectProtocol = maps:get(enable_connect_protocol, Opts, false),
             TCPOpts = [
                 {reuseaddr, true},
                 {active, false},
@@ -476,8 +472,7 @@ start_server_tcp(Port, Opts) ->
                     ServerState = #{
                         listen_socket => ListenSocket,
                         handler => Handler,
-                        settings => Settings,
-                        enable_connect_protocol => EnableConnectProtocol,
+                        conn_opts => conn_opts(Opts),
                         ref => Ref
                     },
                     case h2_sup:start_listener(#{
@@ -510,6 +505,95 @@ stop_server({ListenerPid, Ref, _Port}) ->
 -spec server_port(server_ref()) -> inet:port_number().
 server_port({_, _, Port}) -> Port.
 
+%% @doc Serve HTTP/2 over a socket the caller already accepted and handshook.
+%%
+%% This is the entry point for embedders that own their own listener: accept a
+%% TLS connection yourself, complete the handshake, resolve ALPN, and hand the
+%% `h2' connections here while dispatching `http/1.1' to your own stack. One
+%% port, one certificate, one acceptor pool, both protocols. `Opts' is the same
+%% `server_opts()' map `start_server/2' takes; only `handler', `settings' and
+%% `enable_connect_protocol' are read (the listener keys are the caller's
+%% business), and the connection options are derived through the same code the
+%% built-in acceptor uses.
+%%
+%% ```
+%% {ok, Sock}   = ssl:transport_accept(Listen),
+%% {ok, TLS}    = ssl:handshake(Sock, 30000),
+%% case ssl:negotiated_protocol(TLS) of
+%%     {ok, <<"h2">>}       -> h2:serve_socket(TLS, #{handler => Handler});
+%%     {ok, <<"http/1.1">>} -> my_http1:serve(TLS);
+%%     _                    -> ssl:close(TLS)
+%% end.
+%% '''
+%%
+%% Accepts a TLS socket or a plain `gen_tcp' socket; the transport is inferred
+%% from the socket, and with it the request scheme (`https' vs `http'). A
+%% cleartext socket is served as prior-knowledge h2c.
+%%
+%% == Socket ownership ==
+%%
+%% The caller must be the socket's current controlling process, the socket must
+%% be in binary mode, and nothing may have been read from it beyond the TLS
+%% handshake. The socket is forced to `{active, false}' before it is handed on.
+%%
+%% On `{ok, Pid}' ownership has transferred: the caller must not read from,
+%% write to, or close the socket afterwards. On `{error, _}' the socket is
+%% untouched and still belongs to the caller, who decides whether to close it.
+%%
+%% == Linking and connection death ==
+%%
+%% `Pid' is spawned linked to the caller. A clean peer disconnect or GOAWAY
+%% exits it with `normal', which a caller that does not trap exits can ignore;
+%% an abnormal connection failure propagates to the caller unless it traps
+%% exits. If the caller dies, the connection is torn down with it. Call
+%% `serve_socket/2' from the per-connection process you are happy to tie the
+%% connection's lifetime to, not from a long-lived accept loop.
+%%
+%% `Pid' is the connection loop process, not the `h2_connection' pid. The
+%% handler is passed the connection pid as its first argument, exactly as under
+%% `start_server/2'.
+%%
+%% ALPN is not re-validated: the caller has already resolved it.
+-spec serve_socket(ssl:sslsocket() | gen_tcp:socket(), server_opts()) ->
+    {ok, pid()} | {error, term()}.
+serve_socket(Socket, Opts) ->
+    case maps:find(handler, Opts) of
+        {ok, Handler} ->
+            Transport = case is_ssl_socket(Socket) of
+                true -> ssl;
+                false -> gen_tcp
+            end,
+            ConnOpts = conn_opts(Opts),
+            _ = set_passive(Transport, Socket),
+            Pid = spawn_link(fun() ->
+                receive
+                    {socket_ready, Sock} ->
+                        handle_server_connection(Sock, Handler, ConnOpts, Transport);
+                    {socket_transfer_failed, _} ->
+                        ok
+                end
+            end),
+            TransferResult = case Transport of
+                ssl -> ssl:controlling_process(Socket, Pid);
+                gen_tcp -> gen_tcp:controlling_process(Socket, Pid)
+            end,
+            case TransferResult of
+                ok ->
+                    Pid ! {socket_ready, Socket},
+                    {ok, Pid};
+                {error, TransferReason} ->
+                    %% The wrapper exits `normal'; the socket stays the
+                    %% caller's, so we deliberately don't close it here.
+                    Pid ! {socket_transfer_failed, TransferReason},
+                    {error, {controlling_process_failed, TransferReason}}
+            end;
+        error ->
+            {error, {missing_required_option, [handler]}}
+    end.
+
+set_passive(ssl, Socket)     -> ssl:setopts(Socket, [{active, false}]);
+set_passive(gen_tcp, Socket) -> inet:setopts(Socket, [{active, false}]).
+
 acceptor_loop(State) ->
     process_flag(trap_exit, true),
     acceptor_loop_inner(State).
@@ -524,41 +608,29 @@ drain_child_exits() ->
     after 0 -> ok
     end.
 
-acceptor_loop_inner(#{listen_socket := ListenSocket, handler := Handler, settings := Settings} = State) ->
-    EnableConnectProtocol = maps:get(enable_connect_protocol, State, false),
+acceptor_loop_inner(#{listen_socket := ListenSocket, handler := Handler,
+                      conn_opts := ConnOpts} = State) ->
     drain_child_exits(),
     case ssl:transport_accept(ListenSocket, infinity) of
         {ok, Socket} ->
-            case ssl:handshake(Socket, ?DEFAULT_TIMEOUT_MS) of
-                {ok, SSLSocket} ->
-                    %% Check ALPN
-                    case ssl:negotiated_protocol(SSLSocket) of
-                        {ok, <<"h2">>} ->
-                            %% Ensure socket is in passive mode before transfer
-                            _ = ssl:setopts(SSLSocket, [{active, false}]),
-                            Pid = spawn_link(fun() ->
-                                receive
-                                    {socket_ready, Sock} ->
-                                        handle_server_connection(Sock, Handler, Settings,
-                                                                 ssl, EnableConnectProtocol);
-                                    {socket_transfer_failed, _} ->
-                                        ok
-                                end
-                            end),
-                            case ssl:controlling_process(SSLSocket, Pid) of
-                                ok ->
-                                    Pid ! {socket_ready, SSLSocket},
-                                    ok;
-                                {error, TransferReason} ->
-                                    Pid ! {socket_transfer_failed, TransferReason},
-                                    _ = ssl:close(SSLSocket),
-                                    ok
-                            end;
-                        _ ->
-                            _ = ssl:close(SSLSocket),
-                            ok
-                    end;
-                {error, _} ->
+            %% The TLS handshake runs in the spawned connection process, not
+            %% here: a slow or stalled peer would otherwise hold up this
+            %% acceptor's whole accept queue for up to ?DEFAULT_TIMEOUT_MS.
+            Pid = spawn_link(fun() ->
+                receive
+                    {socket_ready, Sock} ->
+                        accept_handshake(Sock, Handler, ConnOpts);
+                    {socket_transfer_failed, _} ->
+                        ok
+                end
+            end),
+            case ssl:controlling_process(Socket, Pid) of
+                ok ->
+                    Pid ! {socket_ready, Socket},
+                    ok;
+                {error, TransferReason} ->
+                    Pid ! {socket_transfer_failed, TransferReason},
+                    _ = ssl:close(Socket),
                     ok
             end,
             acceptor_loop_inner(State);
@@ -571,16 +643,37 @@ acceptor_loop_inner(#{listen_socket := ListenSocket, handler := Handler, setting
             acceptor_loop_inner(State)
     end.
 
-handle_server_connection(Socket, Handler, Settings, Transport, EnableConnectProtocol) ->
-    ConnOpts = #{settings => Settings,
-                 enable_connect_protocol => EnableConnectProtocol},
+%% TLS handshake + ALPN gate for a socket handed over by the acceptor. Runs in
+%% the connection process. Anything the peer did not negotiate as `h2' is
+%% closed here; callers who want to dispatch non-h2 themselves own the
+%% handshake and use serve_socket/2 instead.
+accept_handshake(Socket, Handler, ConnOpts) ->
+    case ssl:handshake(Socket, ?DEFAULT_TIMEOUT_MS) of
+        {ok, SSLSocket} ->
+            case ssl:negotiated_protocol(SSLSocket) of
+                {ok, <<"h2">>} ->
+                    %% Ensure socket is in passive mode before transfer
+                    _ = ssl:setopts(SSLSocket, [{active, false}]),
+                    handle_server_connection(SSLSocket, Handler, ConnOpts, ssl);
+                _ ->
+                    _ = ssl:close(SSLSocket),
+                    ok
+            end;
+        {error, _} ->
+            ignore_errors(fun() -> ssl:close(Socket) end)
+    end.
+
+%% Derive the h2_connection options from a server_opts() map. Single source of
+%% truth for both the built-in acceptor path and serve_socket/2, so the two
+%% cannot drift.
+conn_opts(Opts) ->
+    #{settings => maps:get(settings, Opts, #{}),
+      enable_connect_protocol => maps:get(enable_connect_protocol, Opts, false)}.
+
+handle_server_connection(Socket, Handler, ConnOpts, Transport) ->
     TransferFn = case Transport of
         ssl -> fun ssl:controlling_process/2;
         gen_tcp -> fun gen_tcp:controlling_process/2
-    end,
-    CloseFn = case Transport of
-        ssl -> fun ssl:close/1;
-        gen_tcp -> fun gen_tcp:close/1
     end,
     case h2_connection:start_link(server, Socket, self(), ConnOpts) of
         {ok, Conn} ->
@@ -590,18 +683,18 @@ handle_server_connection(Socket, Handler, Settings, Transport, EnableConnectProt
                     server_connection_loop(Conn, Handler);
                 {error, _} ->
                     ignore_errors(fun() -> h2_connection:close(Conn) end),
-                    ignore_errors(fun() -> CloseFn(Socket) end)
+                    ignore_errors(fun() -> close_socket(Transport, Socket) end)
             end;
         {error, _Reason} ->
-            ignore_errors(fun() -> CloseFn(Socket) end)
+            ignore_errors(fun() -> close_socket(Transport, Socket) end)
     end.
 
 tcp_acceptor_loop(State) ->
     process_flag(trap_exit, true),
     tcp_acceptor_loop_inner(State).
 
-tcp_acceptor_loop_inner(#{listen_socket := ListenSocket, handler := Handler, settings := Settings} = State) ->
-    EnableConnectProtocol = maps:get(enable_connect_protocol, State, false),
+tcp_acceptor_loop_inner(#{listen_socket := ListenSocket, handler := Handler,
+                          conn_opts := ConnOpts} = State) ->
     drain_child_exits(),
     case gen_tcp:accept(ListenSocket, infinity) of
         {ok, Socket} ->
@@ -609,8 +702,7 @@ tcp_acceptor_loop_inner(#{listen_socket := ListenSocket, handler := Handler, set
             Pid = spawn_link(fun() ->
                 receive
                     {socket_ready, Sock} ->
-                        handle_server_connection(Sock, Handler, Settings,
-                                                 gen_tcp, EnableConnectProtocol);
+                        handle_server_connection(Sock, Handler, ConnOpts, gen_tcp);
                     {socket_transfer_failed, _} ->
                         ok
                 end

@@ -39,6 +39,10 @@
 - ALPN `h2` required on the client, advertised on the server.
 - TLS 1.2 and 1.3.
 - SNI carried automatically from the client hostname.
+- Handshake runs in the per-connection process, so a stalled peer can't block
+  an acceptor's accept queue.
+- Dual-stack listeners are the caller's to own: resolve ALPN yourself and pass
+  the `h2` sockets to `h2:serve_socket/2`.
 
 ### API surface
 
@@ -63,6 +67,7 @@ h2:controlling_process/2
 h2:start_server/2,3
 h2:stop_server/1
 h2:server_port/1
+h2:serve_socket/2       %% serve a socket you accepted and handshook yourself
 h2:send_response/4
 h2:respond/5            %% combined headers+body fast path (one call, one write)
 
