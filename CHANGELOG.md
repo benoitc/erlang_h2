@@ -4,6 +4,17 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+### Fixed
+
+- A HEADERS frame rejected with a stream error now has its field block
+  decoded before it is dropped (RFC 9113 §4.3). This covers HEADERS on a reset
+  or half-closed stream, a stream refused by `max_concurrent_streams`, and
+  HEADERS whose priority depends on its own stream, including blocks
+  continued in CONTINUATION frames. Skipping the block left the HPACK decoder
+  behind the peer's encoder, so the next block that referenced the missing
+  dynamic table entries failed with COMPRESSION_ERROR and the whole connection
+  closed. A client hit this when a response crossed its own RST_STREAM.
+
 ## [0.12.0] - 2026-08-11
 
 ### Added
