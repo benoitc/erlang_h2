@@ -215,6 +215,10 @@
     %% END_HEADERS is a matching CONTINUATION on the same stream.
     %% {StreamId, EndStream} while awaiting; undefined otherwise.
     expecting_continuation :: {non_neg_integer(), boolean()} | undefined,
+    %% Field block of a HEADERS frame we rejected with a stream error,
+    %% buffered until END_HEADERS so it can still be decoded (RFC 9113 §4.3):
+    %% {StreamId, Buffer, Size}.
+    discarded_block :: {non_neg_integer(), iodata(), non_neg_integer()} | undefined,
 
     %% Scheme to advertise on outbound :scheme pseudo-header.
     %% Derived from transport at init: ssl -> https, gen_tcp -> http.
@@ -1037,10 +1041,9 @@ handle_frame(_StateName, {headers, StreamId, HeaderBlock, EndStream, EndHeaders}
     handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, undefined, State);
 
 %% RFC 9113 §5.3.1: HEADERS with inline priority cannot depend on itself.
-handle_frame(_StateName, {headers, StreamId, _HeaderBlock, _EndStream, _EndHeaders,
+handle_frame(_StateName, {headers, StreamId, HeaderBlock, _EndStream, EndHeaders,
                            {_Exclusive, StreamId, _Weight}}, State) ->
-    send_rst_stream(StreamId, protocol_error, State),
-    {ok, connected, State};
+    reject_header_block(StreamId, protocol_error, HeaderBlock, EndHeaders, State);
 handle_frame(_StateName, {headers, StreamId, HeaderBlock, EndStream, EndHeaders, Priority}, State) ->
     handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, Priority, State);
 
@@ -1215,13 +1218,11 @@ handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, _Priority, #state{m
             %% RFC 9113 §5.1: after RST_STREAM, further frames on the stream
             %% are a stream error STREAM_CLOSED (peer/self may have in-flight
             %% frames; don't tear down the connection).
-            send_rst_stream(StreamId, stream_closed, State),
-            {ok, connected, State};
+            reject_header_block(StreamId, stream_closed, HeaderBlock, EndHeaders, State);
         {ok, _Stream} ->
             %% RFC 9113 §5.1 (half_closed_remote): HEADERS in this state is a
             %% stream error STREAM_CLOSED.
-            send_rst_stream(StreamId, stream_closed, State),
-            {ok, connected, State};
+            reject_header_block(StreamId, stream_closed, HeaderBlock, EndHeaders, State);
         error ->
             %% No active record. If the id was closed recently (record
             %% evicted but reason retained), apply the spec-correct
@@ -1230,8 +1231,8 @@ handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, _Priority, #state{m
                 end_stream ->
                     {error, stream_closed, State};
                 rst ->
-                    send_rst_stream(StreamId, stream_closed, State),
-                    {ok, connected, State};
+                    reject_header_block(StreamId, stream_closed, HeaderBlock,
+                                        EndHeaders, State);
                 unknown ->
                     handle_headers_new(StreamId, HeaderBlock, EndStream, EndHeaders, Mode, State)
             end
@@ -1244,8 +1245,8 @@ handle_headers_new(StreamId, HeaderBlock, EndStream, EndHeaders, Mode, State) ->
                     %% would exceed our advertised SETTINGS_MAX_CONCURRENT_STREAMS.
                     case peer_stream_limit_exceeded(Mode, State) of
                         true ->
-                            send_rst_stream(StreamId, refused_stream, State),
-                            {ok, connected, State};
+                            reject_header_block(StreamId, refused_stream,
+                                                HeaderBlock, EndHeaders, State);
                         false ->
                             case EndHeaders of
                                 true ->
@@ -1287,6 +1288,25 @@ handle_continuation(_StreamId, _HeaderBlock, _EndHeaders,
                     #state{expecting_continuation = undefined} = State) ->
     {error, protocol_error, State};
 handle_continuation(StreamId, HeaderBlock, EndHeaders,
+                    #state{discarded_block = {StreamId, Buffer, Size}} = State) ->
+    NewSize = Size + byte_size(HeaderBlock),
+    case NewSize > ?MAX_HEADER_BLOCK_BYTES of
+        true ->
+            {error, enhance_your_calm, State};
+        false ->
+            NewBuffer = [Buffer, HeaderBlock],
+            case EndHeaders of
+                true ->
+                    decode_discarded_block(
+                      iolist_to_binary(NewBuffer),
+                      State#state{expecting_continuation = undefined,
+                                  discarded_block = undefined});
+                false ->
+                    {ok, connected,
+                     State#state{discarded_block = {StreamId, NewBuffer, NewSize}}}
+            end
+    end;
+handle_continuation(StreamId, HeaderBlock, EndHeaders,
                     #state{streams = Streams,
                            expecting_continuation = Expecting} = State) ->
     case maps:find(StreamId, Streams) of
@@ -1319,6 +1339,33 @@ handle_continuation(StreamId, HeaderBlock, EndHeaders,
             end;
         error ->
             {error, protocol_error, State}
+    end.
+
+%% RFC 9113 §4.3: every field block updates the HPACK decoding context, so a
+%% block must be decoded even when its stream is refused or already reset.
+%% Skipping it leaves our dynamic table behind the peer's, and the next block
+%% that references the missing entries fails with COMPRESSION_ERROR, taking
+%% the connection down. Answer the stream error, then decode the block
+%% (buffering any CONTINUATION frames) and drop the headers.
+reject_header_block(StreamId, ErrorCode, HeaderBlock, EndHeaders, State) ->
+    send_rst_stream(StreamId, ErrorCode, State),
+    case EndHeaders of
+        true ->
+            decode_discarded_block(HeaderBlock, State);
+        false ->
+            {ok, connected,
+             State#state{expecting_continuation = {StreamId, false},
+                         discarded_block = {StreamId, HeaderBlock,
+                                            byte_size(HeaderBlock)}}}
+    end.
+
+decode_discarded_block(HeaderBlock, #state{decode_context = DecCtx} = State) ->
+    case h2_hpack:decode(HeaderBlock, DecCtx) of
+        {ok, _Headers, DecCtx1} ->
+            {ok, connected, State#state{decode_context = DecCtx1}};
+        {error, _Reason} ->
+            logger:error("h2: HPACK decode error", #{}),
+            {error, compression_error, State}
     end.
 
 decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_context = DecCtx, mode = Mode} = State) ->

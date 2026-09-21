@@ -131,7 +131,13 @@
     large_body_yields_to_inbound_frames_test/1,
     tls_transport_tag_detected_test/1,
     request_preserves_authority_and_scheme_test/1,
-    server_peername_test/1
+    server_peername_test/1,
+    rst_closed_stream_headers_keeps_hpack_in_sync_test/1,
+    rst_closed_stream_continuation_keeps_hpack_in_sync_test/1,
+    evicted_rst_stream_headers_keeps_hpack_in_sync_test/1,
+    half_closed_remote_headers_keeps_hpack_in_sync_test/1,
+    refused_stream_headers_keeps_hpack_in_sync_test/1,
+    priority_self_dependency_keeps_hpack_in_sync_test/1
 ]).
 
 %% Module-style handler callback used by handler_module_test.
@@ -273,7 +279,13 @@ groups() ->
             large_body_yields_to_inbound_frames_test,
             tls_transport_tag_detected_test,
             request_preserves_authority_and_scheme_test,
-            server_peername_test
+            server_peername_test,
+            rst_closed_stream_headers_keeps_hpack_in_sync_test,
+            rst_closed_stream_continuation_keeps_hpack_in_sync_test,
+            evicted_rst_stream_headers_keeps_hpack_in_sync_test,
+            half_closed_remote_headers_keeps_hpack_in_sync_test,
+            refused_stream_headers_keeps_hpack_in_sync_test,
+            priority_self_dependency_keeps_hpack_in_sync_test
         ]}
     ].
 
@@ -2227,6 +2239,155 @@ closed_stream_continuation_triggers_goaway_test(Config) ->
         {ok, _ErrorCode} -> ok;  %% STREAM_CLOSED or PROTOCOL_ERROR both acceptable
         timeout          -> ct:fail(no_goaway)
     end,
+    ssl:close(Sock),
+    ok.
+
+%% RFC 9113 §4.3: a field block must be decoded even when its stream is
+%% rejected with a stream error, or the HPACK tables of the two endpoints
+%% drift apart. Each test below has the rejected block introduce a header
+%% into the dynamic table, then sends a request whose block references that
+%% entry by index. If the rejected block was skipped, the probe fails with
+%% COMPRESSION_ERROR and the connection is torn down.
+
+hpack_request(Path) ->
+    [{<<":method">>, <<"GET">>},
+     {<<":scheme">>, <<"https">>},
+     {<<":path">>, Path},
+     {<<":authority">>, <<"localhost">>}].
+
+%% Same request plus a header that enters the dynamic table.
+hpack_sync_request(Path) ->
+    hpack_request(Path) ++ [{<<"x-hpack-sync">>, <<"dynamic-table-probe">>}].
+
+%% Send a request referencing the probe entry on StreamId and expect its
+%% response rather than a GOAWAY.
+assert_hpack_in_sync(Sock, StreamId, Ctx) ->
+    {Block, _} = h2_hpack:encode(hpack_sync_request(<<"/">>), Ctx),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(StreamId, Block, true))),
+    ?assertEqual(ok, await_end_stream_or_goaway(Sock, StreamId, 3000)).
+
+await_end_stream_or_goaway(Sock, StreamId, Timeout) ->
+    case ssl:recv(Sock, 9, Timeout) of
+        {ok, <<Len:24, Type:8, Flags:8, _:1, Sid:31>>} ->
+            Payload = case Len of
+                0 -> <<>>;
+                _ -> {ok, P} = ssl:recv(Sock, Len, Timeout), P
+            end,
+            EndStream = (Flags band 16#1) =:= 1,
+            case {Type, Payload} of
+                {16#7, <<_Last:32, ErrorCode:32, _/binary>>} ->
+                    {goaway, ErrorCode};
+                {T, _} when (T =:= 16#0 orelse T =:= 16#1), EndStream,
+                            Sid =:= StreamId ->
+                    ok;
+                _ ->
+                    await_end_stream_or_goaway(Sock, StreamId, Timeout)
+            end;
+        {error, Reason} -> {error, Reason}
+    end.
+
+rst_closed_stream_headers_keeps_hpack_in_sync_test(Config) ->
+    {ok, Sock} = raw_h2_client(?config(port, Config)),
+    {Block1, Ctx1} = h2_hpack:encode(hpack_request(<<"/">>), h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block1, true))),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:rst_stream(1, 8))),
+    {Block2, Ctx2} = h2_hpack:encode(hpack_sync_request(<<"/">>), Ctx1),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block2, true))),
+    ?assertEqual({rst, 5}, wait_for_rst_or_goaway(Sock, 3000)),
+    assert_hpack_in_sync(Sock, 3, Ctx2),
+    ssl:close(Sock),
+    ok.
+
+%% The rejected block spans HEADERS + CONTINUATION: it is buffered until
+%% END_HEADERS, then decoded.
+rst_closed_stream_continuation_keeps_hpack_in_sync_test(Config) ->
+    {ok, Sock} = raw_h2_client(?config(port, Config)),
+    {Block1, Ctx1} = h2_hpack:encode(hpack_request(<<"/">>), h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block1, true))),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:rst_stream(1, 8))),
+    {Block2, Ctx2} = h2_hpack:encode(hpack_sync_request(<<"/">>), Ctx1),
+    Half = byte_size(Block2) div 2,
+    <<Part1:Half/binary, Part2/binary>> = Block2,
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Part1, true, false))),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:continuation(1, Part2, true))),
+    ?assertEqual({rst, 5}, wait_for_rst_or_goaway(Sock, 3000)),
+    assert_hpack_in_sync(Sock, 3, Ctx2),
+    ssl:close(Sock),
+    ok.
+
+%% The reset stream's record has been evicted from the closed-streams FIFO
+%% (?CLOSED_STREAMS_LIMIT = 100); only its close reason remains.
+evicted_rst_stream_headers_keeps_hpack_in_sync_test(Config) ->
+    {ok, Sock} = raw_h2_client(?config(port, Config)),
+    {Block1, Ctx1} = h2_hpack:encode(hpack_request(<<"/">>), h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block1, true))),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:rst_stream(1, 8))),
+    Ctx2 = lists:foldl(
+             fun(StreamId, CtxAcc) ->
+                 {B, CtxNext} = h2_hpack:encode(hpack_request(<<"/">>), CtxAcc),
+                 ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(StreamId, B, true))),
+                 ok = drain_until_end_stream(Sock, StreamId, 3000),
+                 CtxNext
+             end, Ctx1, lists:seq(3, 205, 2)),
+    {Block2, Ctx3} = h2_hpack:encode(hpack_sync_request(<<"/">>), Ctx2),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block2, true))),
+    ?assertEqual({rst, 5}, wait_for_rst_or_goaway(Sock, 3000)),
+    assert_hpack_in_sync(Sock, 207, Ctx3),
+    ssl:close(Sock),
+    ok.
+
+%% HEADERS on a stream the peer already half-closed (its END_STREAM was
+%% received and the handler has not answered yet).
+half_closed_remote_headers_keeps_hpack_in_sync_test(Config) ->
+    {ok, Sock} = raw_h2_client(?config(port, Config)),
+    {Block1, Ctx1} = h2_hpack:encode(hpack_request(<<"/delay/1000">>),
+                                     h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block1, true))),
+    {Block2, Ctx2} = h2_hpack:encode(hpack_sync_request(<<"/delay/1000">>), Ctx1),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block2, true))),
+    ?assertEqual({rst, 5}, wait_for_rst_or_goaway(Sock, 3000)),
+    assert_hpack_in_sync(Sock, 3, Ctx2),
+    ssl:close(Sock),
+    ok.
+
+%% A stream refused for exceeding SETTINGS_MAX_CONCURRENT_STREAMS.
+refused_stream_headers_keeps_hpack_in_sync_test(Config) ->
+    Handler = fun(Conn, StreamId, Method, Path, Headers) ->
+        handle_test_request(Conn, StreamId, Method, Path, Headers)
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert     => ?config(cert_file, Config),
+        key      => ?config(key_file, Config),
+        handler  => Handler,
+        settings => #{max_concurrent_streams => 1}
+    }),
+    {ok, Sock} = raw_h2_client(h2:server_port(Ref)),
+    %% Stream 1 stays open and holds the only slot.
+    {Block1, Ctx1} = h2_hpack:encode(hpack_request(<<"/delay/2000">>),
+                                     h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block1, false))),
+    {Block3, Ctx2} = h2_hpack:encode(hpack_sync_request(<<"/">>), Ctx1),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(3, Block3, true))),
+    ?assertEqual({rst, 7}, wait_for_rst_or_goaway(Sock, 3000)),
+    %% Free the slot, then probe on a new stream.
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:rst_stream(1, 8))),
+    assert_hpack_in_sync(Sock, 5, Ctx2),
+    ssl:close(Sock),
+    h2:stop_server(Ref),
+    drain_exits(),
+    ok.
+
+%% HEADERS whose inline priority depends on its own stream.
+priority_self_dependency_keeps_hpack_in_sync_test(Config) ->
+    {ok, Sock} = raw_h2_client(?config(port, Config)),
+    {Block, Ctx} = h2_hpack:encode(hpack_sync_request(<<"/">>), h2_hpack:new_context()),
+    %% PRIORITY (0x20) + END_HEADERS (0x4) + END_STREAM (0x1), depending on
+    %% stream 1 itself.
+    Payload = <<0:1, 1:31, 15:8, Block/binary>>,
+    Flags = 16#20 bor 16#4 bor 16#1,
+    ok = ssl:send(Sock, <<(byte_size(Payload)):24, 1:8, Flags:8, 0:1, 1:31, Payload/binary>>),
+    ?assertEqual({rst, 1}, wait_for_rst_or_goaway(Sock, 3000)),
+    assert_hpack_in_sync(Sock, 3, Ctx),
     ssl:close(Sock),
     ok.
 
