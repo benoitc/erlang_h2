@@ -53,7 +53,7 @@
 %% - `{h2, Conn, {trailers, StreamId, Trailers}}'
 %% - `{h2, Conn, {stream_reset, StreamId, ErrorCode}}'
 %% - `{h2, Conn, {goaway, LastStreamId, ErrorCode}}'
-%% - `{h2, Conn, closed}'
+%% - `{h2, Conn, {closed, Reason}}'
 %%
 %% Server handler receives direct calls.
 %%

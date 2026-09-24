@@ -2,6 +2,16 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- The `h2_client` CLI now reports a connection that closes while it waits for
+  a response, along with the close reason. It matched a bare `closed` atom
+  that `h2_connection` never sends, so it waited out its timeout and printed
+  "Timeout waiting for response". The owner-message list in `h2` now documents
+  `{h2, Conn, {closed, Reason}}`.
+
 ## [0.12.1] - 2026-09-21
 
 ### Fixed
