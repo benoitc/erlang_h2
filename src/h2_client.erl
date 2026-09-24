@@ -208,6 +208,7 @@ usage() ->
 %% Client Implementation
 %% ============================================================================
 
+-spec run_client(map()) -> no_return().
 run_client(Opts) ->
     %% Start required applications
     ok = application:ensure_started(crypto),
@@ -300,9 +301,10 @@ build_ssl_opts(Opts) ->
 
     BaseOpts ++ CertOpts ++ KeyOpts ++ CAOpts ++ SNIOpts.
 
+-spec receive_response(pid(), non_neg_integer(), map()) -> no_return().
 receive_response(Conn, StreamId, Opts) ->
     Verbose = maps:get(verbose, Opts),
-    receive_response_loop(Conn, StreamId, Opts, Verbose, <<>>, undefined).
+    halt(receive_response_loop(Conn, StreamId, Opts, Verbose, <<>>, undefined)).
 
 receive_response_loop(Conn, StreamId, Opts, Verbose, BodyAcc, Status) ->
     Timeout = maps:get(timeout, Opts) * 1000,
@@ -318,8 +320,8 @@ receive_response_loop(Conn, StreamId, Opts, Verbose, BodyAcc, Status) ->
             handle_response_body(FullBody, Status, Opts, Verbose),
             h2:close(Conn),
             case Status of
-                S when S >= 200, S < 400 -> halt(0);
-                _ -> halt(1)
+                S when S >= 200, S < 400 -> 0;
+                _ -> 1
             end;
 
         {h2, Conn, {data, StreamId, Data, false}} ->
@@ -335,21 +337,21 @@ receive_response_loop(Conn, StreamId, Opts, Verbose, BodyAcc, Status) ->
         {h2, Conn, {stream_reset, StreamId, ErrorCode}} ->
             io:format(standard_error, "~nStream reset: ~p~n", [ErrorCode]),
             h2:close(Conn),
-            halt(1);
+            1;
 
         {h2, Conn, {goaway, _LastStreamId, ErrorCode}} ->
             io:format(standard_error, "~nConnection closed: ~p~n", [ErrorCode]),
             h2:close(Conn),
-            halt(1);
+            1;
 
-        {h2, Conn, closed} ->
-            io:format(standard_error, "~nConnection closed unexpectedly~n", []),
-            halt(1)
+        {h2, Conn, {closed, Reason}} ->
+            io:format(standard_error, "~nConnection closed: ~p~n", [Reason]),
+            1
 
     after Timeout ->
         io:format(standard_error, "~nTimeout waiting for response~n", []),
         h2:close(Conn),
-        halt(1)
+        1
     end.
 
 handle_response_body(Body, Status, Opts, Verbose) ->
@@ -407,5 +409,16 @@ parse_args_test_() ->
         ?_assertMatch({ok, #{method := <<"POST">>}},
                       parse_args(["-X", "post", "https://example.com/"], #{method => <<"GET">>, headers => [], timeout => 30, verbose => false, insecure => false}))
     ].
+
+%% A close while waiting for the response must end the wait right away
+%% instead of running out the timeout.
+receive_response_closed_test() ->
+    Conn = self(),
+    self() ! {h2, Conn, {closed, {shutdown, tcp_closed}}},
+    {Elapsed, Code} = timer:tc(fun() ->
+        receive_response_loop(Conn, 1, #{timeout => 2}, false, <<>>, undefined)
+    end),
+    ?assertEqual(1, Code),
+    ?assert(Elapsed < 1000000).
 
 -endif.
