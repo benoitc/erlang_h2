@@ -1116,7 +1116,15 @@ handle_settings(Settings, #state{mode = Mode, peer_settings = OldSettings} = Sta
                                         true -> connected;
                                         false -> settings
                                     end,
-                                    {ok, NewStateName, State1};
+                                    %% RFC 9113 §6.9.2: a larger initial window
+                                    %% can unblock data already buffered on
+                                    %% open streams, and no WINDOW_UPDATE will
+                                    %% come to drain it.
+                                    State2 = case window_grew(OldSettings, MergedSettings) of
+                                        true -> flush_send_buffers(State1);
+                                        false -> State1
+                                    end,
+                                    {ok, NewStateName, State2};
                                 {error, Reason} ->
                                     {stop, {shutdown, {send_failed, Reason}}, State1}
                             end;
@@ -1133,6 +1141,10 @@ handle_settings(Settings, #state{mode = Mode, peer_settings = OldSettings} = Sta
         {error, _Reason} ->
             {error, protocol_error, State}
     end.
+
+window_grew(OldSettings, NewSettings) ->
+    h2_settings:get(initial_window_size, NewSettings) >
+        h2_settings:get(initial_window_size, OldSettings).
 
 encode_settings_list(Settings) ->
     lists:foldl(fun({Id, Value}, Acc) ->

@@ -116,6 +116,7 @@
     window_update_on_idle_stream_triggers_goaway_test/1,
     goaway_closes_tcp_socket_test/1,
     iws_exceeds_max_triggers_flow_control_error_test/1,
+    iws_increase_flushes_buffered_data_test/1,
     priority_self_dependency_is_stream_error_test/1,
     headers_priority_self_dependency_is_stream_error_test/1,
     send_request_without_host_omits_authority_test/1,
@@ -264,6 +265,7 @@ groups() ->
             window_update_on_idle_stream_triggers_goaway_test,
             goaway_closes_tcp_socket_test,
             iws_exceeds_max_triggers_flow_control_error_test,
+            iws_increase_flushes_buffered_data_test,
             priority_self_dependency_is_stream_error_test,
             headers_priority_self_dependency_is_stream_error_test,
             send_request_without_host_omits_authority_test,
@@ -2974,6 +2976,45 @@ iws_exceeds_max_triggers_flow_control_error_test(Config) ->
         timeout         -> ct:fail(no_goaway)
     end,
     ssl:close(Sock),
+    ok.
+
+%% RFC 9113 §6.9.2: raising SETTINGS_INITIAL_WINDOW_SIZE must release data
+%% the server already buffered against a zero window. Mirrors h2spec 6.9.2/1,
+%% with the body forced into the buffer before the window opens.
+iws_increase_flushes_buffered_data_test(Config) ->
+    case ?config(server_ref, Config) of
+        undefined -> ok;
+        OldRef    -> h2:stop_server(OldRef)
+    end,
+    Parent = self(),
+    Handler = fun(Conn, Sid, _, _, _) ->
+        ok = h2:send_response(Conn, Sid, 200, []),
+        ok = h2:send_data(Conn, Sid, <<"hello">>, true),
+        Parent ! body_buffered
+    end,
+    {ok, Ref} = h2:start_server(0, #{
+        cert    => ?config(cert_file, Config),
+        key     => ?config(key_file, Config),
+        handler => Handler
+    }),
+    {ok, Sock} = raw_h2_client(h2:server_port(Ref)),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:settings([{initial_window_size, 0}]))),
+    Headers = [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/">>},
+        {<<":authority">>, <<"localhost">>}
+    ],
+    {Block, _} = h2_hpack:encode(Headers, h2_hpack:new_context()),
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:headers(1, Block, true))),
+    receive body_buffered -> ok
+    after 3000 -> ct:fail(handler_did_not_send)
+    end,
+    ok = ssl:send(Sock, h2_frame:encode(h2_frame:settings([{initial_window_size, 5}]))),
+    ?assertEqual(ok, drain_until_end_stream(Sock, 1, 3000)),
+    ssl:close(Sock),
+    h2:stop_server(Ref),
+    drain_exits(),
     ok.
 
 %% RFC 9113 §5.3.1: a stream cannot depend on itself — stream PROTOCOL_ERROR.

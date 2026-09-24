@@ -2,6 +2,16 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- A SETTINGS frame that raises `SETTINGS_INITIAL_WINDOW_SIZE` now sends the
+  DATA already buffered on open streams (RFC 9113 §6.9.2). The larger window
+  was applied, but nothing drained the buffers, so a response body queued
+  against a zero window stalled until an unrelated WINDOW_UPDATE arrived. Since
+  0.12.0 this showed up as an intermittent h2spec 6.9.2/1 failure.
+
 ## [0.12.2] - 2026-09-24
 
 ### Fixed
