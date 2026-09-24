@@ -82,8 +82,11 @@ init_per_testcase(TestCase, Config) ->
     end.
 
 %% TLS variants use the cert/key; h2c variants use TCP (`transport => tcp`).
-%% Strict/small-window variant advertises a tiny peer window + frame size
-%% to force fragmentation and flow-control exercise.
+%% Strict/small-window variant advertises a reduced peer window + frame size
+%% to force fragmentation and flow-control exercise. The window must not drop
+%% below max_frame_size: h2spec 4.2/1 sends one max-size DATA frame, and a
+%% smaller window makes that a flow-control violation we rightly reset, which
+%% then races the handler's response.
 server_opts(TC, Handler, Config) ->
     Base = #{handler => Handler,
              settings => #{max_concurrent_streams => 100}},
@@ -94,7 +97,7 @@ server_opts(TC, Handler, Config) ->
         h2spec_h2c_hpack_test   -> Base#{transport => tcp};
         h2spec_small_window_test ->
             Tls#{settings => #{max_concurrent_streams => 100,
-                               initial_window_size    => 1024,
+                               initial_window_size    => 16384,
                                max_frame_size         => 16384}};
         h2spec_strict_test -> Tls;
         _                  -> Tls
