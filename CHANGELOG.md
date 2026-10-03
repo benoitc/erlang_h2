@@ -2,6 +2,17 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- `h2:cancel/2,3` works again after a GOAWAY has been sent or received. The
+  `goaway_sent` and `goaway_received` states only accepted `send_data`,
+  `send_data_blocking` and `consume`, so a RST_STREAM request got
+  `{error, unknown_request}`. RFC 9113 §6.8 keeps existing streams alive after
+  a GOAWAY, and a client needs the reset to drop the streams a peer GOAWAY
+  refused.
+
 ## [0.12.3] - 2026-09-24
 
 ### Fixed

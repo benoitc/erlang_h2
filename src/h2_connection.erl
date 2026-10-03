@@ -759,6 +759,11 @@ goaway_sent({call, From}, {send_data_blocking, StreamId, Data, EndStream, Timeou
 goaway_sent({call, From}, {consume, StreamId, ByteCount}, State) ->
     handle_consume(From, StreamId, ByteCount, State);
 
+goaway_sent({call, From}, {cancel_stream, StreamId, ErrorCode}, State) ->
+    %% Existing streams stay valid after GOAWAY (RFC 9113 6.8), so they can
+    %% still be reset.
+    handle_cancel_stream(From, StreamId, ErrorCode, State);
+
 goaway_sent({call, From}, {send_request, _, _, _, _}, State) ->
     {keep_state, State, [{reply, From, {error, goaway_sent}}]};
 goaway_sent({call, From}, {send_request_headers, _, _, _}, State) ->
@@ -796,6 +801,11 @@ goaway_received({call, From}, {send_data_blocking, StreamId, Data, EndStream, Ti
 
 goaway_received({call, From}, {consume, StreamId, ByteCount}, State) ->
     handle_consume(From, StreamId, ByteCount, State);
+
+goaway_received({call, From}, {cancel_stream, StreamId, ErrorCode}, State) ->
+    %% Existing streams stay valid after GOAWAY (RFC 9113 6.8), and a stream
+    %% the peer refused (id above last_stream_id) needs a reset to be dropped.
+    handle_cancel_stream(From, StreamId, ErrorCode, State);
 
 goaway_received({call, From}, Request, State) ->
     handle_call_common(From, Request, goaway_received, State);
