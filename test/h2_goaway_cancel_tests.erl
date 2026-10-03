@@ -1,7 +1,7 @@
-%% @doc RST_STREAM stays valid after a GOAWAY in either direction (RFC 9113
-%% 6.8): existing streams keep running, and a client needs the reset to drop
-%% the streams a peer GOAWAY refused. A raw gen_tcp h2c server built on
-%% h2_frame reports every RST_STREAM it receives to the test process.
+%% @doc Existing streams stay valid after a GOAWAY in either direction (RFC
+%% 9113 6.8): they can be reset and finished with trailers, while new streams
+%% are refused. A raw gen_tcp h2c server built on h2_frame reports every
+%% RST_STREAM and HEADERS frame it receives to the test process.
 -module(h2_goaway_cancel_tests).
 
 -ifdef(TEST).
@@ -17,45 +17,98 @@ goaway_cancel_test_() ->
      [{"cancel a stream refused by a received GOAWAY",
        {timeout, 30, fun refused_stream_cancel/0}},
       {"cancel an open stream after sending our own GOAWAY",
-       {timeout, 30, fun cancel_after_own_goaway/0}}]}.
+       {timeout, 30, fun cancel_after_own_goaway/0}},
+      {"a new request after a received GOAWAY is refused",
+       {timeout, 30, fun request_after_received_goaway/0}},
+      {"send trailers on an open stream after a received GOAWAY",
+       {timeout, 30, fun trailers_after_received_goaway/0}},
+      {"send trailers on an open stream after sending our own GOAWAY",
+       {timeout, 30, fun trailers_after_own_goaway/0}}]}.
 
-%% Note: today this case also passes without the goaway_received clause.
-%% process_frames/2 ends every read with determine_state_transition/1, which
-%% puts a client back in `connected' whenever its settings are acked, so the
-%% goaway_received state name chosen by the GOAWAY handler never sticks. The
-%% case still pins the observable contract: cancel/2 returns ok and the peer
-%% sees RST_STREAM for the refused stream.
 refused_stream_cancel() ->
-    process_flag(trap_exit, true),
+    start_case(),
     {Port, Server} = start_server(goaway, self()),
     {ok, Conn} = h2:connect("127.0.0.1", Port, #{transport => tcp}),
     ok = h2:wait_connected(Conn),
     {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/">>, headers(Port)),
-    receive
-        {h2, Conn, {goaway, 0, no_error}} -> ok
-    after 5000 ->
-        error(no_goaway)
-    end,
+    wait_goaway(Conn),
     ?assertEqual(ok, h2:cancel(Conn, StreamId)),
-    ?assertEqual({rst_stream, StreamId, ?CANCEL}, wait_rst_stream()),
+    ?assertEqual(?CANCEL, wait_rst_stream(StreamId)),
     cleanup(Conn, Server).
 
 cancel_after_own_goaway() ->
-    process_flag(trap_exit, true),
+    start_case(),
     {Port, Server} = start_server(plain, self()),
     {ok, Conn} = h2:connect("127.0.0.1", Port, #{transport => tcp}),
     ok = h2:wait_connected(Conn),
     {ok, StreamId} = h2:request(Conn, <<"GET">>, <<"/">>, headers(Port)),
     ok = h2:goaway(Conn),
     ?assertEqual(ok, h2:cancel(Conn, StreamId)),
-    ?assertEqual({rst_stream, StreamId, ?CANCEL}, wait_rst_stream()),
+    ?assertEqual(?CANCEL, wait_rst_stream(StreamId)),
     cleanup(Conn, Server).
 
-wait_rst_stream() ->
+request_after_received_goaway() ->
+    start_case(),
+    {Port, Server} = start_server(goaway, self()),
+    {ok, Conn} = h2:connect("127.0.0.1", Port, #{transport => tcp}),
+    ok = h2:wait_connected(Conn),
+    {ok, _StreamId} = h2:request(Conn, <<"GET">>, <<"/">>, headers(Port)),
+    wait_goaway(Conn),
+    ?assertEqual({error, goaway_received},
+                 h2:request(Conn, <<"GET">>, <<"/">>, headers(Port))),
+    ?assertEqual({error, goaway_received},
+                 h2:request(Conn, pseudo_headers(Port), #{end_stream => false})),
+    cleanup(Conn, Server).
+
+trailers_after_received_goaway() ->
+    start_case(),
+    {Port, Server} = start_server(goaway, self()),
+    {ok, Conn} = h2:connect("127.0.0.1", Port, #{transport => tcp}),
+    ok = h2:wait_connected(Conn),
+    {ok, StreamId} = h2:request(Conn, pseudo_headers(Port), #{end_stream => false}),
+    false = wait_headers(StreamId),
+    wait_goaway(Conn),
+    ?assertEqual(ok, h2:send_trailers(Conn, StreamId, [{<<"grpc-status">>, <<"0">>}])),
+    ?assertEqual(true, wait_headers(StreamId)),
+    cleanup(Conn, Server).
+
+trailers_after_own_goaway() ->
+    start_case(),
+    {Port, Server} = start_server(plain, self()),
+    {ok, Conn} = h2:connect("127.0.0.1", Port, #{transport => tcp}),
+    ok = h2:wait_connected(Conn),
+    {ok, StreamId} = h2:request(Conn, pseudo_headers(Port), #{end_stream => false}),
+    false = wait_headers(StreamId),
+    ok = h2:goaway(Conn),
+    ?assertEqual(ok, h2:send_trailers(Conn, StreamId, [{<<"grpc-status">>, <<"0">>}])),
+    ?assertEqual(true, wait_headers(StreamId)),
+    cleanup(Conn, Server).
+
+%% Cases in one fixture run in the same process, so a failed case must not
+%% leave frames or EXIT messages behind for the next one.
+start_case() ->
+    process_flag(trap_exit, true),
+    flush().
+
+wait_goaway(Conn) ->
     receive
-        {rst_stream, _, _} = Rst -> Rst
+        {h2, Conn, {goaway, 0, no_error}} -> ok
+    after 5000 ->
+        error(no_goaway)
+    end.
+
+wait_rst_stream(StreamId) ->
+    receive
+        {rst_stream, StreamId, Code} -> Code
     after 5000 ->
         error(no_rst_stream)
+    end.
+
+wait_headers(StreamId) ->
+    receive
+        {headers, StreamId, EndStream} -> EndStream
+    after 5000 ->
+        error(no_headers)
     end.
 
 cleanup(Conn, Server) ->
@@ -67,8 +120,17 @@ cleanup(Conn, Server) ->
 flush() ->
     receive _ -> flush() after 0 -> ok end.
 
+authority(Port) ->
+    iolist_to_binary([<<"127.0.0.1:">>, integer_to_binary(Port)]).
+
 headers(Port) ->
-    [{<<"host">>, iolist_to_binary([<<"127.0.0.1:">>, integer_to_binary(Port)])}].
+    [{<<"host">>, authority(Port)}].
+
+pseudo_headers(Port) ->
+    [{<<":method">>,    <<"POST">>},
+     {<<":path">>,      <<"/">>},
+     {<<":scheme">>,    <<"http">>},
+     {<<":authority">>, authority(Port)}].
 
 %% ---------------------------------------------------------------------------
 %% Raw h2c server. Mode `goaway' answers the first HEADERS with
@@ -119,9 +181,15 @@ loop(Sock, Buf, Mode, TestPid) ->
 handle_frame(Sock, {settings, _}, Mode, _TestPid) ->
     ok = gen_tcp:send(Sock, h2_frame:encode(h2_frame:settings_ack())),
     Mode;
-handle_frame(Sock, Frame, goaway, _TestPid) when element(1, Frame) =:= headers ->
-    ok = gen_tcp:send(Sock, h2_frame:encode(h2_frame:goaway(0, no_error, <<>>))),
-    plain;
+handle_frame(Sock, Frame, Mode, TestPid) when element(1, Frame) =:= headers ->
+    TestPid ! {headers, element(2, Frame), element(4, Frame)},
+    case Mode of
+        goaway ->
+            ok = gen_tcp:send(Sock, h2_frame:encode(h2_frame:goaway(0, no_error, <<>>))),
+            plain;
+        plain ->
+            plain
+    end;
 handle_frame(_Sock, {rst_stream, StreamId, Code}, Mode, TestPid) ->
     TestPid ! {rst_stream, StreamId, Code},
     Mode;

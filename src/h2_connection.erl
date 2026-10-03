@@ -606,35 +606,11 @@ settings({call, From}, activate, State) ->
 %% just because the SETTINGS-ACK has not arrived yet. Handle the response-side
 %% calls here exactly as `connected` does (the connection stays in `settings`
 %% until the ACK arrives, then transitions normally).
-settings({call, From}, {send_response, StreamId, Status, Headers}, State) ->
-    handle_send_response(From, StreamId, Status, Headers, State);
-
-settings({call, From}, {respond, StreamId, Status, Headers, Body}, State) ->
-    handle_respond(From, StreamId, Status, Headers, Body, State);
-
-settings({call, From}, {send_data, StreamId, Data, EndStream}, State) ->
-    handle_send_data(From, StreamId, Data, EndStream, State);
-
-settings({call, From}, {send_data_blocking, StreamId, Data, EndStream, Timeout}, State) ->
-    handle_send_data_blocking(From, StreamId, Data, EndStream, Timeout, State);
-
-settings({call, From}, {consume, StreamId, ByteCount}, State) ->
-    handle_consume(From, StreamId, ByteCount, State);
-
-settings({call, From}, {send_trailers, StreamId, Trailers}, State) ->
-    handle_send_trailers(From, StreamId, Trailers, State);
-
-settings({call, From}, {cancel_stream, StreamId, ErrorCode}, State) ->
-    handle_cancel_stream(From, StreamId, ErrorCode, State);
-
-settings({call, From}, {set_stream_handler, StreamId, Pid, Opts}, State) ->
-    handle_set_stream_handler(From, StreamId, Pid, Opts, State);
-
-settings({call, From}, {unset_stream_handler, StreamId}, State) ->
-    handle_unset_stream_handler(From, StreamId, State);
-
 settings({call, From}, Request, State) ->
-    handle_call_early(From, Request, settings, State);
+    case handle_stream_call(From, Request, State) of
+        false  -> handle_call_early(From, Request, settings, State);
+        Result -> Result
+    end;
 
 settings(EventType, Event, State) ->
     handle_common(EventType, Event, settings, State).
@@ -674,33 +650,6 @@ connected({call, From}, {send_request, Method, Path, Headers, EndStream}, State)
 connected({call, From}, {send_request_headers, Headers, EndStream, Opts}, State) ->
     handle_send_request_headers(From, Headers, EndStream, Opts, State);
 
-connected({call, From}, {send_data_blocking, StreamId, Data, EndStream, Timeout}, State) ->
-    handle_send_data_blocking(From, StreamId, Data, EndStream, Timeout, State);
-
-connected({call, From}, {consume, StreamId, ByteCount}, State) ->
-    handle_consume(From, StreamId, ByteCount, State);
-
-connected({call, From}, {send_response, StreamId, Status, Headers}, State) ->
-    handle_send_response(From, StreamId, Status, Headers, State);
-
-connected({call, From}, {respond, StreamId, Status, Headers, Body}, State) ->
-    handle_respond(From, StreamId, Status, Headers, Body, State);
-
-connected({call, From}, {send_data, StreamId, Data, EndStream}, State) ->
-    handle_send_data(From, StreamId, Data, EndStream, State);
-
-connected({call, From}, {send_trailers, StreamId, Trailers}, State) ->
-    handle_send_trailers(From, StreamId, Trailers, State);
-
-connected({call, From}, {cancel_stream, StreamId, ErrorCode}, State) ->
-    handle_cancel_stream(From, StreamId, ErrorCode, State);
-
-connected({call, From}, {set_stream_handler, StreamId, Pid, Opts}, State) ->
-    handle_set_stream_handler(From, StreamId, Pid, Opts, State);
-
-connected({call, From}, {unset_stream_handler, StreamId}, State) ->
-    handle_unset_stream_handler(From, StreamId, State);
-
 connected({call, From}, {send_goaway, ErrorCode}, State) ->
     handle_send_goaway(From, ErrorCode, connected, State);
 
@@ -709,7 +658,10 @@ connected({call, From}, wait_connected, State) ->
     {keep_state, State, [{reply, From, ok}]};
 
 connected({call, From}, Request, State) ->
-    handle_call_common(From, Request, connected, State);
+    case handle_stream_call(From, Request, State) of
+        false  -> handle_call_common(From, Request, connected, State);
+        Result -> Result
+    end;
 
 connected(EventType, Event, State) ->
     %% Routes cast {flush_stream, _} (send_data continuation) through
@@ -749,28 +701,21 @@ goaway_sent(info, {timeout, Timer, goaway_drain},
 goaway_sent(info, {timeout, Timer, close_timeout}, #state{close_timer = Timer} = State) ->
     {stop, {shutdown, close_timeout}, State};
 
-goaway_sent({call, From}, {send_data, StreamId, Data, EndStream}, State) ->
-    %% Allow completing existing streams
-    handle_send_data(From, StreamId, Data, EndStream, State);
-
-goaway_sent({call, From}, {send_data_blocking, StreamId, Data, EndStream, Timeout}, State) ->
-    handle_send_data_blocking(From, StreamId, Data, EndStream, Timeout, State);
-
-goaway_sent({call, From}, {consume, StreamId, ByteCount}, State) ->
-    handle_consume(From, StreamId, ByteCount, State);
-
-goaway_sent({call, From}, {cancel_stream, StreamId, ErrorCode}, State) ->
-    %% Existing streams stay valid after GOAWAY (RFC 9113 6.8), so they can
-    %% still be reset.
-    handle_cancel_stream(From, StreamId, ErrorCode, State);
-
 goaway_sent({call, From}, {send_request, _, _, _, _}, State) ->
     {keep_state, State, [{reply, From, {error, goaway_sent}}]};
 goaway_sent({call, From}, {send_request_headers, _, _, _}, State) ->
     {keep_state, State, [{reply, From, {error, goaway_sent}}]};
 
+goaway_sent({call, From}, wait_connected, State) ->
+    {keep_state, State, [{reply, From, ok}]};
+
 goaway_sent({call, From}, Request, State) ->
-    handle_call_common(From, Request, goaway_sent, State);
+    %% Existing streams stay valid after a GOAWAY (RFC 9113 6.8): every
+    %% per-stream operation keeps working, only new streams are refused.
+    case handle_stream_call(From, Request, State) of
+        false  -> handle_call_common(From, Request, goaway_sent, State);
+        Result -> Result
+    end;
 
 goaway_sent(EventType, Event, State) ->
     handle_common(EventType, Event, goaway_sent, State).
@@ -792,23 +737,25 @@ goaway_received(info, {tcp_closed, Socket}, #state{socket = Socket} = State) ->
 goaway_received(info, {ssl_closed, Socket}, #state{socket = Socket} = State) ->
     {stop, {shutdown, ssl_closed}, State};
 
-goaway_received({call, From}, {send_data, StreamId, Data, EndStream}, State) ->
-    %% Allow completing existing streams
-    handle_send_data(From, StreamId, Data, EndStream, State);
+goaway_received({call, From}, {send_request, _, _, _, _}, State) ->
+    {keep_state, State, [{reply, From, {error, goaway_received}}]};
+goaway_received({call, From}, {send_request_headers, _, _, _}, State) ->
+    {keep_state, State, [{reply, From, {error, goaway_received}}]};
 
-goaway_received({call, From}, {send_data_blocking, StreamId, Data, EndStream, Timeout}, State) ->
-    handle_send_data_blocking(From, StreamId, Data, EndStream, Timeout, State);
+goaway_received({call, From}, {send_goaway, ErrorCode}, State) ->
+    handle_send_goaway(From, ErrorCode, goaway_received, State);
 
-goaway_received({call, From}, {consume, StreamId, ByteCount}, State) ->
-    handle_consume(From, StreamId, ByteCount, State);
-
-goaway_received({call, From}, {cancel_stream, StreamId, ErrorCode}, State) ->
-    %% Existing streams stay valid after GOAWAY (RFC 9113 6.8), and a stream
-    %% the peer refused (id above last_stream_id) needs a reset to be dropped.
-    handle_cancel_stream(From, StreamId, ErrorCode, State);
+goaway_received({call, From}, wait_connected, State) ->
+    {keep_state, State, [{reply, From, ok}]};
 
 goaway_received({call, From}, Request, State) ->
-    handle_call_common(From, Request, goaway_received, State);
+    %% Existing streams stay valid after a GOAWAY (RFC 9113 6.8): every
+    %% per-stream operation keeps working, and a stream the peer refused
+    %% (id above last_stream_id) needs cancel_stream to be dropped.
+    case handle_stream_call(From, Request, State) of
+        false  -> handle_call_common(From, Request, goaway_received, State);
+        Result -> Result
+    end;
 
 goaway_received(EventType, Event, State) ->
     handle_common(EventType, Event, goaway_received, State).
@@ -899,7 +846,7 @@ process_frames(StateName, #state{buffer = Buffer, local_settings = Local} = Stat
         {ok, Frame, Rest} ->
             case handle_frame(StateName, Frame, State#state{buffer = Rest}) of
                 {ok, NewStateName, NewState} ->
-                    process_frames(NewStateName, NewState);
+                    process_frames(next_frame_state(StateName, NewStateName), NewState);
                 {stop, Reason, NewState} ->
                     {stop, Reason, NewState};
                 {error, ErrorCode, NewState} ->
@@ -910,7 +857,7 @@ process_frames(StateName, #state{buffer = Buffer, local_settings = Local} = Stat
             case set_active(State#state.transport, State#state.socket) of
                 ok ->
                     %% Determine the correct state based on connection conditions
-                    determine_state_transition(State);
+                    determine_state_transition(StateName, State);
                 {error, Reason} ->
                     {stop, {shutdown, {socket_error, Reason}}, State}
             end;
@@ -925,9 +872,20 @@ process_frames(StateName, #state{buffer = Buffer, local_settings = Local} = Stat
             {next_state, closing, State1}
     end.
 
+%% Most frame handlers report `connected' whatever state they ran in. Once a
+%% GOAWAY has been sent or received the connection must stay in that state,
+%% so a frame handled there cannot move it back to `connected'.
+next_frame_state(goaway_sent, _NewStateName) -> goaway_sent;
+next_frame_state(goaway_received, _NewStateName) -> goaway_received;
+next_frame_state(_StateName, NewStateName) -> NewStateName.
+
 %% Determine the correct state based on connection conditions
-determine_state_transition(#state{mode = Mode, preface_received = PrefaceReceived,
-                                   settings_acked = SettingsAcked} = State) ->
+determine_state_transition(goaway_sent, State) ->
+    {next_state, goaway_sent, State};
+determine_state_transition(goaway_received, State) ->
+    {next_state, goaway_received, State};
+determine_state_transition(_StateName, #state{mode = Mode, preface_received = PrefaceReceived,
+                                               settings_acked = SettingsAcked} = State) ->
     %% For client: connected when we've received and acked peer's settings,
     %% and received ack for our settings
     %% For server: connected when preface received, settings exchanged
@@ -3007,6 +2965,31 @@ handle_call_early(From, Request, StateName, #state{waiters = Waiters} = State) -
         _ ->
             {keep_state, State, [{reply, From, {error, {not_ready, StateName}}}]}
     end.
+
+%% Per-stream calls that are valid in every state where streams exist:
+%% `settings' (a server may answer before the SETTINGS ack), `connected',
+%% and both goaway states (RFC 9113 6.8 keeps existing streams alive after
+%% a GOAWAY). Returns `false' for anything else.
+handle_stream_call(From, {send_data, StreamId, Data, EndStream}, State) ->
+    handle_send_data(From, StreamId, Data, EndStream, State);
+handle_stream_call(From, {send_data_blocking, StreamId, Data, EndStream, Timeout}, State) ->
+    handle_send_data_blocking(From, StreamId, Data, EndStream, Timeout, State);
+handle_stream_call(From, {consume, StreamId, ByteCount}, State) ->
+    handle_consume(From, StreamId, ByteCount, State);
+handle_stream_call(From, {send_response, StreamId, Status, Headers}, State) ->
+    handle_send_response(From, StreamId, Status, Headers, State);
+handle_stream_call(From, {respond, StreamId, Status, Headers, Body}, State) ->
+    handle_respond(From, StreamId, Status, Headers, Body, State);
+handle_stream_call(From, {send_trailers, StreamId, Trailers}, State) ->
+    handle_send_trailers(From, StreamId, Trailers, State);
+handle_stream_call(From, {cancel_stream, StreamId, ErrorCode}, State) ->
+    handle_cancel_stream(From, StreamId, ErrorCode, State);
+handle_stream_call(From, {set_stream_handler, StreamId, Pid, Opts}, State) ->
+    handle_set_stream_handler(From, StreamId, Pid, Opts, State);
+handle_stream_call(From, {unset_stream_handler, StreamId}, State) ->
+    handle_unset_stream_handler(From, StreamId, State);
+handle_stream_call(_From, _Request, _State) ->
+    false.
 
 handle_call_common(From, Request, _StateName, State) ->
     case Request of

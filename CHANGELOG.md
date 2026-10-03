@@ -6,12 +6,21 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ### Fixed
 
-- `h2:cancel/2,3` works again after a GOAWAY has been sent or received. The
-  `goaway_sent` and `goaway_received` states only accepted `send_data`,
-  `send_data_blocking` and `consume`, so a RST_STREAM request got
-  `{error, unknown_request}`. RFC 9113 §6.8 keeps existing streams alive after
-  a GOAWAY, and a client needs the reset to drop the streams a peer GOAWAY
-  refused.
+- Existing streams keep working after a GOAWAY has been sent or received
+  (RFC 9113 §6.8). The `goaway_sent` and `goaway_received` states only
+  accepted `send_data`, `send_data_blocking` and `consume`, so
+  `h2:cancel/2,3`, `h2:send_trailers/3`, `h2:send_response/4`, `h2:respond/5`
+  and the stream handler calls got `{error, unknown_request}`. A client needs
+  the reset to drop the streams a peer GOAWAY refused, and a gRPC stream
+  needs trailers to finish. The per-stream calls now share one dispatcher
+  across `settings`, `connected` and both goaway states.
+- A received GOAWAY now keeps the client in `goaway_received`. The frame loop
+  recomputed the state after every read and put a client whose settings were
+  acked back in `connected`, so the GOAWAY state never stuck and new requests
+  were still sent on a connection the peer was closing. `h2:request` now
+  returns `{error, goaway_received}` there, and `h2:goaway/1,2` is accepted
+  to answer the peer. The same recomputation could move a connection out of
+  `goaway_sent` when a frame arrived during the drain window.
 
 ## [0.12.3] - 2026-09-24
 
