@@ -113,6 +113,9 @@
     cacerts => [binary()],
     verify => verify_none | verify_peer,
     settings => h2_settings:settings(),
+    %% Connection-level receive window shared by all streams. Raise it with
+    %% settings.initial_window_size for large downloads. Default 65535.
+    connection_window_size => 65535..2147483647,
     timeout => timeout(),
     connect_timeout => timeout(),
     sync => boolean()
@@ -134,6 +137,8 @@
     inet6 => boolean(),
     handler := fun((connection(), stream_id(), binary(), binary(), headers()) -> any()),
     settings => h2_settings:settings(),
+    %% Connection-level receive window shared by all streams. Default 65535.
+    connection_window_size => 65535..2147483647,
     acceptors => pos_integer(),
     %% RFC 8441: when true, advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1 and
     %% accept Extended CONNECT requests carrying the `:protocol` pseudo-header.
@@ -220,7 +225,7 @@ connect_tcp(Host, Port, Opts, Timeout) ->
     end.
 
 start_connection(Mode, Socket, Opts) ->
-    ConnOpts = maps:with([settings], Opts),
+    ConnOpts = maps:with([settings, connection_window_size], Opts),
     Timeout = maps:get(timeout, Opts, ?DEFAULT_TIMEOUT_MS),
     case h2_connection:start_link(Mode, Socket, ConnOpts) of
         {ok, Pid} ->
@@ -667,8 +672,9 @@ accept_handshake(Socket, Handler, ConnOpts) ->
 %% truth for both the built-in acceptor path and serve_socket/2, so the two
 %% cannot drift.
 conn_opts(Opts) ->
-    #{settings => maps:get(settings, Opts, #{}),
-      enable_connect_protocol => maps:get(enable_connect_protocol, Opts, false)}.
+    maps:merge(maps:with([connection_window_size], Opts),
+               #{settings => maps:get(settings, Opts, #{}),
+                 enable_connect_protocol => maps:get(enable_connect_protocol, Opts, false)}).
 
 handle_server_connection(Socket, Handler, ConnOpts, Transport) ->
     TransferFn = case Transport of
