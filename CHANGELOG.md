@@ -6,14 +6,17 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ### Added
 
-- `connection_window_size` option for `h2:connect/3`, `h2:start_server/2,3`,
-  `h2:serve_socket/2` and `h2_connection:start_link/3,4`. The connection
-  receive window was fixed at 65,535 bytes, so all streams shared 64 KB in
-  flight whatever `initial_window_size` was, and large downloads over
-  high-latency links ran at 64 KB per round trip. The window is granted with
-  one stream-0 `WINDOW_UPDATE` right after our SETTINGS and refilled to that
-  size. Range 65535..2147483647, default 65535 (no change); an invalid value
-  returns `{error, {invalid_option, {connection_window_size, V}}}`.
+- New `connection_window_size` option for clients and servers. h2 kept the
+  connection-wide flow-control window at 64 KB, so large downloads over slow
+  links were capped at 64 KB per round trip, whatever `initial_window_size`
+  was. You can now raise it:
+
+  ```erlang
+  h2:connect(Host, 443, #{settings => #{initial_window_size => 8 * 1024 * 1024},
+                          connection_window_size => 32 * 1024 * 1024}).
+  ```
+
+  Default stays 64 KB, so nothing changes unless you set it.
 
 ## [0.12.4] - 2026-10-03
 
