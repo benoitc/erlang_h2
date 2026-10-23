@@ -9,14 +9,9 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 - New `connection_window_size` option for clients and servers. h2 kept the
   connection-wide flow-control window at 64 KB, so large downloads over slow
   links were capped at 64 KB per round trip, whatever `initial_window_size`
-  was. You can now raise it:
-
-  ```erlang
-  h2:connect(Host, 443, #{settings => #{initial_window_size => 8 * 1024 * 1024},
-                          connection_window_size => 32 * 1024 * 1024}).
-  ```
-
-  Default stays 64 KB, so nothing changes unless you set it.
+  was. Set `connection_window_size` together with a larger
+  `initial_window_size` to raise it. Default stays 64 KB, so nothing changes
+  unless you set it.
 
 ## [0.12.4] - 2026-10-03
 
