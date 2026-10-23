@@ -10,6 +10,7 @@
 - All frame types: `DATA`, `HEADERS`, `PRIORITY`, `RST_STREAM`, `SETTINGS`, `PING`, `GOAWAY`, `WINDOW_UPDATE`, `CONTINUATION`. `PUSH_PROMISE` is decoded but not generated (push disabled).
 - Stream state machine per §5.1 with correct transitions for `idle → open → half_closed_{local,remote} → closed`, including reserved states for reception of PUSH_PROMISE.
 - Flow control at both connection and stream level, including `SETTINGS_INITIAL_WINDOW_SIZE` retroactive adjustment with signed 32-bit overflow detection.
+- Configurable connection receive window: `connection_window_size` (client and server, 65535..2147483647, default 65535) is granted with one stream-0 `WINDOW_UPDATE` after our SETTINGS and is the refill target afterwards.
 - SETTINGS negotiation: synchronous ACK timing, `SETTINGS_TIMEOUT`, validation of each parameter's legal range.
 - Two-phase GOAWAY: graceful drain window before socket close.
 - CONTINUATION interleaving: only CONTINUATION frames on the same stream accepted between HEADERS and END_HEADERS; anything else is a `PROTOCOL_ERROR`.

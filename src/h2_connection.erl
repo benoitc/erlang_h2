@@ -193,6 +193,8 @@
     %% Flow control
     conn_window_size :: integer(),       % Our send window
     recv_conn_window_size :: integer(),  % Our receive window
+    %% Size the receive window is refilled to (connection_window_size option).
+    recv_conn_window_target = ?DEFAULT_INITIAL_WINDOW_SIZE :: pos_integer(),
 
     %% State tracking
     preface_received = false :: boolean(),
@@ -246,7 +248,14 @@ start_link(client, Socket, Opts) ->
 %% @doc Start a connection with explicit owner.
 -spec start_link(client | server, gen_tcp:socket() | ssl:sslsocket(), pid(), map()) -> {ok, pid()} | {error, term()}.
 start_link(Mode, Socket, Owner, Opts) ->
-    gen_statem:start_link(?MODULE, {Mode, Socket, Owner, Opts}, []).
+    %% Validated here rather than in init/1: a {stop, _} from init/1 would
+    %% log a crash report for what is a caller error.
+    case maps:get(connection_window_size, Opts, ?DEFAULT_INITIAL_WINDOW_SIZE) of
+        V when is_integer(V), V >= ?DEFAULT_INITIAL_WINDOW_SIZE, V =< ?MAX_WINDOW_SIZE ->
+            gen_statem:start_link(?MODULE, {Mode, Socket, Owner, Opts}, []);
+        V ->
+            {error, {invalid_option, {connection_window_size, V}}}
+    end.
 
 %% @doc Wait for the connection to reach connected state.
 -spec wait_connected(pid()) -> ok | {error, term()}.
@@ -474,8 +483,10 @@ init({Mode, Socket, Owner, Opts}) ->
     DecodeCtx = h2_hpack:new_context(h2_settings:get(header_table_size, LocalSettings)),
 
     %% RFC 9113 §6.9.2: SETTINGS_INITIAL_WINDOW_SIZE only affects stream
-    %% flow-control windows; the connection window is fixed at 65535 octets
-    %% and only changes via WINDOW_UPDATE frames.
+    %% flow-control windows; the connection window starts at 65535 octets
+    %% and only changes via WINDOW_UPDATE frames. A larger
+    %% connection_window_size is granted once the preface is out, see
+    %% grow_conn_window/1.
 
     State = #state{
         mode = Mode,
@@ -492,6 +503,8 @@ init({Mode, Socket, Owner, Opts}) ->
         next_stream_id = case Mode of client -> 1; server -> 2 end,
         conn_window_size = ?DEFAULT_INITIAL_WINDOW_SIZE,
         recv_conn_window_size = ?DEFAULT_INITIAL_WINDOW_SIZE,
+        recv_conn_window_target = maps:get(connection_window_size, Opts,
+                                           ?DEFAULT_INITIAL_WINDOW_SIZE),
         scheme = Scheme,
         enable_connect_protocol = EnableConnectProtocol
     },
@@ -555,10 +568,11 @@ preface({call, From}, activate, #state{mode = Mode, transport = Transport, socke
     %% Socket ownership has been transferred, now we can send and receive.
     case set_active(Transport, Socket) of
         ok ->
-            State1 = case Mode of
+            State0 = case Mode of
                 client -> send_preface(State);
                 server -> send_settings_frame(State)
             end,
+            State1 = grow_conn_window(State0),
             Timer = erlang:start_timer(?SETTINGS_TIMEOUT_MS, self(), settings_timeout),
             {keep_state, State1#state{settings_timer = Timer},
              [{reply, From, ok}]};
@@ -2135,10 +2149,11 @@ in_closed_stream_range(StreamId, #state{mode = Mode, last_peer_stream_id = LastP
 %% Connection-level WINDOW_UPDATE refill. Called for every DATA frame,
 %% including those on closed/unknown streams — per RFC 9113 §5.1 the
 %% connection window is consumed regardless of stream state. The refill
-%% target is the fixed connection window default (RFC 9113 §6.9.2), not
-%% SETTINGS_INITIAL_WINDOW_SIZE, which only adjusts stream windows.
-maybe_send_conn_window_update(_DataSize, #state{recv_conn_window_size = ConnWindow} = State) ->
-    Target = ?DEFAULT_INITIAL_WINDOW_SIZE,
+%% target is the connection_window_size option (65535 by default), not
+%% SETTINGS_INITIAL_WINDOW_SIZE, which only adjusts stream windows
+%% (RFC 9113 §6.9.2).
+maybe_send_conn_window_update(_DataSize, #state{recv_conn_window_size = ConnWindow,
+                                                recv_conn_window_target = Target} = State) ->
     Threshold = Target div 2,
     case ConnWindow < Threshold of
         true ->
@@ -3313,6 +3328,17 @@ send_preface(State) ->
     %% Send connection preface (tolerate peer-close mid-send)
     _ = sock_send(State, ?H2_PREFACE),
     send_settings_frame(State).
+
+%% The connection window can only grow through a stream-0 WINDOW_UPDATE
+%% (RFC 9113 §6.9.2), so a connection_window_size above the 65535 default is
+%% granted in one frame right after our SETTINGS.
+grow_conn_window(#state{recv_conn_window_size = Window,
+                        recv_conn_window_target = Target} = State) when Target > Window ->
+    %% Best-effort like send_settings_frame/1.
+    _ = send_frame(h2_frame:window_update(0, Target - Window), State),
+    State#state{recv_conn_window_size = Target};
+grow_conn_window(State) ->
+    State.
 
 send_settings_frame(#state{local_settings = Settings, pending_settings = Pending} = State) ->
     Frame = h2_frame:settings(settings_to_list(Settings)),

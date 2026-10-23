@@ -250,6 +250,15 @@ end.
 ok = h2:consume(Conn, Sid, N).
 ```
 
+**Receive windows for large downloads.** `settings.initial_window_size` only sizes each stream's window; every stream also shares one connection window, which stays at 65,535 bytes unless you set `connection_window_size` (65535..2147483647). With the default, a download moves at most 64 KB per round trip. Raise both for large bodies over high-latency links; the same option is accepted by `h2:start_server/2,3` and `h2:serve_socket/2`:
+
+```erlang
+{ok, Conn} = h2:connect(Host, 443, #{settings => #{initial_window_size => 8 * 1024 * 1024},
+                                     connection_window_size => 32 * 1024 * 1024}).
+```
+
+An invalid value makes `h2_connection:start_link/3,4` return `{error, {invalid_option, {connection_window_size, V}}}`.
+
 **Send backpressure.** `h2:send_data/4` buffers when the peer's window is shut and returns `{error, send_buffer_full}` once the per-stream cap is reached (non-blocking; back off and retry). For a blocking send, `h2:send_data/5` with `#{block => Timeout}` waits until the window accepts the data, returning `ok` or `{error, timeout}`:
 
 ```erlang
