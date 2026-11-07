@@ -2,6 +2,16 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Extension settings passed by number in the `settings` map, such as
+  WebTransport's `#{16#2b67 => 1}`, are now sent to the peer. They were
+  accepted but silently left out of the SETTINGS frame, so the other side
+  never saw them and a WebTransport client could not tell the server
+  supports it.
+
 ## [0.12.5] - 2026-10-23
 
 ### Added

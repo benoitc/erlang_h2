@@ -3348,13 +3348,17 @@ send_settings_frame(#state{local_settings = Settings, pending_settings = Pending
     _ = send_frame(Frame, State),
     State#state{pending_settings = Pending ++ [Settings]}.
 
+%% Extension settings kept under their raw 16-bit id go out unchanged, same
+%% rule as h2_settings:encode/1. Unknown atoms are skipped.
 settings_to_list(Settings) ->
-    maps:fold(fun(Key, Value, Acc) ->
-        case h2_settings:setting_id(Key) of
-            undefined -> Acc;
-            Id -> [{Id, h2_settings:encode_value(Value)} | Acc]
-        end
-    end, [], Settings).
+    maps:fold(fun(Key, Value, Acc) when is_integer(Key), Key >= 0, Key =< 16#ffff ->
+                      [{Key, h2_settings:encode_value(Value)} | Acc];
+                 (Key, Value, Acc) ->
+                      case h2_settings:setting_id(Key) of
+                          undefined -> Acc;
+                          Id -> [{Id, h2_settings:encode_value(Value)} | Acc]
+                      end
+              end, [], Settings).
 
 %% Returns ok | {error, Reason}. Callers must handle errors so that
 %% an in-flight gen_statem:call cannot reply ok to the user after the
@@ -3567,4 +3571,13 @@ extract_request_headers_test_() ->
      ?_assertEqual(<<"text/html">>, proplists:get_value(<<"accept">>, Other)),
      %% Defaults when :method/:path absent.
      ?_assertEqual({<<"GET">>, <<"/">>, []}, extract_request_headers([]))].
+
+%% Extension settings kept under a raw 16-bit id (e.g. SETTINGS_WT_ENABLED,
+%% 0x2b67) go on the wire; ids past 16 bits and unknown atoms do not.
+settings_to_list_test_() ->
+    L = settings_to_list(#{16#2b67 => 1, enable_push => 0,
+                           16#10000 => 1, not_a_setting => 1}),
+    [?_assert(lists:member({16#2b67, 1}, L)),
+     ?_assert(lists:member({?SETTINGS_ENABLE_PUSH, 0}, L)),
+     ?_assertEqual(2, length(L))].
 -endif.
