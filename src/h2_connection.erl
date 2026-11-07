@@ -53,6 +53,14 @@
 %% second; exceeding the limit triggers GOAWAY(ENHANCE_YOUR_CALM).
 -define(PING_FLOOD_LIMIT_PER_SEC, 20).
 -define(RST_FLOOD_LIMIT_PER_SEC, 100).
+%% MadeYouReset (CVE-2025-8671): a peer can keep breaking the protocol so that
+%% *we* reset the stream, which frees its MAX_CONCURRENT_STREAMS slot while the
+%% handler keeps running — bypassing the concurrency limit. The client-side RST
+%% flood counter above never sees these, since we send them. Cap the resets we
+%% emit for peer misbehaviour per second; past the cap the connection is a
+%% write-off and we send GOAWAY(ENHANCE_YOUR_CALM). A well-behaved peer never
+%% makes us reset a stream, so this is only ever reached under abuse.
+-define(SENT_RST_FLOOD_LIMIT_PER_SEC, 100).
 %% RFC 9113 §10.5 / §6.5.2: cap the raw bytes of a HEADERS+CONTINUATION
 %% block before HPACK decode, so a CONTINUATION flood cannot OOM the node
 %% before max_header_list_size (which acts on decoded headers) can fire.
@@ -233,7 +241,10 @@
     %% RFC 9113 §10.5 flood counters. `{BucketSec, Count}`; BucketSec is
     %% `erlang:monotonic_time(second)` for the current second.
     ping_flood = {0, 0} :: {integer(), non_neg_integer()},
-    rst_flood  = {0, 0} :: {integer(), non_neg_integer()}
+    rst_flood  = {0, 0} :: {integer(), non_neg_integer()},
+    %% {BucketSec, Count} of RST_STREAM frames we sent for peer protocol
+    %% errors this second. MadeYouReset (CVE-2025-8671) budget.
+    sent_rst_flood = {0, 0} :: {integer(), non_neg_integer()}
 }).
 
 %% ============================================================================
@@ -854,7 +865,20 @@ check_preface(Buffer) ->
             {error, invalid_preface}
     end.
 
-process_frames(StateName, #state{buffer = Buffer, local_settings = Local} = State) ->
+process_frames(StateName, State) ->
+    %% MadeYouReset (CVE-2025-8671): if the peer has driven us past the
+    %% per-second reset budget, the connection is abusive — drop it before
+    %% handling any further frame.
+    case over_sent_rst_budget(State) of
+        true ->
+            State1 = send_goaway_frame(State#state.last_peer_stream_id,
+                                       enhance_your_calm, State),
+            {next_state, closing, State1};
+        false ->
+            process_frames_1(StateName, State)
+    end.
+
+process_frames_1(StateName, #state{buffer = Buffer, local_settings = Local} = State) ->
     MaxFrameSize = h2_settings:get(max_frame_size, Local),
     case h2_frame:decode(Buffer, MaxFrameSize) of
         {ok, Frame, Rest} ->
@@ -878,8 +902,8 @@ process_frames(StateName, #state{buffer = Buffer, local_settings = Local} = Stat
         {error, {stream_error, StreamId, ErrorCode}, Rest} ->
             %% Frame-level decode error scoped to a single stream
             %% (e.g. WINDOW_UPDATE 0 on a non-zero stream id).
-            send_rst_stream(StreamId, ErrorCode, State),
-            State1 = close_stream(StreamId, rst, State),
+            State0 = sent_rst(StreamId, ErrorCode, State),
+            State1 = close_stream(StreamId, rst, State0),
             process_frames(StateName, State1#state{buffer = Rest});
         {error, Reason} ->
             State1 = send_goaway_frame(State#state.last_peer_stream_id, Reason, State),
@@ -1000,8 +1024,8 @@ handle_frame(_StateName, {window_update, StreamId, Increment}, #state{streams = 
             NewWindow = Window + Increment,
             if
                 NewWindow > ?MAX_WINDOW_SIZE ->
-                    send_rst_stream(StreamId, flow_control_error, State),
-                    State1 = close_stream(StreamId, rst, State),
+                    State0 = sent_rst(StreamId, flow_control_error, State),
+                    State1 = close_stream(StreamId, rst, State0),
                     {ok, connected, State1};
                 true ->
                     Stream1 = Stream#stream{window_size = NewWindow},
@@ -1059,8 +1083,7 @@ handle_frame(_StateName, {rst_stream, StreamId, ErrorCode},
 
 %% RFC 9113 §5.3.1: a stream cannot depend on itself — stream PROTOCOL_ERROR.
 handle_frame(_StateName, {priority, StreamId, _Exclusive, StreamId, _Weight}, State) ->
-    send_rst_stream(StreamId, protocol_error, State),
-    {ok, connected, State};
+    {ok, connected, sent_rst(StreamId, protocol_error, State)};
 handle_frame(_StateName, {priority, _StreamId, _Exclusive, _DependsOn, _Weight}, State) ->
     %% Priority is advisory, ignore
     {ok, connected, State};
@@ -1341,8 +1364,15 @@ handle_continuation(StreamId, HeaderBlock, EndHeaders,
 %% that references the missing entries fails with COMPRESSION_ERROR, taking
 %% the connection down. Answer the stream error, then decode the block
 %% (buffering any CONTINUATION frames) and drop the headers.
-reject_header_block(StreamId, ErrorCode, HeaderBlock, EndHeaders, State) ->
-    send_rst_stream(StreamId, ErrorCode, State),
+reject_header_block(StreamId, ErrorCode, HeaderBlock, EndHeaders, State0) ->
+    %% REFUSED_STREAM for exceeding MAX_CONCURRENT_STREAMS is pre-admission:
+    %% no backend work starts, so it is not a MadeYouReset vector and must not
+    %% count against the reset budget, or a bursty-but-legitimate client would
+    %% be dropped. Every other reset here is a peer protocol error and counts.
+    State = case ErrorCode of
+        refused_stream -> _ = send_rst_stream(StreamId, ErrorCode, State0), State0;
+        _              -> sent_rst(StreamId, ErrorCode, State0)
+    end,
     case EndHeaders of
         true ->
             decode_discarded_block(HeaderBlock, State);
@@ -1369,10 +1399,10 @@ decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_conte
             %% RFC 9113 §6.5.2: enforce our advertised MAX_HEADER_LIST_SIZE.
             case check_local_max_header_list_size(Headers, State1) of
                 {error, _} ->
-                    send_rst_stream(StreamId, protocol_error, State1),
-                    State2 = case maps:is_key(StreamId, State1#state.streams) of
-                        true -> close_stream(StreamId, rst, State1);
-                        false -> State1
+                    State1b = sent_rst(StreamId, protocol_error, State1),
+                    State2 = case maps:is_key(StreamId, State1b#state.streams) of
+                        true -> close_stream(StreamId, rst, State1b);
+                        false -> State1b
                     end,
                     {ok, connected, State2};
                 ok ->
@@ -1405,10 +1435,10 @@ decode_and_process_headers_validated(Mode, StreamId, Headers, EndStream, State1)
                 ok ->
                     decode_and_process_headers_cont(Kind, StreamId, Headers, EndStream, State1);
                 {error, ValidErr} ->
-                    send_rst_stream(StreamId, ValidErr, State1),
-                    State2 = case maps:is_key(StreamId, State1#state.streams) of
-                        true -> close_stream(StreamId, rst, State1);
-                        false -> State1
+                    State1b = sent_rst(StreamId, ValidErr, State1),
+                    State2 = case maps:is_key(StreamId, State1b#state.streams) of
+                        true -> close_stream(StreamId, rst, State1b);
+                        false -> State1b
                     end,
                     {ok, connected, State2}
             end.
@@ -1627,12 +1657,11 @@ strip_pseudo(Headers) ->
     lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers).
 
 stream_reject(StreamId, ErrorCode, State) ->
-    send_rst_stream(StreamId, ErrorCode, State),
-    {ok, connected, State}.
+    {ok, connected, sent_rst(StreamId, ErrorCode, State)}.
 
 stream_reject_and_close(StreamId, ErrorCode, State) ->
-    send_rst_stream(StreamId, ErrorCode, State),
-    {ok, connected, close_stream(StreamId, rst, State)}.
+    State1 = sent_rst(StreamId, ErrorCode, State),
+    {ok, connected, close_stream(StreamId, rst, State1)}.
 
 %% RFC 9113 §8.1.1: Content-Length parser. Multiple headers with the same
 %% value collapse into one; mismatched values are malformed. Non-numeric or
@@ -2030,12 +2059,12 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
                                  andalso ReceivedSoFar + DataSize =/= ExpectedCL)),
                     if
                         FlowControlled > StreamWindow ->
-                            send_rst_stream(StreamId, flow_control_error, State0a),
-                            State1 = close_stream(StreamId, rst, State0a),
+                            State0b = sent_rst(StreamId, flow_control_error, State0a),
+                            State1 = close_stream(StreamId, rst, State0b),
                             {ok, connected, State1};
                         BodyViolation ->
-                            send_rst_stream(StreamId, protocol_error, State0a),
-                            State1 = close_stream(StreamId, rst, State0a),
+                            State0b = sent_rst(StreamId, protocol_error, State0a),
+                            State1 = close_stream(StreamId, rst, State0b),
                             {ok, connected, State1};
                         true ->
                             NewStreamWindow = StreamWindow - FlowControlled,
@@ -2074,25 +2103,21 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
                 {ok, #stream{state = closed, closed_reason = rst}} ->
                     %% RFC 9113 §5.1: after RST_STREAM, further DATA is a
                     %% stream error STREAM_CLOSED.
-                    send_rst_stream(StreamId, stream_closed, State0a),
-                    {ok, connected, State0a};
+                    {ok, connected, sent_rst(StreamId, stream_closed, State0a)};
                 {ok, _} ->
                     %% half_closed_remote etc.: stream-scoped STREAM_CLOSED.
-                    send_rst_stream(StreamId, stream_closed, State0a),
-                    {ok, connected, State0a};
+                    {ok, connected, sent_rst(StreamId, stream_closed, State0a)};
                 error ->
                     case recently_closed_reason(StreamId, State0a) of
                         end_stream ->
                             %% Exact: peer END_STREAM then more DATA → conn error.
                             {error, stream_closed, State0a};
                         rst ->
-                            send_rst_stream(StreamId, stream_closed, State0a),
-                            {ok, connected, State0a};
+                            {ok, connected, sent_rst(StreamId, stream_closed, State0a)};
                         unknown ->
                             case in_closed_stream_range(StreamId, State0a) of
                                 true ->
-                                    send_rst_stream(StreamId, stream_closed, State0a),
-                                    {ok, connected, State0a};
+                                    {ok, connected, sent_rst(StreamId, stream_closed, State0a)};
                                 false ->
                                     {error, protocol_error, State0a}
                             end
@@ -3382,6 +3407,26 @@ send_rst_stream(StreamId, ErrorCode, State) ->
     Frame = h2_frame:rst_stream(StreamId, ErrorCode),
     _ = sock_send(State, h2_frame:encode_iodata(Frame)),
     ok.
+
+%% Send an RST_STREAM caused by peer misbehaviour and count it against the
+%% MadeYouReset budget (CVE-2025-8671). Returns the updated State; enforcement
+%% happens centrally in process_frames/2 via over_sent_rst_budget/1. Use this
+%% for every reset we emit for a protocol/flow-control error, but NOT for an
+%% application-initiated h2:cancel (that is the caller's own doing, not abuse).
+sent_rst(StreamId, ErrorCode, #state{sent_rst_flood = {Bucket, Count}} = State) ->
+    _ = send_rst_stream(StreamId, ErrorCode, State),
+    Now = erlang:monotonic_time(second),
+    NewBC = case Bucket =:= Now of
+        true  -> {Bucket, Count + 1};
+        false -> {Now, 1}
+    end,
+    State#state{sent_rst_flood = NewBC}.
+
+%% True once we have sent more than the per-second cap of peer-triggered
+%% resets in the current second.
+over_sent_rst_budget(#state{sent_rst_flood = {Bucket, Count}}) ->
+    Count > ?SENT_RST_FLOOD_LIMIT_PER_SEC
+        andalso Bucket =:= erlang:monotonic_time(second).
 
 %% ============================================================================
 %% Internal: Utilities

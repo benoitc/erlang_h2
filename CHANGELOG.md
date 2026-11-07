@@ -2,6 +2,18 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- Fixed a denial-of-service bug where a client could run far more requests at
+  once than `max_concurrent_streams` allows (MadeYouReset, CVE-2025-8671). By
+  repeatedly sending a frame that forces the server to reset the stream, the
+  client freed the stream's slot while its handler kept running, so the
+  concurrency limit no longer bounded the work in flight. The server now caps
+  how many streams it resets per second and closes the connection once a peer
+  goes past that cap. A well-behaved client is unaffected.
+
 ## [0.12.6] - 2026-11-07
 
 ### Fixed
