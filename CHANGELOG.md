@@ -4,6 +4,16 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+### Security
+
+- Fixed a denial-of-service bug where a peer could send SETTINGS frames
+  without limit (SETTINGS flood, CVE-2019-9515). Each one made the connection
+  write an acknowledgement and recompute every stream's flow-control window,
+  so a single client could keep a connection busy and its outbound buffer
+  growing. The connection now accepts at most 20 SETTINGS frames per second
+  from a peer and closes the connection past that. Real clients send one or
+  two per connection and are unaffected.
+
 ### Added
 
 - New `notify_peer_settings` option for clients and servers. The peer can
