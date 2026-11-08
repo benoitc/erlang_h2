@@ -1,8 +1,7 @@
 name: Set up rebar3
 description: >
-  Install a pinned rebar3 from the actions cache, falling back to the GitHub
-  release, the GitHub API asset endpoint, then s3 (only if it serves the same
-  version). Run after erlef/setup-beam with install-rebar false.
+  Install a pinned rebar3 from its GitHub release, cached by version. Run after
+  erlef/setup-beam with install-rebar false.
 inputs:
   version:
     description: rebar3 version to install
@@ -10,42 +9,18 @@ inputs:
 runs:
   using: composite
   steps:
-    - id: cache
-      uses: actions/cache@v4
+    - id: asset
+      uses: ./.github/actions/release-asset
       with:
-        path: ~/.cache/rebar3-bin/${{ inputs.version }}
-        key: rebar3-bin-${{ inputs.version }}
-    - if: steps.cache.outputs.cache-hit != 'true'
-      shell: bash
-      env:
-        VERSION: ${{ inputs.version }}
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        set -u
-        dir="$HOME/.cache/rebar3-bin/$VERSION"
-        mkdir -p "$dir"
-        out="$dir/rebar3"
-        fetch() { curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$@" -o "$out"; }
-        ok() { chmod +x "$out" && "$out" version | grep -q "^rebar $VERSION "; }
-        api="https://api.github.com/repos/erlang/rebar3/releases"
-        auth=()
-        [ -n "$GH_TOKEN" ] && auth=(-H "Authorization: Bearer $GH_TOKEN")
-        asset_id() {
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "${auth[@]}" \
-            "$api/tags/$VERSION" | jq -er '.assets[] | select(.name=="rebar3") | .id'
-        }
-        if fetch "https://github.com/erlang/rebar3/releases/download/$VERSION/rebar3" && ok; then
-          echo "rebar3 $VERSION from GitHub release"
-        elif id=$(asset_id) && [ -n "$id" ] \
-             && fetch "${auth[@]}" -H "Accept: application/octet-stream" "$api/assets/$id" \
-             && ok; then
-          echo "rebar3 $VERSION from GitHub API asset"
-        elif fetch "https://s3.amazonaws.com/rebar3/rebar3" && ok; then
-          echo "rebar3 $VERSION from s3"
-        else
-          echo "::error::could not download rebar3 $VERSION"
-          rm -f "$out"
-          exit 1
-        fi
+        repo: erlang/rebar3
+        tag: ${{ inputs.version }}
+        name: rebar3
     - shell: bash
-      run: echo "$HOME/.cache/rebar3-bin/${{ inputs.version }}" >> "$GITHUB_PATH"
+      env:
+        BIN: ${{ steps.asset.outputs.path }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        chmod +x "$BIN"
+        "$BIN" version | grep -q "^rebar $VERSION " \
+          || { echo "::error::$BIN is not rebar3 $VERSION"; exit 1; }
+        dirname "$BIN" >> "$GITHUB_PATH"

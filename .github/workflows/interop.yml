@@ -18,11 +18,15 @@ jobs:
       - uses: ./.github/actions/setup-rebar3
         with:
           version: '3.28.0'
+      - id: h2spec
+        uses: ./.github/actions/release-asset
+        with:
+          repo: summerwind/h2spec
+          tag: v2.6.0
+          name: h2spec_linux_amd64.tar.gz
       - name: Install h2spec
         run: |
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/h2spec.tar.gz \
-            https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz
-          tar -xzf /tmp/h2spec.tar.gz -C /usr/local/bin h2spec
+          tar -xzf "${{ steps.h2spec.outputs.path }}" -C /usr/local/bin h2spec
           h2spec --version
       - run: rebar3 ct --suite=test/h2_interop_SUITE
       - uses: actions/upload-artifact@v4
@@ -42,11 +46,15 @@ jobs:
       - uses: ./.github/actions/setup-rebar3
         with:
           version: '3.28.0'
+      - id: grpcurl
+        uses: ./.github/actions/release-asset
+        with:
+          repo: fullstorydev/grpcurl
+          tag: v1.9.3
+          name: grpcurl_1.9.3_linux_x86_64.tar.gz
       - name: Install grpcurl
         run: |
-          curl -sSL -o /tmp/grpcurl.tar.gz \
-            https://github.com/fullstorydev/grpcurl/releases/download/v1.9.3/grpcurl_1.9.3_linux_x86_64.tar.gz
-          tar -xzf /tmp/grpcurl.tar.gz -C /usr/local/bin grpcurl
+          tar -xzf "${{ steps.grpcurl.outputs.path }}" -C /usr/local/bin grpcurl
           grpcurl --version
       - run: rebar3 ct --suite=test/h2_grpc_interop_SUITE
       - uses: actions/upload-artifact@v4
