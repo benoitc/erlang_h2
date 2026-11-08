@@ -246,6 +246,14 @@
     %% each peer SETTINGS frame is applied and acknowledged. Opt-in.
     notify_peer_settings = false :: boolean(),
 
+    %% Client only. When true, a send_request refused with
+    %% max_streams_exceeded sets `stream_blocked'; the first time a slot frees
+    %% after that (a stream closes or the peer raises
+    %% SETTINGS_MAX_CONCURRENT_STREAMS) the owner gets
+    %% `{h2, Conn, stream_available}' once and the flag is cleared. Opt-in.
+    notify_stream_available = false :: boolean(),
+    stream_blocked = false :: boolean(),
+
     %% RFC 9113 §10.5 flood counters. `{BucketSec, Count}`; BucketSec is
     %% `erlang:monotonic_time(second)` for the current second.
     ping_flood = {0, 0} :: {integer(), non_neg_integer()},
@@ -553,7 +561,9 @@ init({Mode, Socket, Owner, Opts}) ->
                                            ?DEFAULT_INITIAL_WINDOW_SIZE),
         scheme = Scheme,
         enable_connect_protocol = EnableConnectProtocol,
-        notify_peer_settings = maps:get(notify_peer_settings, Opts, false) =:= true
+        notify_peer_settings = maps:get(notify_peer_settings, Opts, false) =:= true,
+        notify_stream_available = Mode =:= client andalso
+            maps:get(notify_stream_available, Opts, false) =:= true
     },
 
     %% Note: Socket is NOT set to active here - it will be activated
@@ -1169,7 +1179,11 @@ handle_settings(Settings, #state{mode = Mode, peer_settings = OldSettings} = Sta
                                         false -> State1
                                     end,
                                     notify_peer_settings(MergedSettings, State2),
-                                    {ok, NewStateName, State2};
+                                    %% RFC 9113 §6.5.2: a raised
+                                    %% SETTINGS_MAX_CONCURRENT_STREAMS can
+                                    %% free a slot for a refused request.
+                                    State3 = maybe_stream_available(State2),
+                                    {ok, NewStateName, State3};
                                 {error, Reason} ->
                                     {stop, {shutdown, {send_failed, Reason}}, State1}
                             end;
@@ -2301,7 +2315,8 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
 
     case MaxStreams of
         N when is_integer(N), ActiveStreams >= N ->
-            {keep_state, State, [{reply, From, {error, max_streams_exceeded}}]};
+            {keep_state, mark_stream_blocked(State),
+             [{reply, From, {error, max_streams_exceeded}}]};
         _ ->
             IsConnect = Method =:= <<"CONNECT">>,
             Host = proplists:get_value(<<"host">>, Headers),
@@ -2384,7 +2399,8 @@ handle_send_request_headers(From, Headers, EndStream, Opts,
     ActiveStreams = count_active_streams(State),
     case MaxStreams of
         N when is_integer(N), ActiveStreams >= N ->
-            {keep_state, State, [{reply, From, {error, max_streams_exceeded}}]};
+            {keep_state, mark_stream_blocked(State),
+             [{reply, From, {error, max_streams_exceeded}}]};
         _ ->
             Method = proplists:get_value(<<":method">>, Headers),
             Protocol = proplists:get_value(<<":protocol">>, Headers),
@@ -3239,9 +3255,39 @@ put_stream(StreamId, Stream, #state{streams = Streams, mode = Mode,
                    error -> undefined
                end,
     {DA, DP} = stream_count_delta(StreamId, Mode, OldState, Stream#stream.state),
-    State#state{streams = maps:put(StreamId, Stream, Streams),
-                active_stream_count = AC + DA,
-                peer_active_stream_count = PC + DP}.
+    State1 = State#state{streams = maps:put(StreamId, Stream, Streams),
+                         active_stream_count = AC + DA,
+                         peer_active_stream_count = PC + DP},
+    case DA < 0 of
+        true -> maybe_stream_available(State1);
+        false -> State1
+    end.
+
+%% RFC 9113 §5.1.2: a request refused at the peer's concurrency limit marks
+%% the connection blocked, so the owner can be told when a slot frees.
+mark_stream_blocked(#state{notify_stream_available = true} = State) ->
+    State#state{stream_blocked = true};
+mark_stream_blocked(State) ->
+    State.
+
+%% Send `stream_available' once per refusal episode, after the state update,
+%% when the active count is below the peer limit again. A peer may lower the
+%% limit below the current count (RFC 9113 §6.5.2); the flag then stays set
+%% until enough streams close. Nothing is sent once a GOAWAY went either way,
+%% since no new stream can open.
+maybe_stream_available(#state{stream_blocked = false} = State) ->
+    State;
+maybe_stream_available(#state{goaway_sent = true} = State) ->
+    State;
+maybe_stream_available(#state{goaway_received = true} = State) ->
+    State;
+maybe_stream_available(#state{peer_max_concurrent_streams = Max,
+                              active_stream_count = Active} = State)
+  when Max =:= unlimited; Active < Max ->
+    notify_owner({h2, self(), stream_available}, State),
+    State#state{stream_blocked = false};
+maybe_stream_available(State) ->
+    State.
 
 %% Count-membership delta for a stream transitioning OldState -> NewState.
 %% `undefined` OldState means the stream was absent (insert).

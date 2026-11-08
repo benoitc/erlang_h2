@@ -58,6 +58,11 @@
 %%   the merged peer settings (same map as get_peer_settings/1, extension ids as
 %%   integer keys), sent after each peer SETTINGS frame is applied and
 %%   acknowledged, the first one included.
+%% - `{h2, Conn, stream_available}' with `notify_stream_available => true':
+%%   sent once after a request was refused with `max_streams_exceeded', when a
+%%   stream closes or the peer raises SETTINGS_MAX_CONCURRENT_STREAMS so a new
+%%   request fits. Another caller may take the slot first, so a retry can still
+%%   be refused (and re-arms the notice). Not sent after a GOAWAY.
 %%
 %% Server handler receives direct calls. With `notify_peer_settings => true'
 %% and a module handler, `Module:handle_peer_settings(Conn, Settings)' is called
@@ -126,6 +131,10 @@
     %% Send `{h2, Conn, {peer_settings, Settings}}' to the owner after each
     %% peer SETTINGS frame is applied and acknowledged. Default false.
     notify_peer_settings => boolean(),
+    %% After a request was refused with max_streams_exceeded, send
+    %% `{h2, Conn, stream_available}' to the owner once, the first time a
+    %% stream slot frees. Default false.
+    notify_stream_available => boolean(),
     timeout => timeout(),
     connect_timeout => timeout(),
     sync => boolean()
@@ -242,7 +251,8 @@ connect_tcp(Host, Port, Opts, Timeout) ->
     end.
 
 start_connection(Mode, Socket, Opts) ->
-    ConnOpts = maps:with([settings, connection_window_size, notify_peer_settings], Opts),
+    ConnOpts = maps:with([settings, connection_window_size, notify_peer_settings,
+                          notify_stream_available], Opts),
     Timeout = maps:get(timeout, Opts, ?DEFAULT_TIMEOUT_MS),
     case h2_connection:start_link(Mode, Socket, ConnOpts) of
         {ok, Pid} ->
