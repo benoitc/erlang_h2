@@ -54,8 +54,15 @@
 %% - `{h2, Conn, {stream_reset, StreamId, ErrorCode}}'
 %% - `{h2, Conn, {goaway, LastStreamId, ErrorCode}}'
 %% - `{h2, Conn, {closed, Reason}}'
+%% - `{h2, Conn, {peer_settings, Settings}}' with `notify_peer_settings => true':
+%%   the merged peer settings (same map as get_peer_settings/1, extension ids as
+%%   integer keys), sent after each peer SETTINGS frame is applied and
+%%   acknowledged, the first one included.
 %%
-%% Server handler receives direct calls.
+%% Server handler receives direct calls. With `notify_peer_settings => true'
+%% and a module handler, `Module:handle_peer_settings(Conn, Settings)' is called
+%% (if exported) after each client SETTINGS frame. It runs in the connection's
+%% dispatch loop, so keep it short.
 %%
 %% == Bidirectional streaming (gRPC) ==
 %%
@@ -80,7 +87,7 @@
 %% Server API
 -export([start_server/2, start_server/3, stop_server/1, server_port/1]).
 -export([serve_socket/2]).
--export([send_response/4]).
+-export([send_response/4, send_response/5]).
 -export([respond/5]).
 
 %% Common API
@@ -94,7 +101,7 @@
 -export([set_stream_handler/3, set_stream_handler/4, unset_stream_handler/2]).
 -export([goaway/1, goaway/2]).
 -export([close/1]).
--export([get_settings/1, get_peer_settings/1, peername/1]).
+-export([get_settings/1, get_peer_settings/1, peername/1, connection_info/1]).
 -export([controlling_process/2]).
 
 %% Types
@@ -116,6 +123,9 @@
     %% Connection-level receive window shared by all streams. Raise it with
     %% settings.initial_window_size for large downloads. Default 65535.
     connection_window_size => 65535..2147483647,
+    %% Send `{h2, Conn, {peer_settings, Settings}}' to the owner after each
+    %% peer SETTINGS frame is applied and acknowledged. Default false.
+    notify_peer_settings => boolean(),
     timeout => timeout(),
     connect_timeout => timeout(),
     sync => boolean()
@@ -135,14 +145,21 @@
     ssl_opts => [ssl:tls_option()],
     ip => inet:ip_address(),
     inet6 => boolean(),
-    handler := fun((connection(), stream_id(), binary(), binary(), headers()) -> any()),
+    %% A fun, or a module exporting handle_request/5 (and optionally
+    %% handle_peer_settings/2).
+    handler := fun((connection(), stream_id(), binary(), binary(), headers()) -> any())
+             | module(),
     settings => h2_settings:settings(),
     %% Connection-level receive window shared by all streams. Default 65535.
     connection_window_size => 65535..2147483647,
     acceptors => pos_integer(),
     %% RFC 8441: when true, advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1 and
     %% accept Extended CONNECT requests carrying the `:protocol` pseudo-header.
-    enable_connect_protocol => boolean()
+    enable_connect_protocol => boolean(),
+    %% When true and `handler' is a module exporting handle_peer_settings/2,
+    %% it is called as `Module:handle_peer_settings(Conn, Settings)' after each
+    %% client SETTINGS frame is applied and acknowledged. Default false.
+    notify_peer_settings => boolean()
 }.
 
 -export_type([connection/0, stream_id/0, headers/0, status/0, error_code/0]).
@@ -225,7 +242,7 @@ connect_tcp(Host, Port, Opts, Timeout) ->
     end.
 
 start_connection(Mode, Socket, Opts) ->
-    ConnOpts = maps:with([settings, connection_window_size], Opts),
+    ConnOpts = maps:with([settings, connection_window_size, notify_peer_settings], Opts),
     Timeout = maps:get(timeout, Opts, ?DEFAULT_TIMEOUT_MS),
     case h2_connection:start_link(Mode, Socket, ConnOpts) of
         {ok, Pid} ->
@@ -297,8 +314,11 @@ request(Conn, Headers) ->
 %%   flow_control => manual | auto   manual = receive-side backpressure (consume/3)
 %%   end_stream   => boolean()       half-close the send side immediately
 %%   protocol     => binary()        RFC 8441 Extended CONNECT
+%%   report_peer_settings => true    return `{ok, StreamId, PeerSettings}' with
+%%                                   the peer settings in effect when the
+%%                                   HEADERS were written (WebTransport §4.3.1)
 -spec request(connection(), headers(), map()) ->
-    {ok, stream_id()} | {error, term()}.
+    {ok, stream_id()} | {ok, stream_id(), h2_settings:settings()} | {error, term()}.
 request(Conn, Headers, Opts) ->
     StreamOpts = stream_opts(Opts),
     %% RFC 8441 Extended CONNECT: when `protocol` is supplied, inject the
@@ -324,7 +344,7 @@ stream_opts(Opts) ->
             {ok, Value} -> Acc#{Key => Value};
             error       -> Acc
         end
-    end, #{}, [handler, defer, flow_control]).
+    end, #{}, [handler, defer, flow_control, report_peer_settings]).
 
 %% Insert `:protocol` after the trailing pseudo-header so the block stays
 %% well-ordered (RFC 9113 §8.3: pseudo-headers must precede regular ones).
@@ -672,7 +692,7 @@ accept_handshake(Socket, Handler, ConnOpts) ->
 %% truth for both the built-in acceptor path and serve_socket/2, so the two
 %% cannot drift.
 conn_opts(Opts) ->
-    maps:merge(maps:with([connection_window_size], Opts),
+    maps:merge(maps:with([connection_window_size, notify_peer_settings], Opts),
                #{settings => maps:get(settings, Opts, #{}),
                  enable_connect_protocol => maps:get(enable_connect_protocol, Opts, false)}).
 
@@ -748,6 +768,11 @@ server_connection_loop(Conn, Handler) ->
         {h2, Conn, {data, _StreamId, _Data, _IsFin}} ->
             %% Data received (for POST/PUT bodies)
             server_connection_loop(Conn, Handler);
+        {h2, Conn, {peer_settings, Settings}} ->
+            %% Only sent with notify_peer_settings => true. Run inline so
+            %% successive notifications reach the handler in order.
+            invoke_peer_settings(Handler, Conn, Settings),
+            server_connection_loop(Conn, Handler);
         {h2, Conn, {closed, _Reason}} ->
             ok;
         {h2, Conn, {goaway, _LastStreamId, _ErrorCode}} ->
@@ -757,6 +782,24 @@ server_connection_loop(Conn, Handler) ->
                          [Other]),
             server_connection_loop(Conn, Handler)
     end.
+
+invoke_peer_settings(Module, Conn, Settings) when is_atom(Module) ->
+    _ = code:ensure_loaded(Module),
+    case erlang:function_exported(Module, handle_peer_settings, 2) of
+        true ->
+            try
+                Module:handle_peer_settings(Conn, Settings)
+            catch
+                Class:Reason:Stack ->
+                    logger:error("h2 handle_peer_settings crash: ~ts:~tp~n~tp",
+                                 [Class, Reason, Stack])
+            end,
+            ok;
+        false ->
+            ok
+    end;
+invoke_peer_settings(_Handler, _Conn, _Settings) ->
+    ok.
 
 invoke_handler(Handler, Conn, StreamId, Method, Path, Headers) when is_function(Handler, 5) ->
     Handler(Conn, StreamId, Method, Path, Headers);
@@ -768,6 +811,23 @@ invoke_handler(Module, Conn, StreamId, Method, Path, Headers) when is_atom(Modul
     ok | {error, term()}.
 send_response(Conn, StreamId, Status, Headers) ->
     h2_connection:send_response(Conn, StreamId, Status, Headers).
+
+%% @doc Send an HTTP/2 response with options (server mode).
+%%
+%% With `#{report_peer_settings => true}' it returns `{ok, PeerSettings}': the
+%% client settings in effect when the HEADERS frame was written. A server that
+%% accepts a WebTransport session must use exactly those (draft-ietf-webtrans-
+%% http2 §4.3.1); reading them with get_peer_settings/1 in a separate call can
+%% race a SETTINGS frame. With an empty map it behaves like send_response/4.
+%%
+%% ```
+%% {ok, PeerSettings} = h2:send_response(Conn, StreamId, 200, [],
+%%                                       #{report_peer_settings => true}).
+%% '''
+-spec send_response(connection(), stream_id(), status(), headers(), map()) ->
+    ok | {ok, h2_settings:settings()} | {error, term()}.
+send_response(Conn, StreamId, Status, Headers, Opts) when is_map(Opts) ->
+    h2_connection:send_response(Conn, StreamId, Status, Headers, Opts).
 
 %% @doc Send a complete response (headers + full body) in a single call. This is
 %% the fast path for the common request/response case: one message to the
@@ -911,6 +971,28 @@ get_peer_settings(Conn) ->
     {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 peername(Conn) ->
     h2_connection:peername(Conn).
+
+%% @doc Return what the connection runs over.
+%%
+%% `Info' always has `transport => tcp | ssl'. Over TLS it also has
+%% `tls_version' (for example `` 'tlsv1.3' ''), `alpn' when a protocol was
+%% negotiated, and `sni_hostname' when the client sent one. Use it to apply
+%% transport requirements such as draft-ietf-webtrans-http2 §7, which only
+%% allows WebTransport over TLS 1.3 on OTP.
+%%
+%% ```
+%% case h2:connection_info(Conn) of
+%%     {ok, #{tls_version := 'tlsv1.3'}} -> accept;
+%%     {ok, _}                          -> reject
+%% end.
+%% '''
+-spec connection_info(connection()) ->
+    {ok, #{transport := tcp | ssl,
+           tls_version => ssl:protocol_version(),
+           alpn => binary(),
+           sni_hostname => string()}} | {error, term()}.
+connection_info(Conn) ->
+    h2_connection:connection_info(Conn).
 
 %% @doc Transfer connection ownership.
 -spec controlling_process(connection(), pid()) -> ok | {error, term()}.

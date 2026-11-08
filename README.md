@@ -208,6 +208,62 @@ ok = h2:send_data(Conn, Sid, FrameBytes, false).
 
 If the peer never advertised the setting, `h2:request/3` returns `{error, extended_connect_disabled}`. Server handlers read `:protocol` from the request `Headers` argument (alongside `:authority`/`:scheme`; see [Server](#server)). Tunnel semantics (no body length, no trailers) apply once the 2xx is sent.
 
+## WebTransport over HTTP/2
+
+h2 carries the connection-level pieces that draft-ietf-webtrans-http2 asks of
+the HTTP/2 layer; the session protocol lives in erlang-webtransport. Use these
+when you build WebTransport, or anything else that depends on extension
+settings or the TLS version.
+
+### Watch the peer's SETTINGS
+
+The peer may change `SETTINGS_WT_ENABLED` (0x2b67) at any time. Ask to be told:
+
+```erlang
+{ok, Conn} = h2:connect("localhost", 8443, #{notify_peer_settings => true}),
+receive
+    {h2, Conn, {peer_settings, #{16#2b67 := V}}} when V > 1 ->
+        h2:goaway(Conn, protocol_error);
+    {h2, Conn, {peer_settings, _}} ->
+        ok
+end.
+```
+
+On a server, give `notify_peer_settings => true` to `h2:start_server/2` and
+export `handle_peer_settings(Conn, Settings)` from the handler module.
+
+### Check the TLS version
+
+WebTransport over HTTP/2 needs TLS 1.3 on OTP. Check it before you accept a
+session:
+
+```erlang
+case h2:connection_info(Conn) of
+    {ok, #{tls_version := 'tlsv1.3'}} -> accept_session;
+    {ok, _}                          -> h2:send_response(Conn, StreamId, 400, [])
+end.
+```
+
+The map always has `transport => tcp | ssl`; TLS connections add
+`tls_version`, `alpn` and, when the client sent one, `sni_hostname`.
+
+### Use the SETTINGS in effect when you send HEADERS
+
+The session request and the response that accepts it must use the peer
+settings acknowledged at that moment. Get them from the same call:
+
+```erlang
+{ok, Sid, PeerSettings} =
+    h2:request(Conn, Headers, #{protocol => <<"webtransport">>,
+                                report_peer_settings => true}),
+
+{ok, ClientSettings} =
+    h2:send_response(Conn, StreamId, 200, [], #{report_peer_settings => true}).
+```
+
+Without the option, `h2:request/3` returns `{ok, StreamId}` and
+`h2:send_response/5` returns `ok`, as `h2:send_response/4` does.
+
 ## Bidirectional streaming (gRPC)
 
 A gRPC call is one HTTP/2 stream where both peers send interleaved DATA, the client half-closes with `END_STREAM` on its last DATA while still receiving, and the server ends with trailers carrying `grpc-status`. Each call runs in its own process that owns *its* stream's events without owning the connection, so many calls multiplex one connection.

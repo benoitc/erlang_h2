@@ -20,13 +20,13 @@
 -export([activate/1]).
 -export([wait_connected/1, wait_connected/2]).
 -export([send_request/4, send_request/5, send_request_headers/3, send_request_headers/4,
-         send_response/4, respond/5, send_data/3, send_data/4, send_data/5]).
+         send_response/4, send_response/5, respond/5, send_data/3, send_data/4, send_data/5]).
 -export([set_stream_handler/3, set_stream_handler/4, unset_stream_handler/2]).
 -export([consume/3]).
 -export([send_trailers/3]).
 -export([cancel_stream/2, cancel_stream/3]).
 -export([send_goaway/1, send_goaway/2, close/1]).
--export([get_settings/1, get_peer_settings/1, peername/1]).
+-export([get_settings/1, get_peer_settings/1, peername/1, connection_info/1]).
 -export([controlling_process/2]).
 -export([verify_stream_counts/1]).
 
@@ -242,6 +242,10 @@
     %% and accepts requests with the `:protocol` pseudo-header. Server-side opt-in.
     enable_connect_protocol = false :: boolean(),
 
+    %% When true, the owner gets `{h2, Conn, {peer_settings, Settings}}' after
+    %% each peer SETTINGS frame is applied and acknowledged. Opt-in.
+    notify_peer_settings = false :: boolean(),
+
     %% RFC 9113 §10.5 flood counters. `{BucketSec, Count}`; BucketSec is
     %% `erlang:monotonic_time(second)` for the current second.
     ping_flood = {0, 0} :: {integer(), non_neg_integer()},
@@ -314,14 +318,18 @@ send_request(Conn, Method, Path, Headers, EndStream) ->
 send_request_headers(Conn, Headers, EndStream) ->
     send_request_headers(Conn, Headers, EndStream, #{}).
 
-%% @doc Send a request with a pre-built header list and per-stream options. For
+%% @doc Send a request with a pre-built header list and per-stream options.
+%% `#{report_peer_settings => true}' makes it return `{ok, StreamId,
+%% PeerSettings}', the peer settings in effect when the HEADERS were written.
+%% For
 %% gRPC bidi a dedicated call process passes `#{handler => self()}' so the
 %% stream's events route to it from creation (race-free, no owner detour), and
 %% optionally `#{flow_control => manual}' to apply receive-side backpressure.
 %% `#{defer => true}' buffers events until a later set_stream_handler/3 replays
 %% them when the handler pid is not known at creation time.
 -spec send_request_headers(pid(), [{binary(), binary()}], boolean(), map()) ->
-    {ok, non_neg_integer()} | {error, term()}.
+    {ok, non_neg_integer()} | {ok, non_neg_integer(), h2_settings:settings()}
+    | {error, term()}.
 send_request_headers(Conn, Headers, EndStream, Opts) when is_map(Opts) ->
     gen_statem:call(Conn, {send_request_headers, Headers, EndStream, Opts}).
 
@@ -350,6 +358,15 @@ unset_stream_handler(Conn, StreamId) ->
     ok | {error, term()}.
 send_response(Conn, StreamId, Status, Headers) ->
     gen_statem:call(Conn, {send_response, StreamId, Status, Headers}).
+
+%% @doc Send a response with options. `#{report_peer_settings => true}' makes
+%% it return `{ok, PeerSettings}', the peer settings in effect when the HEADERS
+%% were written; otherwise it behaves like send_response/4.
+-spec send_response(pid(), non_neg_integer(), non_neg_integer(),
+                    [{binary(), binary()}], map()) ->
+    ok | {ok, h2_settings:settings()} | {error, term()}.
+send_response(Conn, StreamId, Status, Headers, Opts) when is_map(Opts) ->
+    gen_statem:call(Conn, {send_response, StreamId, Status, Headers, Opts}).
 
 %% @doc Send a complete response (headers + full body) in one call. Returns
 %% `need_fallback' when the fast path does not apply; callers (h2:respond/5)
@@ -452,6 +469,13 @@ get_peer_settings(Conn) ->
 peername(Conn) ->
     gen_statem:call(Conn, peername).
 
+%% @doc Return the connection's transport and, over TLS, the negotiated
+%% version, ALPN protocol and SNI host name. Read inside the connection process
+%% so the socket never leaves it.
+-spec connection_info(pid()) -> {ok, map()} | {error, term()}.
+connection_info(Conn) ->
+    gen_statem:call(Conn, connection_info).
+
 %% @doc Transfer ownership of the connection.
 -spec controlling_process(pid(), pid()) -> ok | {error, term()}.
 controlling_process(Conn, NewOwner) ->
@@ -522,7 +546,8 @@ init({Mode, Socket, Owner, Opts}) ->
         recv_conn_window_target = maps:get(connection_window_size, Opts,
                                            ?DEFAULT_INITIAL_WINDOW_SIZE),
         scheme = Scheme,
-        enable_connect_protocol = EnableConnectProtocol
+        enable_connect_protocol = EnableConnectProtocol,
+        notify_peer_settings = maps:get(notify_peer_settings, Opts, false) =:= true
     },
 
     %% Note: Socket is NOT set to active here - it will be activated
@@ -1137,6 +1162,7 @@ handle_settings(Settings, #state{mode = Mode, peer_settings = OldSettings} = Sta
                                         true -> flush_send_buffers(State1);
                                         false -> State1
                                     end,
+                                    notify_peer_settings(MergedSettings, State2),
                                     {ok, NewStateName, State2};
                                 {error, Reason} ->
                                     {stop, {shutdown, {send_failed, Reason}}, State1}
@@ -1154,6 +1180,14 @@ handle_settings(Settings, #state{mode = Mode, peer_settings = OldSettings} = Sta
         {error, _Reason} ->
             {error, protocol_error, State}
     end.
+
+%% draft-ietf-webtrans-http2 §3.1: SETTINGS_WT_ENABLED and the other
+%% extension settings can change during the connection, so an owner that
+%% opted in is told each time a peer SETTINGS frame has been applied and acked.
+notify_peer_settings(Settings, #state{notify_peer_settings = true} = State) ->
+    notify_owner({h2, self(), {peer_settings, Settings}}, State);
+notify_peer_settings(_Settings, _State) ->
+    ok.
 
 window_grew(OldSettings, NewSettings) ->
     h2_settings:get(initial_window_size, NewSettings) >
@@ -2397,7 +2431,11 @@ handle_send_request_headers(From, Headers, EndStream, Opts,
                         encode_context = EncCtx1,
                         next_stream_id = StreamId + 2
                     },
-                    {keep_state, State1, [{reply, From, {ok, StreamId}}]};
+                    Reply = case report_peer_settings(Opts) of
+                        true  -> {ok, StreamId, PeerSettings};
+                        false -> {ok, StreamId}
+                    end,
+                    {keep_state, State1, [{reply, From, Reply}]};
                 {error, SendReason} ->
                     {stop_and_reply,
                      {shutdown, {send_failed, SendReason}},
@@ -2431,8 +2469,12 @@ stream_opts(Opts) ->
     end,
     {Handler, DispatchMode, FlowControl}.
 
-handle_send_response(From, StreamId, Status, Headers, #state{mode = server, streams = Streams,
-                                                              encode_context = EncCtx} = State) ->
+handle_send_response(From, StreamId, Status, Headers, State) ->
+    handle_send_response(From, StreamId, Status, Headers, #{}, State).
+
+handle_send_response(From, StreamId, Status, Headers, Opts,
+                     #state{mode = server, streams = Streams,
+                            encode_context = EncCtx} = State) ->
     case maps:find(StreamId, Streams) of
         _ when Status =:= 101 ->
             %% RFC 9113 §8.6: HTTP/2 MUST NOT generate 101 Switching Protocols.
@@ -2489,7 +2531,11 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
                                 closed -> close_stream(StreamId, end_stream, State1);
                                 _      -> State1
                             end,
-                            {keep_state, State2, [{reply, From, ok}]};
+                            Reply = case report_peer_settings(Opts) of
+                                true  -> {ok, State#state.peer_settings};
+                                false -> ok
+                            end,
+                            {keep_state, State2, [{reply, From, Reply}]};
                         {error, SendReason} ->
                             {stop_and_reply,
                              {shutdown, {send_failed, SendReason}},
@@ -2505,8 +2551,15 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
             {keep_state, State, [{reply, From, {error, unknown_stream}}]}
     end;
 
-handle_send_response(From, _StreamId, _Status, _Headers, State) ->
+handle_send_response(From, _StreamId, _Status, _Headers, _Opts, State) ->
     {keep_state, State, [{reply, From, {error, not_server}}]}.
+
+%% draft-ietf-webtrans-http2 §4.3.1: the CONNECT request and the response
+%% accepting a session must use the peer SETTINGS acknowledged at that moment.
+%% peer_settings only changes when a SETTINGS frame is applied and acked, so
+%% its value while the HEADERS are written is exactly that set.
+report_peer_settings(Opts) ->
+    maps:get(report_peer_settings, Opts, false) =:= true.
 
 %% Combined response: status + headers + full body in one gen_statem call and a
 %% single socket write (HEADERS coalesced with the DATA frame). This halves the
@@ -3010,6 +3063,8 @@ handle_call_early(From, Request, StateName, #state{waiters = Waiters} = State) -
             {keep_state, State, [{reply, From, State#state.peer_settings}]};
         peername ->
             {keep_state, State, [{reply, From, do_peername(State)}]};
+        connection_info ->
+            {keep_state, State, [{reply, From, do_connection_info(State)}]};
         {controlling_process, NewOwner} ->
             {keep_state, swap_owner_monitor(NewOwner, State),
              [{reply, From, ok}]};
@@ -3029,6 +3084,8 @@ handle_stream_call(From, {consume, StreamId, ByteCount}, State) ->
     handle_consume(From, StreamId, ByteCount, State);
 handle_stream_call(From, {send_response, StreamId, Status, Headers}, State) ->
     handle_send_response(From, StreamId, Status, Headers, State);
+handle_stream_call(From, {send_response, StreamId, Status, Headers, Opts}, State) ->
+    handle_send_response(From, StreamId, Status, Headers, Opts, State);
 handle_stream_call(From, {respond, StreamId, Status, Headers, Body}, State) ->
     handle_respond(From, StreamId, Status, Headers, Body, State);
 handle_stream_call(From, {send_trailers, StreamId, Trailers}, State) ->
@@ -3050,6 +3107,8 @@ handle_call_common(From, Request, _StateName, State) ->
             {keep_state, State, [{reply, From, State#state.peer_settings}]};
         peername ->
             {keep_state, State, [{reply, From, do_peername(State)}]};
+        connection_info ->
+            {keep_state, State, [{reply, From, do_connection_info(State)}]};
         {controlling_process, NewOwner} ->
             {keep_state, swap_owner_monitor(NewOwner, State),
              [{reply, From, ok}]};
@@ -3063,6 +3122,33 @@ do_peername(#state{socket = Socket, transport = gen_tcp}) ->
     inet:peername(Socket);
 do_peername(#state{socket = Socket, transport = ssl}) ->
     ssl:peername(Socket).
+
+%% draft-ietf-webtrans-http2 §7 makes WebTransport depend on the TLS version,
+%% so the application needs it without getting hold of the socket.
+do_connection_info(#state{socket = undefined}) ->
+    {error, not_connected};
+do_connection_info(#state{transport = gen_tcp}) ->
+    {ok, #{transport => tcp}};
+do_connection_info(#state{socket = Socket, transport = ssl}) ->
+    case ssl:connection_information(Socket, [protocol, sni_hostname]) of
+        {ok, Items} ->
+            Info0 = #{transport => ssl},
+            Info1 = case proplists:get_value(protocol, Items) of
+                undefined -> Info0;
+                Version   -> Info0#{tls_version => Version}
+            end,
+            Info2 = case proplists:get_value(sni_hostname, Items) of
+                undefined -> Info1;
+                Sni       -> Info1#{sni_hostname => Sni}
+            end,
+            Info = case ssl:negotiated_protocol(Socket) of
+                {ok, Alpn} -> Info2#{alpn => Alpn};
+                _          -> Info2
+            end,
+            {ok, Info};
+        {error, _} = Err ->
+            Err
+    end.
 
 handle_common(info, {'EXIT', Owner, Reason}, _StateName, #state{owner = Owner} = State) ->
     {stop, {shutdown, {owner_exit, Reason}}, State};

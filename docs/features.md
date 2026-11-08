@@ -69,13 +69,14 @@ h2:start_server/2,3
 h2:stop_server/1
 h2:server_port/1
 h2:serve_socket/2       %% serve a socket you accepted and handshook yourself
-h2:send_response/4
+h2:send_response/4,5    %% /5 takes #{report_peer_settings => true}
 h2:respond/5            %% combined headers+body fast path (one call, one write)
 
 %% Inspection
 h2:get_settings/1
 h2:get_peer_settings/1
 h2:peername/1
+h2:connection_info/1    %% transport, TLS version, ALPN, SNI
 ```
 
 See the README for usage snippets and `src/h2.erl` for full edoc.
@@ -91,9 +92,12 @@ See the README for usage snippets and `src/h2.erl` for full edoc.
 {h2, Conn, {stream_reset, StreamId, ErrorCode}}
 {h2, Conn, {goaway, LastStreamId, ErrorCode}}
 {h2, Conn, {closed, Reason}}
+{h2, Conn, {peer_settings, Settings}}   %% with notify_peer_settings => true
 ```
 
 All per-stream events (`response`, `informational`, `data`, `trailers`, `stream_reset`) are routed to the process registered via `h2:set_stream_handler/3,4` (or set at creation with `#{handler => Pid}`) if one is set; otherwise they fall back to the connection owner. Events that arrive before a handler registers are buffered and replayed in arrival order, never dropped. The connection-wide `goaway` and `closed` events are delivered to the owner and, additionally, to each stream handler so a per-stream process learns the connection is going away.
+
+`peer_settings` is sent only with the `notify_peer_settings => true` connect option, after each peer SETTINGS frame is applied and acknowledged (the first one included). On the server, a handler module may export `handle_peer_settings(Conn, Settings)` to receive the same map.
 
 Identical shape to `quic_h3` so application code that dispatches on protocol events can be shared between h2 and h3.
 
