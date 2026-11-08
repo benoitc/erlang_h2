@@ -42,20 +42,30 @@ init(Parent, #{transport := Transport,
     AcceptorPids = [spawn_link(fun() -> AcceptorFun(ServerState) end)
                     || _ <- lists:seq(1, NumAcceptors)],
     proc_lib:init_ack(Parent, {ok, self()}),
-    loop(Transport, ListenSocket, AcceptorPids, Ref).
+    loop(Parent, Transport, ListenSocket, AcceptorPids, Ref).
 
-loop(Transport, ListenSocket, AcceptorPids, Ref) ->
+%% The listener traps exits to track its acceptors, so the supervisor's
+%% shutdown arrives as an 'EXIT' message from Parent. Handle it like a stop,
+%% or the listener would linger until the supervisor's shutdown timeout kills
+%% it and the listen socket would stay open meanwhile.
+loop(Parent, Transport, ListenSocket, AcceptorPids, Ref) ->
     receive
         {stop, Ref} ->
-            lists:foreach(fun(Pid) -> exit(Pid, shutdown) end, AcceptorPids),
-            close(Transport, ListenSocket),
+            shutdown(Transport, ListenSocket, AcceptorPids),
             ok;
+        {'EXIT', Parent, Reason} ->
+            shutdown(Transport, ListenSocket, AcceptorPids),
+            exit(Reason);
         {'EXIT', Pid, _Reason} ->
-            loop(Transport, ListenSocket, lists:delete(Pid, AcceptorPids), Ref);
+            loop(Parent, Transport, ListenSocket, lists:delete(Pid, AcceptorPids), Ref);
         Other ->
             logger:debug("h2_listener: unexpected message ~tp", [Other]),
-            loop(Transport, ListenSocket, AcceptorPids, Ref)
+            loop(Parent, Transport, ListenSocket, AcceptorPids, Ref)
     end.
+
+shutdown(Transport, ListenSocket, AcceptorPids) ->
+    lists:foreach(fun(Pid) -> exit(Pid, shutdown) end, AcceptorPids),
+    close(Transport, ListenSocket).
 
 close(ssl, Sock) -> _ = ssl:close(Sock), ok;
 close(tcp, Sock) -> _ = gen_tcp:close(Sock), ok.
