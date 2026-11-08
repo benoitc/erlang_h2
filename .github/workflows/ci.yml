@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  REBAR3_VERSION: '3.28.0'
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -14,7 +17,18 @@ jobs:
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '29.0'
-          rebar3-version: '3.25.0'
+          install-rebar: false
+      - uses: actions/cache@v4
+        id: rebar3
+        with:
+          path: ~/.local/rebar3
+          key: rebar3-${{ env.REBAR3_VERSION }}
+      - name: Download rebar3
+        if: steps.rebar3.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/fetch-rebar3.sh "$REBAR3_VERSION" ~/.local/rebar3
+      - run: echo "$HOME/.local/rebar3" >> "$GITHUB_PATH"
       - run: rebar3 compile
 
   xref:
@@ -25,7 +39,18 @@ jobs:
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '29.0'
-          rebar3-version: '3.25.0'
+          install-rebar: false
+      - uses: actions/cache@v4
+        id: rebar3
+        with:
+          path: ~/.local/rebar3
+          key: rebar3-${{ env.REBAR3_VERSION }}
+      - name: Download rebar3
+        if: steps.rebar3.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/fetch-rebar3.sh "$REBAR3_VERSION" ~/.local/rebar3
+      - run: echo "$HOME/.local/rebar3" >> "$GITHUB_PATH"
       - run: rebar3 xref
 
   dialyzer:
@@ -36,7 +61,18 @@ jobs:
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '29.0'
-          rebar3-version: '3.25.0'
+          install-rebar: false
+      - uses: actions/cache@v4
+        id: rebar3
+        with:
+          path: ~/.local/rebar3
+          key: rebar3-${{ env.REBAR3_VERSION }}
+      - name: Download rebar3
+        if: steps.rebar3.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/fetch-rebar3.sh "$REBAR3_VERSION" ~/.local/rebar3
+      - run: echo "$HOME/.local/rebar3" >> "$GITHUB_PATH"
       - uses: actions/cache@v4
         with:
           path: _build/default/*_plt
@@ -52,7 +88,18 @@ jobs:
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '29.0'
-          rebar3-version: '3.25.0'
+          install-rebar: false
+      - uses: actions/cache@v4
+        id: rebar3
+        with:
+          path: ~/.local/rebar3
+          key: rebar3-${{ env.REBAR3_VERSION }}
+      - name: Download rebar3
+        if: steps.rebar3.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/fetch-rebar3.sh "$REBAR3_VERSION" ~/.local/rebar3
+      - run: echo "$HOME/.local/rebar3" >> "$GITHUB_PATH"
       - run: rebar3 eunit
       - run: rebar3 ct --suite=test/h2_compliance_SUITE
       - run: rebar3 cover
