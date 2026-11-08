@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  REBAR3_VERSION: '3.28.0'
+
 jobs:
   h2spec:
     runs-on: ubuntu-latest
@@ -15,18 +18,30 @@ jobs:
         with:
           otp-version: '29.0'
           install-rebar: false
-      - uses: ./.github/actions/setup-rebar3
+      - uses: actions/cache@v4
+        id: rebar3
         with:
-          version: '3.28.0'
-      - id: h2spec
-        uses: ./.github/actions/release-asset
+          path: ~/.local/rebar3
+          key: rebar3-${{ env.REBAR3_VERSION }}
+      - name: Download rebar3
+        if: steps.rebar3.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/fetch-rebar3.sh "$REBAR3_VERSION" ~/.local/rebar3
+      - run: echo "$HOME/.local/rebar3" >> "$GITHUB_PATH"
+      - uses: actions/cache@v4
+        id: h2spec
         with:
-          repo: summerwind/h2spec
-          tag: v2.6.0
-          name: h2spec_linux_amd64.tar.gz
+          path: ~/.local/h2spec
+          key: h2spec-v2.6.0
+      - name: Download h2spec
+        if: steps.h2spec.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/fetch-release-asset.sh summerwind/h2spec v2.6.0 h2spec_linux_amd64.tar.gz ~/.local/h2spec
       - name: Install h2spec
         run: |
-          tar -xzf "${{ steps.h2spec.outputs.path }}" -C /usr/local/bin h2spec
+          tar -xzf ~/.local/h2spec/h2spec_linux_amd64.tar.gz -C /usr/local/bin h2spec
           h2spec --version
       - run: rebar3 ct --suite=test/h2_interop_SUITE
       - uses: actions/upload-artifact@v4
@@ -43,18 +58,30 @@ jobs:
         with:
           otp-version: '29.0'
           install-rebar: false
-      - uses: ./.github/actions/setup-rebar3
+      - uses: actions/cache@v4
+        id: rebar3
         with:
-          version: '3.28.0'
-      - id: grpcurl
-        uses: ./.github/actions/release-asset
+          path: ~/.local/rebar3
+          key: rebar3-${{ env.REBAR3_VERSION }}
+      - name: Download rebar3
+        if: steps.rebar3.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/fetch-rebar3.sh "$REBAR3_VERSION" ~/.local/rebar3
+      - run: echo "$HOME/.local/rebar3" >> "$GITHUB_PATH"
+      - uses: actions/cache@v4
+        id: grpcurl
         with:
-          repo: fullstorydev/grpcurl
-          tag: v1.9.3
-          name: grpcurl_1.9.3_linux_x86_64.tar.gz
+          path: ~/.local/grpcurl
+          key: grpcurl-v1.9.3
+      - name: Download grpcurl
+        if: steps.grpcurl.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/fetch-release-asset.sh fullstorydev/grpcurl v1.9.3 grpcurl_1.9.3_linux_x86_64.tar.gz ~/.local/grpcurl
       - name: Install grpcurl
         run: |
-          tar -xzf "${{ steps.grpcurl.outputs.path }}" -C /usr/local/bin grpcurl
+          tar -xzf ~/.local/grpcurl/grpcurl_1.9.3_linux_x86_64.tar.gz -C /usr/local/bin grpcurl
           grpcurl --version
       - run: rebar3 ct --suite=test/h2_grpc_interop_SUITE
       - uses: actions/upload-artifact@v4
@@ -71,9 +98,17 @@ jobs:
         with:
           otp-version: '29.0'
           install-rebar: false
-      - uses: ./.github/actions/setup-rebar3
+      - uses: actions/cache@v4
+        id: rebar3
         with:
-          version: '3.28.0'
+          path: ~/.local/rebar3
+          key: rebar3-${{ env.REBAR3_VERSION }}
+      - name: Download rebar3
+        if: steps.rebar3.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/fetch-rebar3.sh "$REBAR3_VERSION" ~/.local/rebar3
+      - run: echo "$HOME/.local/rebar3" >> "$GITHUB_PATH"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
