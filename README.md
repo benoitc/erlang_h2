@@ -208,6 +208,30 @@ ok = h2:send_data(Conn, Sid, FrameBytes, false).
 
 If the peer never advertised the setting, `h2:request/3` returns `{error, extended_connect_disabled}`. Server handlers read `:protocol` from the request `Headers` argument (alongside `:authority`/`:scheme`; see [Server](#server)). Tunnel semantics (no body length, no trailers) apply once the 2xx is sent.
 
+## WebTransport over HTTP/2
+
+h2 carries the connection-level pieces that draft-ietf-webtrans-http2 asks of
+the HTTP/2 layer; the session protocol lives in erlang-webtransport. Use these
+when you build WebTransport, or anything else that depends on extension
+settings or the TLS version.
+
+### Watch the peer's SETTINGS
+
+The peer may change `SETTINGS_WT_ENABLED` (0x2b67) at any time. Ask to be told:
+
+```erlang
+{ok, Conn} = h2:connect("localhost", 8443, #{notify_peer_settings => true}),
+receive
+    {h2, Conn, {peer_settings, #{16#2b67 := V}}} when V > 1 ->
+        h2:goaway(Conn, protocol_error);
+    {h2, Conn, {peer_settings, _}} ->
+        ok
+end.
+```
+
+On a server, give `notify_peer_settings => true` to `h2:start_server/2` and
+export `handle_peer_settings(Conn, Settings)` from the handler module.
+
 ## Bidirectional streaming (gRPC)
 
 A gRPC call is one HTTP/2 stream where both peers send interleaved DATA, the client half-closes with `END_STREAM` on its last DATA while still receiving, and the server ends with trailers carrying `grpc-status`. Each call runs in its own process that owns *its* stream's events without owning the connection, so many calls multiplex one connection.

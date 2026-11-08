@@ -238,6 +238,10 @@
     %% and accepts requests with the `:protocol` pseudo-header. Server-side opt-in.
     enable_connect_protocol = false :: boolean(),
 
+    %% When true, the owner gets `{h2, Conn, {peer_settings, Settings}}' after
+    %% each peer SETTINGS frame is applied and acknowledged. Opt-in.
+    notify_peer_settings = false :: boolean(),
+
     %% RFC 9113 §10.5 flood counters. `{BucketSec, Count}`; BucketSec is
     %% `erlang:monotonic_time(second)` for the current second.
     ping_flood = {0, 0} :: {integer(), non_neg_integer()},
@@ -517,7 +521,8 @@ init({Mode, Socket, Owner, Opts}) ->
         recv_conn_window_target = maps:get(connection_window_size, Opts,
                                            ?DEFAULT_INITIAL_WINDOW_SIZE),
         scheme = Scheme,
-        enable_connect_protocol = EnableConnectProtocol
+        enable_connect_protocol = EnableConnectProtocol,
+        notify_peer_settings = maps:get(notify_peer_settings, Opts, false) =:= true
     },
 
     %% Note: Socket is NOT set to active here - it will be activated
@@ -1129,6 +1134,7 @@ handle_settings(Settings, #state{mode = Mode, peer_settings = OldSettings} = Sta
                                         true -> flush_send_buffers(State1);
                                         false -> State1
                                     end,
+                                    notify_peer_settings(MergedSettings, State2),
                                     {ok, NewStateName, State2};
                                 {error, Reason} ->
                                     {stop, {shutdown, {send_failed, Reason}}, State1}
@@ -1146,6 +1152,14 @@ handle_settings(Settings, #state{mode = Mode, peer_settings = OldSettings} = Sta
         {error, _Reason} ->
             {error, protocol_error, State}
     end.
+
+%% draft-ietf-webtrans-http2 §3.1: SETTINGS_WT_ENABLED and the other
+%% extension settings can change during the connection, so an owner that
+%% opted in is told each time a peer SETTINGS frame has been applied and acked.
+notify_peer_settings(Settings, #state{notify_peer_settings = true} = State) ->
+    notify_owner({h2, self(), {peer_settings, Settings}}, State);
+notify_peer_settings(_Settings, _State) ->
+    ok.
 
 window_grew(OldSettings, NewSettings) ->
     h2_settings:get(initial_window_size, NewSettings) >

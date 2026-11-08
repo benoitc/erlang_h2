@@ -54,8 +54,15 @@
 %% - `{h2, Conn, {stream_reset, StreamId, ErrorCode}}'
 %% - `{h2, Conn, {goaway, LastStreamId, ErrorCode}}'
 %% - `{h2, Conn, {closed, Reason}}'
+%% - `{h2, Conn, {peer_settings, Settings}}' with `notify_peer_settings => true':
+%%   the merged peer settings (same map as get_peer_settings/1, extension ids as
+%%   integer keys), sent after each peer SETTINGS frame is applied and
+%%   acknowledged, the first one included.
 %%
-%% Server handler receives direct calls.
+%% Server handler receives direct calls. With `notify_peer_settings => true'
+%% and a module handler, `Module:handle_peer_settings(Conn, Settings)' is called
+%% (if exported) after each client SETTINGS frame. It runs in the connection's
+%% dispatch loop, so keep it short.
 %%
 %% == Bidirectional streaming (gRPC) ==
 %%
@@ -116,6 +123,9 @@
     %% Connection-level receive window shared by all streams. Raise it with
     %% settings.initial_window_size for large downloads. Default 65535.
     connection_window_size => 65535..2147483647,
+    %% Send `{h2, Conn, {peer_settings, Settings}}' to the owner after each
+    %% peer SETTINGS frame is applied and acknowledged. Default false.
+    notify_peer_settings => boolean(),
     timeout => timeout(),
     connect_timeout => timeout(),
     sync => boolean()
@@ -135,14 +145,21 @@
     ssl_opts => [ssl:tls_option()],
     ip => inet:ip_address(),
     inet6 => boolean(),
-    handler := fun((connection(), stream_id(), binary(), binary(), headers()) -> any()),
+    %% A fun, or a module exporting handle_request/5 (and optionally
+    %% handle_peer_settings/2).
+    handler := fun((connection(), stream_id(), binary(), binary(), headers()) -> any())
+             | module(),
     settings => h2_settings:settings(),
     %% Connection-level receive window shared by all streams. Default 65535.
     connection_window_size => 65535..2147483647,
     acceptors => pos_integer(),
     %% RFC 8441: when true, advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1 and
     %% accept Extended CONNECT requests carrying the `:protocol` pseudo-header.
-    enable_connect_protocol => boolean()
+    enable_connect_protocol => boolean(),
+    %% When true and `handler' is a module exporting handle_peer_settings/2,
+    %% it is called as `Module:handle_peer_settings(Conn, Settings)' after each
+    %% client SETTINGS frame is applied and acknowledged. Default false.
+    notify_peer_settings => boolean()
 }.
 
 -export_type([connection/0, stream_id/0, headers/0, status/0, error_code/0]).
@@ -225,7 +242,7 @@ connect_tcp(Host, Port, Opts, Timeout) ->
     end.
 
 start_connection(Mode, Socket, Opts) ->
-    ConnOpts = maps:with([settings, connection_window_size], Opts),
+    ConnOpts = maps:with([settings, connection_window_size, notify_peer_settings], Opts),
     Timeout = maps:get(timeout, Opts, ?DEFAULT_TIMEOUT_MS),
     case h2_connection:start_link(Mode, Socket, ConnOpts) of
         {ok, Pid} ->
@@ -672,7 +689,7 @@ accept_handshake(Socket, Handler, ConnOpts) ->
 %% truth for both the built-in acceptor path and serve_socket/2, so the two
 %% cannot drift.
 conn_opts(Opts) ->
-    maps:merge(maps:with([connection_window_size], Opts),
+    maps:merge(maps:with([connection_window_size, notify_peer_settings], Opts),
                #{settings => maps:get(settings, Opts, #{}),
                  enable_connect_protocol => maps:get(enable_connect_protocol, Opts, false)}).
 
@@ -748,6 +765,11 @@ server_connection_loop(Conn, Handler) ->
         {h2, Conn, {data, _StreamId, _Data, _IsFin}} ->
             %% Data received (for POST/PUT bodies)
             server_connection_loop(Conn, Handler);
+        {h2, Conn, {peer_settings, Settings}} ->
+            %% Only sent with notify_peer_settings => true. Run inline so
+            %% successive notifications reach the handler in order.
+            invoke_peer_settings(Handler, Conn, Settings),
+            server_connection_loop(Conn, Handler);
         {h2, Conn, {closed, _Reason}} ->
             ok;
         {h2, Conn, {goaway, _LastStreamId, _ErrorCode}} ->
@@ -757,6 +779,24 @@ server_connection_loop(Conn, Handler) ->
                          [Other]),
             server_connection_loop(Conn, Handler)
     end.
+
+invoke_peer_settings(Module, Conn, Settings) when is_atom(Module) ->
+    _ = code:ensure_loaded(Module),
+    case erlang:function_exported(Module, handle_peer_settings, 2) of
+        true ->
+            try
+                Module:handle_peer_settings(Conn, Settings)
+            catch
+                Class:Reason:Stack ->
+                    logger:error("h2 handle_peer_settings crash: ~ts:~tp~n~tp",
+                                 [Class, Reason, Stack])
+            end,
+            ok;
+        false ->
+            ok
+    end;
+invoke_peer_settings(_Handler, _Conn, _Settings) ->
+    ok.
 
 invoke_handler(Handler, Conn, StreamId, Method, Path, Headers) when is_function(Handler, 5) ->
     Handler(Conn, StreamId, Method, Path, Headers);

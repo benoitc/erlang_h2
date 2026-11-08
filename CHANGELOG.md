@@ -2,6 +2,19 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- New `notify_peer_settings` option for clients and servers. The peer can
+  change its SETTINGS at any time, for example to turn WebTransport off, but
+  h2 applied the change without telling anyone, so an application that read
+  the settings once after connecting never saw a later value. With the option
+  on, the connection owner gets a `peer_settings` message with the current
+  settings after each SETTINGS frame from the peer, the first one included. On
+  the server, a handler module can export `handle_peer_settings/2` to receive
+  them. Off by default.
+
 ## [0.12.7] - 2026-11-07
 
 ### Security
