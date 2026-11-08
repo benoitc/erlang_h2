@@ -1,0 +1,59 @@
+name: Fetch release asset
+description: >
+  Download one asset of a GitHub release, cached by repo, tag and name. Tries
+  the release download URL, then the GitHub API asset endpoint, which is
+  served from another host and keeps working when the release URL fails.
+inputs:
+  repo:
+    description: owner/name of the repository
+    required: true
+  tag:
+    description: release tag
+    required: true
+  name:
+    description: asset file name
+    required: true
+outputs:
+  path:
+    description: local path of the downloaded asset
+    value: ${{ steps.path.outputs.path }}
+runs:
+  using: composite
+  steps:
+    - id: path
+      shell: bash
+      run: echo "path=$HOME/.cache/release-assets/${{ inputs.repo }}/${{ inputs.tag }}/${{ inputs.name }}" >> "$GITHUB_OUTPUT"
+    - id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.path.outputs.path }}
+        key: release-asset-${{ inputs.repo }}-${{ inputs.tag }}-${{ inputs.name }}
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        REPO: ${{ inputs.repo }}
+        TAG: ${{ inputs.tag }}
+        NAME: ${{ inputs.name }}
+        OUT: ${{ steps.path.outputs.path }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -u
+        mkdir -p "$(dirname "$OUT")"
+        retry=(--retry 5 --retry-all-errors --retry-delay 5)
+        auth=()
+        [ -n "$GH_TOKEN" ] && auth=(-H "Authorization: Bearer $GH_TOKEN")
+        api="https://api.github.com/repos/$REPO/releases"
+        if curl -fsSL "${retry[@]}" -o "$OUT" \
+             "https://github.com/$REPO/releases/download/$TAG/$NAME"; then
+          echo "$NAME from the release URL"
+        elif id=$(curl -fsSL "${retry[@]}" "${auth[@]}" "$api/tags/$TAG" \
+                    | jq -er --arg n "$NAME" '.assets[] | select(.name==$n) | .id') \
+             && [ -n "$id" ] \
+             && curl -fsSL "${retry[@]}" "${auth[@]}" -H "Accept: application/octet-stream" \
+                  -o "$OUT" "$api/assets/$id"; then
+          echo "$NAME from the GitHub API"
+        else
+          rm -f "$OUT"
+          echo "::error::could not download $NAME from $REPO $TAG"
+          exit 1
+        fi
