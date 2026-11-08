@@ -14,6 +14,11 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
   settings after each SETTINGS frame from the peer, the first one included. On
   the server, a handler module can export `handle_peer_settings/2` to receive
   them. Off by default.
+- New `h2:connection_info/1` reports whether a connection runs over TCP or TLS
+  and, for TLS, the negotiated version, ALPN protocol and SNI host name.
+  Applications had no way to check the TLS version, which WebTransport over
+  HTTP/2 requires (only TLS 1.3 qualifies on OTP). Works on client and server
+  connections.
 
 ## [0.12.7] - 2026-11-07
 

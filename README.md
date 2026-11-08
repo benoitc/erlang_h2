@@ -232,6 +232,21 @@ end.
 On a server, give `notify_peer_settings => true` to `h2:start_server/2` and
 export `handle_peer_settings(Conn, Settings)` from the handler module.
 
+### Check the TLS version
+
+WebTransport over HTTP/2 needs TLS 1.3 on OTP. Check it before you accept a
+session:
+
+```erlang
+case h2:connection_info(Conn) of
+    {ok, #{tls_version := 'tlsv1.3'}} -> accept_session;
+    {ok, _}                          -> h2:send_response(Conn, StreamId, 400, [])
+end.
+```
+
+The map always has `transport => tcp | ssl`; TLS connections add
+`tls_version`, `alpn` and, when the client sent one, `sni_hostname`.
+
 ## Bidirectional streaming (gRPC)
 
 A gRPC call is one HTTP/2 stream where both peers send interleaved DATA, the client half-closes with `END_STREAM` on its last DATA while still receiving, and the server ends with trailers carrying `grpc-status`. Each call runs in its own process that owns *its* stream's events without owning the connection, so many calls multiplex one connection.

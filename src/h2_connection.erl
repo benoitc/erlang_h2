@@ -26,7 +26,7 @@
 -export([send_trailers/3]).
 -export([cancel_stream/2, cancel_stream/3]).
 -export([send_goaway/1, send_goaway/2, close/1]).
--export([get_settings/1, get_peer_settings/1, peername/1]).
+-export([get_settings/1, get_peer_settings/1, peername/1, connection_info/1]).
 -export([controlling_process/2]).
 -export([verify_stream_counts/1]).
 
@@ -450,6 +450,13 @@ get_peer_settings(Conn) ->
     {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 peername(Conn) ->
     gen_statem:call(Conn, peername).
+
+%% @doc Return the connection's transport and, over TLS, the negotiated
+%% version, ALPN protocol and SNI host name. Read inside the connection process
+%% so the socket never leaves it.
+-spec connection_info(pid()) -> {ok, map()} | {error, term()}.
+connection_info(Conn) ->
+    gen_statem:call(Conn, connection_info).
 
 %% @doc Transfer ownership of the connection.
 -spec controlling_process(pid(), pid()) -> ok | {error, term()}.
@@ -3013,6 +3020,8 @@ handle_call_early(From, Request, StateName, #state{waiters = Waiters} = State) -
             {keep_state, State, [{reply, From, State#state.peer_settings}]};
         peername ->
             {keep_state, State, [{reply, From, do_peername(State)}]};
+        connection_info ->
+            {keep_state, State, [{reply, From, do_connection_info(State)}]};
         {controlling_process, NewOwner} ->
             {keep_state, swap_owner_monitor(NewOwner, State),
              [{reply, From, ok}]};
@@ -3053,6 +3062,8 @@ handle_call_common(From, Request, _StateName, State) ->
             {keep_state, State, [{reply, From, State#state.peer_settings}]};
         peername ->
             {keep_state, State, [{reply, From, do_peername(State)}]};
+        connection_info ->
+            {keep_state, State, [{reply, From, do_connection_info(State)}]};
         {controlling_process, NewOwner} ->
             {keep_state, swap_owner_monitor(NewOwner, State),
              [{reply, From, ok}]};
@@ -3066,6 +3077,33 @@ do_peername(#state{socket = Socket, transport = gen_tcp}) ->
     inet:peername(Socket);
 do_peername(#state{socket = Socket, transport = ssl}) ->
     ssl:peername(Socket).
+
+%% draft-ietf-webtrans-http2 §7 makes WebTransport depend on the TLS version,
+%% so the application needs it without getting hold of the socket.
+do_connection_info(#state{socket = undefined}) ->
+    {error, not_connected};
+do_connection_info(#state{transport = gen_tcp}) ->
+    {ok, #{transport => tcp}};
+do_connection_info(#state{socket = Socket, transport = ssl}) ->
+    case ssl:connection_information(Socket, [protocol, sni_hostname]) of
+        {ok, Items} ->
+            Info0 = #{transport => ssl},
+            Info1 = case proplists:get_value(protocol, Items) of
+                undefined -> Info0;
+                Version   -> Info0#{tls_version => Version}
+            end,
+            Info2 = case proplists:get_value(sni_hostname, Items) of
+                undefined -> Info1;
+                Sni       -> Info1#{sni_hostname => Sni}
+            end,
+            Info = case ssl:negotiated_protocol(Socket) of
+                {ok, Alpn} -> Info2#{alpn => Alpn};
+                _          -> Info2
+            end,
+            {ok, Info};
+        {error, _} = Err ->
+            Err
+    end.
 
 handle_common(info, {'EXIT', Owner, Reason}, _StateName, #state{owner = Owner} = State) ->
     {stop, {shutdown, {owner_exit, Reason}}, State};

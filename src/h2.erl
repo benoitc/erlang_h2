@@ -101,7 +101,7 @@
 -export([set_stream_handler/3, set_stream_handler/4, unset_stream_handler/2]).
 -export([goaway/1, goaway/2]).
 -export([close/1]).
--export([get_settings/1, get_peer_settings/1, peername/1]).
+-export([get_settings/1, get_peer_settings/1, peername/1, connection_info/1]).
 -export([controlling_process/2]).
 
 %% Types
@@ -951,6 +951,28 @@ get_peer_settings(Conn) ->
     {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 peername(Conn) ->
     h2_connection:peername(Conn).
+
+%% @doc Return what the connection runs over.
+%%
+%% `Info' always has `transport => tcp | ssl'. Over TLS it also has
+%% `tls_version' (for example `` 'tlsv1.3' ''), `alpn' when a protocol was
+%% negotiated, and `sni_hostname' when the client sent one. Use it to apply
+%% transport requirements such as draft-ietf-webtrans-http2 §7, which only
+%% allows WebTransport over TLS 1.3 on OTP.
+%%
+%% ```
+%% case h2:connection_info(Conn) of
+%%     {ok, #{tls_version := 'tlsv1.3'}} -> accept;
+%%     {ok, _}                          -> reject
+%% end.
+%% '''
+-spec connection_info(connection()) ->
+    {ok, #{transport := tcp | ssl,
+           tls_version => ssl:protocol_version(),
+           alpn => binary(),
+           sni_hostname => string()}} | {error, term()}.
+connection_info(Conn) ->
+    h2_connection:connection_info(Conn).
 
 %% @doc Transfer connection ownership.
 -spec controlling_process(connection(), pid()) -> ok | {error, term()}.
