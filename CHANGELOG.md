@@ -19,6 +19,13 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
   Applications had no way to check the TLS version, which WebTransport over
   HTTP/2 requires (only TLS 1.3 qualifies on OTP). Works on client and server
   connections.
+- New `report_peer_settings` option for `h2:request/3` and a new
+  `h2:send_response/5`. A WebTransport client or server must use the peer
+  settings in effect at the moment it sends the session request or the
+  response that accepts it, but reading them in a separate call could pick up
+  a different set if a SETTINGS frame arrived in between. With the option on,
+  the call that sends the headers also returns the peer settings that applied
+  when they were sent. Return values without the option are unchanged.
 
 ## [0.12.7] - 2026-11-07
 

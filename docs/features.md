@@ -69,7 +69,7 @@ h2:start_server/2,3
 h2:stop_server/1
 h2:server_port/1
 h2:serve_socket/2       %% serve a socket you accepted and handshook yourself
-h2:send_response/4
+h2:send_response/4,5    %% /5 takes #{report_peer_settings => true}
 h2:respond/5            %% combined headers+body fast path (one call, one write)
 
 %% Inspection

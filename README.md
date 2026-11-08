@@ -247,6 +247,23 @@ end.
 The map always has `transport => tcp | ssl`; TLS connections add
 `tls_version`, `alpn` and, when the client sent one, `sni_hostname`.
 
+### Use the SETTINGS in effect when you send HEADERS
+
+The session request and the response that accepts it must use the peer
+settings acknowledged at that moment. Get them from the same call:
+
+```erlang
+{ok, Sid, PeerSettings} =
+    h2:request(Conn, Headers, #{protocol => <<"webtransport">>,
+                                report_peer_settings => true}),
+
+{ok, ClientSettings} =
+    h2:send_response(Conn, StreamId, 200, [], #{report_peer_settings => true}).
+```
+
+Without the option, `h2:request/3` returns `{ok, StreamId}` and
+`h2:send_response/5` returns `ok`, as `h2:send_response/4` does.
+
 ## Bidirectional streaming (gRPC)
 
 A gRPC call is one HTTP/2 stream where both peers send interleaved DATA, the client half-closes with `END_STREAM` on its last DATA while still receiving, and the server ends with trailers carrying `grpc-status`. Each call runs in its own process that owns *its* stream's events without owning the connection, so many calls multiplex one connection.

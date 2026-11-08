@@ -87,7 +87,7 @@
 %% Server API
 -export([start_server/2, start_server/3, stop_server/1, server_port/1]).
 -export([serve_socket/2]).
--export([send_response/4]).
+-export([send_response/4, send_response/5]).
 -export([respond/5]).
 
 %% Common API
@@ -314,8 +314,11 @@ request(Conn, Headers) ->
 %%   flow_control => manual | auto   manual = receive-side backpressure (consume/3)
 %%   end_stream   => boolean()       half-close the send side immediately
 %%   protocol     => binary()        RFC 8441 Extended CONNECT
+%%   report_peer_settings => true    return `{ok, StreamId, PeerSettings}' with
+%%                                   the peer settings in effect when the
+%%                                   HEADERS were written (WebTransport §4.3.1)
 -spec request(connection(), headers(), map()) ->
-    {ok, stream_id()} | {error, term()}.
+    {ok, stream_id()} | {ok, stream_id(), h2_settings:settings()} | {error, term()}.
 request(Conn, Headers, Opts) ->
     StreamOpts = stream_opts(Opts),
     %% RFC 8441 Extended CONNECT: when `protocol` is supplied, inject the
@@ -341,7 +344,7 @@ stream_opts(Opts) ->
             {ok, Value} -> Acc#{Key => Value};
             error       -> Acc
         end
-    end, #{}, [handler, defer, flow_control]).
+    end, #{}, [handler, defer, flow_control, report_peer_settings]).
 
 %% Insert `:protocol` after the trailing pseudo-header so the block stays
 %% well-ordered (RFC 9113 §8.3: pseudo-headers must precede regular ones).
@@ -808,6 +811,23 @@ invoke_handler(Module, Conn, StreamId, Method, Path, Headers) when is_atom(Modul
     ok | {error, term()}.
 send_response(Conn, StreamId, Status, Headers) ->
     h2_connection:send_response(Conn, StreamId, Status, Headers).
+
+%% @doc Send an HTTP/2 response with options (server mode).
+%%
+%% With `#{report_peer_settings => true}' it returns `{ok, PeerSettings}': the
+%% client settings in effect when the HEADERS frame was written. A server that
+%% accepts a WebTransport session must use exactly those (draft-ietf-webtrans-
+%% http2 §4.3.1); reading them with get_peer_settings/1 in a separate call can
+%% race a SETTINGS frame. With an empty map it behaves like send_response/4.
+%%
+%% ```
+%% {ok, PeerSettings} = h2:send_response(Conn, StreamId, 200, [],
+%%                                       #{report_peer_settings => true}).
+%% '''
+-spec send_response(connection(), stream_id(), status(), headers(), map()) ->
+    ok | {ok, h2_settings:settings()} | {error, term()}.
+send_response(Conn, StreamId, Status, Headers, Opts) when is_map(Opts) ->
+    h2_connection:send_response(Conn, StreamId, Status, Headers, Opts).
 
 %% @doc Send a complete response (headers + full body) in a single call. This is
 %% the fast path for the common request/response case: one message to the

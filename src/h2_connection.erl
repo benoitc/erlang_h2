@@ -20,7 +20,7 @@
 -export([activate/1]).
 -export([wait_connected/1, wait_connected/2]).
 -export([send_request/4, send_request/5, send_request_headers/3, send_request_headers/4,
-         send_response/4, respond/5, send_data/3, send_data/4, send_data/5]).
+         send_response/4, send_response/5, respond/5, send_data/3, send_data/4, send_data/5]).
 -export([set_stream_handler/3, set_stream_handler/4, unset_stream_handler/2]).
 -export([consume/3]).
 -export([send_trailers/3]).
@@ -313,14 +313,18 @@ send_request(Conn, Method, Path, Headers, EndStream) ->
 send_request_headers(Conn, Headers, EndStream) ->
     send_request_headers(Conn, Headers, EndStream, #{}).
 
-%% @doc Send a request with a pre-built header list and per-stream options. For
+%% @doc Send a request with a pre-built header list and per-stream options.
+%% `#{report_peer_settings => true}' makes it return `{ok, StreamId,
+%% PeerSettings}', the peer settings in effect when the HEADERS were written.
+%% For
 %% gRPC bidi a dedicated call process passes `#{handler => self()}' so the
 %% stream's events route to it from creation (race-free, no owner detour), and
 %% optionally `#{flow_control => manual}' to apply receive-side backpressure.
 %% `#{defer => true}' buffers events until a later set_stream_handler/3 replays
 %% them when the handler pid is not known at creation time.
 -spec send_request_headers(pid(), [{binary(), binary()}], boolean(), map()) ->
-    {ok, non_neg_integer()} | {error, term()}.
+    {ok, non_neg_integer()} | {ok, non_neg_integer(), h2_settings:settings()}
+    | {error, term()}.
 send_request_headers(Conn, Headers, EndStream, Opts) when is_map(Opts) ->
     gen_statem:call(Conn, {send_request_headers, Headers, EndStream, Opts}).
 
@@ -349,6 +353,15 @@ unset_stream_handler(Conn, StreamId) ->
     ok | {error, term()}.
 send_response(Conn, StreamId, Status, Headers) ->
     gen_statem:call(Conn, {send_response, StreamId, Status, Headers}).
+
+%% @doc Send a response with options. `#{report_peer_settings => true}' makes
+%% it return `{ok, PeerSettings}', the peer settings in effect when the HEADERS
+%% were written; otherwise it behaves like send_response/4.
+-spec send_response(pid(), non_neg_integer(), non_neg_integer(),
+                    [{binary(), binary()}], map()) ->
+    ok | {ok, h2_settings:settings()} | {error, term()}.
+send_response(Conn, StreamId, Status, Headers, Opts) when is_map(Opts) ->
+    gen_statem:call(Conn, {send_response, StreamId, Status, Headers, Opts}).
 
 %% @doc Send a complete response (headers + full body) in one call. Returns
 %% `need_fallback' when the fast path does not apply; callers (h2:respond/5)
@@ -2407,7 +2420,11 @@ handle_send_request_headers(From, Headers, EndStream, Opts,
                         encode_context = EncCtx1,
                         next_stream_id = StreamId + 2
                     },
-                    {keep_state, State1, [{reply, From, {ok, StreamId}}]};
+                    Reply = case report_peer_settings(Opts) of
+                        true  -> {ok, StreamId, PeerSettings};
+                        false -> {ok, StreamId}
+                    end,
+                    {keep_state, State1, [{reply, From, Reply}]};
                 {error, SendReason} ->
                     {stop_and_reply,
                      {shutdown, {send_failed, SendReason}},
@@ -2441,8 +2458,12 @@ stream_opts(Opts) ->
     end,
     {Handler, DispatchMode, FlowControl}.
 
-handle_send_response(From, StreamId, Status, Headers, #state{mode = server, streams = Streams,
-                                                              encode_context = EncCtx} = State) ->
+handle_send_response(From, StreamId, Status, Headers, State) ->
+    handle_send_response(From, StreamId, Status, Headers, #{}, State).
+
+handle_send_response(From, StreamId, Status, Headers, Opts,
+                     #state{mode = server, streams = Streams,
+                            encode_context = EncCtx} = State) ->
     case maps:find(StreamId, Streams) of
         _ when Status =:= 101 ->
             %% RFC 9113 §8.6: HTTP/2 MUST NOT generate 101 Switching Protocols.
@@ -2499,7 +2520,11 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
                                 closed -> close_stream(StreamId, end_stream, State1);
                                 _      -> State1
                             end,
-                            {keep_state, State2, [{reply, From, ok}]};
+                            Reply = case report_peer_settings(Opts) of
+                                true  -> {ok, State#state.peer_settings};
+                                false -> ok
+                            end,
+                            {keep_state, State2, [{reply, From, Reply}]};
                         {error, SendReason} ->
                             {stop_and_reply,
                              {shutdown, {send_failed, SendReason}},
@@ -2515,8 +2540,15 @@ handle_send_response(From, StreamId, Status, Headers, #state{mode = server, stre
             {keep_state, State, [{reply, From, {error, unknown_stream}}]}
     end;
 
-handle_send_response(From, _StreamId, _Status, _Headers, State) ->
+handle_send_response(From, _StreamId, _Status, _Headers, _Opts, State) ->
     {keep_state, State, [{reply, From, {error, not_server}}]}.
+
+%% draft-ietf-webtrans-http2 §4.3.1: the CONNECT request and the response
+%% accepting a session must use the peer SETTINGS acknowledged at that moment.
+%% peer_settings only changes when a SETTINGS frame is applied and acked, so
+%% its value while the HEADERS are written is exactly that set.
+report_peer_settings(Opts) ->
+    maps:get(report_peer_settings, Opts, false) =:= true.
 
 %% Combined response: status + headers + full body in one gen_statem call and a
 %% single socket write (HEADERS coalesced with the DATA frame). This halves the
@@ -3041,6 +3073,8 @@ handle_stream_call(From, {consume, StreamId, ByteCount}, State) ->
     handle_consume(From, StreamId, ByteCount, State);
 handle_stream_call(From, {send_response, StreamId, Status, Headers}, State) ->
     handle_send_response(From, StreamId, Status, Headers, State);
+handle_stream_call(From, {send_response, StreamId, Status, Headers, Opts}, State) ->
+    handle_send_response(From, StreamId, Status, Headers, Opts, State);
 handle_stream_call(From, {respond, StreamId, Status, Headers, Body}, State) ->
     handle_respond(From, StreamId, Status, Headers, Body, State);
 handle_stream_call(From, {send_trailers, StreamId, Trailers}, State) ->
