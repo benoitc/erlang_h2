@@ -4,6 +4,14 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
 
 ## [Unreleased]
 
+### Added
+
+- New `h2:peercert/1` returns the TLS certificate of the other side of a
+  connection. A server built on h2 could not read the client certificate,
+  because the socket stays inside the connection, so it could not authorize
+  clients by mutual TLS. The server must ask for client certificates
+  (`verify => verify_peer` with `cacerts`) for one to be present.
+
 ### Fixed
 
 - A server stopped accepting connections as soon as the process that started

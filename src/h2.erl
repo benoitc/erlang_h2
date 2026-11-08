@@ -101,7 +101,7 @@
 -export([set_stream_handler/3, set_stream_handler/4, unset_stream_handler/2]).
 -export([goaway/1, goaway/2]).
 -export([close/1]).
--export([get_settings/1, get_peer_settings/1, peername/1, connection_info/1]).
+-export([get_settings/1, get_peer_settings/1, peername/1, peercert/1, connection_info/1]).
 -export([controlling_process/2]).
 
 %% Types
@@ -987,6 +987,26 @@ get_peer_settings(Conn) ->
     {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 peername(Conn) ->
     h2_connection:peername(Conn).
+
+%% @doc Return the peer's TLS certificate, DER-encoded.
+%%
+%% On a server connection this is the client certificate, which is only
+%% present when the server asked for one: start it with
+%% `verify => verify_peer' and the `cacerts' that sign client certificates.
+%% OTP then refuses clients without one; add
+%% `ssl_opts => [{fail_if_no_peer_cert, false}]' to let them in.
+%% Returns `{error, no_peercert}' when the peer sent no certificate or the
+%% connection is cleartext.
+%%
+%% ```
+%% case h2:peercert(Conn) of
+%%     {ok, Der}               -> public_key:pkix_decode_cert(Der, otp);
+%%     {error, no_peercert}    -> anonymous
+%% end.
+%% '''
+-spec peercert(connection()) -> {ok, binary()} | {error, term()}.
+peercert(Conn) ->
+    h2_connection:peercert(Conn).
 
 %% @doc Return what the connection runs over.
 %%

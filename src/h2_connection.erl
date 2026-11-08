@@ -26,7 +26,7 @@
 -export([send_trailers/3]).
 -export([cancel_stream/2, cancel_stream/3]).
 -export([send_goaway/1, send_goaway/2, close/1]).
--export([get_settings/1, get_peer_settings/1, peername/1, connection_info/1]).
+-export([get_settings/1, get_peer_settings/1, peername/1, peercert/1, connection_info/1]).
 -export([controlling_process/2]).
 -export([verify_stream_counts/1]).
 
@@ -468,6 +468,12 @@ get_peer_settings(Conn) ->
     {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 peername(Conn) ->
     gen_statem:call(Conn, peername).
+
+%% @doc Return the peer's TLS certificate (DER). `{error, no_peercert}' when
+%% the peer sent none or the connection is not TLS.
+-spec peercert(pid()) -> {ok, binary()} | {error, term()}.
+peercert(Conn) ->
+    gen_statem:call(Conn, peercert).
 
 %% @doc Return the connection's transport and, over TLS, the negotiated
 %% version, ALPN protocol and SNI host name. Read inside the connection process
@@ -3063,6 +3069,8 @@ handle_call_early(From, Request, StateName, #state{waiters = Waiters} = State) -
             {keep_state, State, [{reply, From, State#state.peer_settings}]};
         peername ->
             {keep_state, State, [{reply, From, do_peername(State)}]};
+        peercert ->
+            {keep_state, State, [{reply, From, do_peercert(State)}]};
         connection_info ->
             {keep_state, State, [{reply, From, do_connection_info(State)}]};
         {controlling_process, NewOwner} ->
@@ -3107,6 +3115,8 @@ handle_call_common(From, Request, _StateName, State) ->
             {keep_state, State, [{reply, From, State#state.peer_settings}]};
         peername ->
             {keep_state, State, [{reply, From, do_peername(State)}]};
+        peercert ->
+            {keep_state, State, [{reply, From, do_peercert(State)}]};
         connection_info ->
             {keep_state, State, [{reply, From, do_connection_info(State)}]};
         {controlling_process, NewOwner} ->
@@ -3122,6 +3132,13 @@ do_peername(#state{socket = Socket, transport = gen_tcp}) ->
     inet:peername(Socket);
 do_peername(#state{socket = Socket, transport = ssl}) ->
     ssl:peername(Socket).
+
+do_peercert(#state{socket = undefined}) ->
+    {error, not_connected};
+do_peercert(#state{transport = gen_tcp}) ->
+    {error, no_peercert};
+do_peercert(#state{socket = Socket, transport = ssl}) ->
+    ssl:peercert(Socket).
 
 %% draft-ietf-webtrans-http2 §7 makes WebTransport depend on the TLS version,
 %% so the application needs it without getting hold of the socket.

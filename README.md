@@ -328,6 +328,35 @@ end.
 
 The message framing (the 5-byte length prefix and protobuf) is the application's concern; h2 carries the HTTP/2 stream, flow control, and trailers. See `test/h2_grpc_tests.erl` for a full loopback example and `test/h2_grpc_interop_SUITE.erl` / `test/h2_grpc_client_interop_SUITE.erl` for interop against real gRPC peers.
 
+## Client certificates (mutual TLS)
+
+Use this when a handler authorizes clients by their TLS certificate. Ask for
+client certificates when you start the server, then read the certificate from
+the connection:
+
+```erlang
+{ok, Server} = h2:start_server(8443, #{
+    cert    => "server.pem",
+    key     => "server-key.pem",
+    verify  => verify_peer,
+    cacerts => [ClientCaDer],
+    %% let clients without a certificate in, as anonymous
+    ssl_opts => [{fail_if_no_peer_cert, false}],
+    handler => fun(Conn, StreamId, _Method, _Path, _Headers) ->
+        Status = case h2:peercert(Conn) of
+            {ok, _Der}           -> 200;
+            {error, no_peercert} -> 403
+        end,
+        h2:send_response(Conn, StreamId, Status, []),
+        h2:send_data(Conn, StreamId, <<>>, true)
+    end
+}).
+```
+
+`h2:peercert/1` returns the DER certificate, or `{error, no_peercert}` when
+the client sent none or the connection is cleartext. On a client connection it
+returns the server's certificate.
+
 ## Using with Ranch
 
 The built-in `h2:start_server/2` runs its own acceptor pool. To plug into an existing Ranch listener instead, hand the accepted socket to `h2:serve_socket/2`. A minimal Ranch protocol module:

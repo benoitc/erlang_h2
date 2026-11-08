@@ -76,6 +76,7 @@ h2:respond/5            %% combined headers+body fast path (one call, one write)
 h2:get_settings/1
 h2:get_peer_settings/1
 h2:peername/1
+h2:peercert/1           %% peer TLS certificate (DER)
 h2:connection_info/1    %% transport, TLS version, ALPN, SNI
 ```
 
