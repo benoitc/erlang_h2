@@ -12,6 +12,15 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
   clients by mutual TLS. The server must ask for client certificates
   (`verify => verify_peer` with `cacerts`) for one to be present.
 
+### Fixed
+
+- A server stopped accepting connections as soon as the process that started
+  it exited. The listen socket stayed tied to that process, so starting a
+  server from a short-lived process (an `rpc:call`, a setup script, a test
+  fixture) left it running but refusing every new connection. The server now
+  owns its socket and keeps serving. `h2:stop_server/1` now also waits until
+  the server is fully stopped before returning.
+
 ## [0.13.0] - 2026-11-08
 
 ### Security
