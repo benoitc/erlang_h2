@@ -16,7 +16,7 @@ Add to `rebar.config`:
 
 ```erlang
 {deps, [
-    {h2, "0.12.7", {git, "https://github.com/benoitc/erlang_h2.git", {tag, "0.12.7"}}}
+    {h2, "0.13.0", {git, "https://github.com/benoitc/erlang_h2.git", {tag, "0.13.0"}}}
 ]}.
 ```
 
