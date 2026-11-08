@@ -14,10 +14,13 @@ jobs:
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '29.0'
-          rebar3-version: '3.25.0'
+          install-rebar: false
+      - uses: ./.github/actions/setup-rebar3
+        with:
+          version: '3.28.0'
       - name: Install h2spec
         run: |
-          curl -sSL -o /tmp/h2spec.tar.gz \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/h2spec.tar.gz \
             https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz
           tar -xzf /tmp/h2spec.tar.gz -C /usr/local/bin h2spec
           h2spec --version
@@ -35,7 +38,10 @@ jobs:
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '29.0'
-          rebar3-version: '3.25.0'
+          install-rebar: false
+      - uses: ./.github/actions/setup-rebar3
+        with:
+          version: '3.28.0'
       - name: Install grpcurl
         run: |
           curl -sSL -o /tmp/grpcurl.tar.gz \
@@ -56,7 +62,10 @@ jobs:
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '29.0'
-          rebar3-version: '3.25.0'
+          install-rebar: false
+      - uses: ./.github/actions/setup-rebar3
+        with:
+          version: '3.28.0'
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
