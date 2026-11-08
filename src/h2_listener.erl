@@ -1,6 +1,6 @@
 %% @doc Listener process: owns the listen socket and supervises the
-%% acceptor pool. Runs under `h2_sup' so the listener outlives the
-%% process that called `h2:start_server/2'.
+%% acceptor pool. Runs under `h2_sup', and `h2:start_server/2' hands it the
+%% listen socket, so the server outlives the process that started it.
 -module(h2_listener).
 
 -export([start_link/1, stop/2]).
@@ -19,10 +19,18 @@
 start_link(Args) ->
     proc_lib:start_link(?MODULE, init, [self(), Args]).
 
+%% @doc Stop the listener and wait until it is gone, so the listen socket is
+%% closed when this returns. Safe to call on a listener that already exited.
 -spec stop(pid(), reference()) -> ok.
 stop(Pid, Ref) ->
+    MRef = erlang:monitor(process, Pid),
     Pid ! {stop, Ref},
-    ok.
+    receive
+        {'DOWN', MRef, process, Pid, _} -> ok
+    after 5000 ->
+        exit(Pid, kill),
+        receive {'DOWN', MRef, process, Pid, _} -> ok end
+    end.
 
 init(Parent, #{transport := Transport,
                listen_socket := ListenSocket,

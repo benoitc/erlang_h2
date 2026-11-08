@@ -422,20 +422,14 @@ start_server_ssl(Port, Opts) ->
                         conn_opts => conn_opts(Opts),
                         ref => Ref
                     },
-                    case h2_sup:start_listener(#{
+                    start_listener(ssl, ListenSocket, BoundPort, Ref, #{
                         transport => ssl,
                         listen_socket => ListenSocket,
                         acceptor_count => NumAcceptors,
                         ref => Ref,
                         acceptor_fun => fun(S) -> acceptor_loop(S) end,
                         server_state => ServerState
-                    }) of
-                        {ok, ListenerPid} ->
-                            {ok, {ListenerPid, Ref, BoundPort}};
-                        {error, StartReason} ->
-                            _ = ssl:close(ListenSocket),
-                            {error, StartReason}
-                    end;
+                    });
                 {error, Reason} ->
                     {error, {listen_failed, Reason}}
             end
@@ -500,20 +494,14 @@ start_server_tcp(Port, Opts) ->
                         conn_opts => conn_opts(Opts),
                         ref => Ref
                     },
-                    case h2_sup:start_listener(#{
+                    start_listener(tcp, ListenSocket, BoundPort, Ref, #{
                         transport => tcp,
                         listen_socket => ListenSocket,
                         acceptor_count => NumAcceptors,
                         ref => Ref,
                         acceptor_fun => fun(S) -> tcp_acceptor_loop(S) end,
                         server_state => ServerState
-                    }) of
-                        {ok, ListenerPid} ->
-                            {ok, {ListenerPid, Ref, BoundPort}};
-                        {error, StartReason} ->
-                            _ = gen_tcp:close(ListenSocket),
-                            {error, StartReason}
-                    end;
+                    });
                 {error, Reason} ->
                     {error, {listen_failed, Reason}}
             end;
@@ -521,7 +509,35 @@ start_server_tcp(Port, Opts) ->
             {error, {missing_required_option, [handler]}}
     end.
 
+%% Start the listener under h2_sup and hand it the listen socket. The socket
+%% is opened in the caller, so without the transfer it would close as soon as
+%% the caller exits and the server would refuse every new connection.
+start_listener(Transport, ListenSocket, BoundPort, Ref, ListenerArgs) ->
+    case h2_sup:start_listener(ListenerArgs) of
+        {ok, ListenerPid} ->
+            case listen_controlling_process(Transport, ListenSocket, ListenerPid) of
+                ok ->
+                    {ok, {ListenerPid, Ref, BoundPort}};
+                {error, Reason} ->
+                    ok = h2_listener:stop(ListenerPid, Ref),
+                    close_listen_socket(Transport, ListenSocket),
+                    {error, {controlling_process_failed, Reason}}
+            end;
+        {error, StartReason} ->
+            close_listen_socket(Transport, ListenSocket),
+            {error, StartReason}
+    end.
+
+listen_controlling_process(ssl, Socket, Pid) -> ssl:controlling_process(Socket, Pid);
+listen_controlling_process(tcp, Socket, Pid) -> gen_tcp:controlling_process(Socket, Pid).
+
+close_listen_socket(ssl, Socket) -> _ = ssl:close(Socket), ok;
+close_listen_socket(tcp, Socket) -> _ = gen_tcp:close(Socket), ok.
+
 %% @doc Stop an HTTP/2 server.
+%%
+%% Closes the listen socket and the server's connections, from any process,
+%% and returns once the listener is gone.
 -spec stop_server(server_ref()) -> ok.
 stop_server({ListenerPid, Ref, _Port}) ->
     h2_listener:stop(ListenerPid, Ref).
@@ -1029,6 +1045,25 @@ load_file(Path) when is_binary(Path) -> binary_to_list(Path).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+%% A listen socket that cannot be handed to the listener (here: already
+%% closed) fails the start and leaves no listener behind.
+start_listener_transfer_failure_test() ->
+    {ok, _} = application:ensure_all_started(h2),
+    Before = length(supervisor:which_children(h2_sup)),
+    {ok, LSock} = gen_tcp:listen(0, [binary, {active, false}]),
+    ok = gen_tcp:close(LSock),
+    Ref = make_ref(),
+    Result = start_listener(tcp, LSock, 0, Ref, #{
+        transport => tcp,
+        listen_socket => LSock,
+        acceptor_count => 1,
+        ref => Ref,
+        acceptor_fun => fun(_) -> receive after infinity -> ok end end,
+        server_state => #{}
+    }),
+    ?assertEqual({error, {controlling_process_failed, closed}}, Result),
+    ?assertEqual(Before, length(supervisor:which_children(h2_sup))).
 
 merge_opts_test() ->
     Default = [{a, 1}, {b, 2}],
