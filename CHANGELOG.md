@@ -20,6 +20,10 @@ All notable changes to `h2` are documented here. This project follows [Semantic 
   fixture) left it running but refusing every new connection. The server now
   owns its socket and keeps serving. `h2:stop_server/1` now also waits until
   the server is fully stopped before returning.
+- Stopping the application, or the supervisor shutting a server down, took
+  5 seconds per server: the listener ignored the shutdown request and kept its
+  socket open until it was killed. It now closes the socket and exits right
+  away.
 
 ## [0.13.0] - 2026-11-08
 
