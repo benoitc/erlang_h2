@@ -53,6 +53,10 @@
 %% second; exceeding the limit triggers GOAWAY(ENHANCE_YOUR_CALM).
 -define(PING_FLOOD_LIMIT_PER_SEC, 20).
 -define(RST_FLOOD_LIMIT_PER_SEC, 100).
+%% SETTINGS flood (CVE-2019-9515): each peer SETTINGS frame costs an ACK
+%% write, a merge and a pass over every stream's window. A real peer sends one
+%% at the preface and rarely another, so cap them like PING.
+-define(SETTINGS_FLOOD_LIMIT_PER_SEC, 20).
 %% MadeYouReset (CVE-2025-8671): a peer can keep breaking the protocol so that
 %% *we* reset the stream, which frees its MAX_CONCURRENT_STREAMS slot while the
 %% handler keeps running — bypassing the concurrency limit. The client-side RST
@@ -242,6 +246,7 @@
     %% `erlang:monotonic_time(second)` for the current second.
     ping_flood = {0, 0} :: {integer(), non_neg_integer()},
     rst_flood  = {0, 0} :: {integer(), non_neg_integer()},
+    settings_flood = {0, 0} :: {integer(), non_neg_integer()},
     %% {BucketSec, Count} of RST_STREAM frames we sent for peer protocol
     %% errors this second. MadeYouReset (CVE-2025-8671) budget.
     sent_rst_flood = {0, 0} :: {integer(), non_neg_integer()}
@@ -955,7 +960,10 @@ handle_frame(_StateName, {continuation, StreamId, _, _}, #state{expecting_contin
     {error, protocol_error, State};
 
 handle_frame(_StateName, {settings, Settings}, State) ->
-    handle_settings(Settings, State);
+    case bump_flood_counter(settings, State) of
+        {ok, State1} -> handle_settings(Settings, State1);
+        flood        -> {error, enhance_your_calm, State}
+    end;
 
 handle_frame(_StateName, {settings_ack}, #state{pending_settings = [Pending|Rest]} = State) ->
     %% Apply our pending settings
@@ -2141,23 +2149,26 @@ recently_closed_reason(StreamId, #state{closed_reasons = Reasons}) ->
 bump_flood_counter(Kind, State) ->
     Now = erlang:monotonic_time(second),
     {Bucket, Count} = case Kind of
-        ping -> State#state.ping_flood;
-        rst  -> State#state.rst_flood
+        ping     -> State#state.ping_flood;
+        rst      -> State#state.rst_flood;
+        settings -> State#state.settings_flood
     end,
     {NewBucket, NewCount} = case Bucket =:= Now of
         true  -> {Bucket, Count + 1};
         false -> {Now, 1}
     end,
     Limit = case Kind of
-        ping -> ?PING_FLOOD_LIMIT_PER_SEC;
-        rst  -> ?RST_FLOOD_LIMIT_PER_SEC
+        ping     -> ?PING_FLOOD_LIMIT_PER_SEC;
+        rst      -> ?RST_FLOOD_LIMIT_PER_SEC;
+        settings -> ?SETTINGS_FLOOD_LIMIT_PER_SEC
     end,
     case NewCount > Limit of
         true  -> flood;
         false ->
             State1 = case Kind of
-                ping -> State#state{ping_flood = {NewBucket, NewCount}};
-                rst  -> State#state{rst_flood  = {NewBucket, NewCount}}
+                ping     -> State#state{ping_flood = {NewBucket, NewCount}};
+                rst      -> State#state{rst_flood  = {NewBucket, NewCount}};
+                settings -> State#state{settings_flood = {NewBucket, NewCount}}
             end,
             {ok, State1}
     end.
