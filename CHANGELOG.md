@@ -2,6 +2,18 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.15.0] - 2026-11-08
+
+### Added
+
+- New client option `notify_stream_available`. When a request was refused
+  because the server's limit on concurrent streams was reached, the connection
+  now tells its owner once when a new request fits again, either because one of
+  your streams ended or because the server raised its limit. Before, you could
+  only poll, and you never learned about a raised limit. This lets a client
+  queue requests instead of failing them. Off by default; nothing changes
+  without it.
+
 ## [0.14.0] - 2026-11-08
 
 ### Added

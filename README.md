@@ -16,7 +16,7 @@ Add to `rebar.config`:
 
 ```erlang
 {deps, [
-    {h2, "0.14.0", {git, "https://github.com/benoitc/erlang_h2.git", {tag, "0.14.0"}}}
+    {h2, "0.15.0", {git, "https://github.com/benoitc/erlang_h2.git", {tag, "0.15.0"}}}
 ]}.
 ```
 
@@ -61,6 +61,7 @@ Options to `h2:connect/3`:
   verify       => verify_peer | verify_none,
   cacerts      => [binary()],
   settings     => h2_settings:settings(),
+  notify_stream_available => boolean(), %% default: false
   timeout      => timeout()}
 ```
 
@@ -71,6 +72,43 @@ Send a request body in chunks:
 ok = h2:send_data(Conn, Sid, Chunk1, false),
 ok = h2:send_data(Conn, Sid, Chunk2, true).   %% last chunk: EndStream = true
 ```
+
+### Wait for a free stream slot
+
+The server caps how many streams you may have open at once
+(SETTINGS_MAX_CONCURRENT_STREAMS). At the cap, `h2:request/4,5` and
+`h2:request/3` return `{error, max_streams_exceeded}`. Use
+`notify_stream_available => true` when you want to queue the request and retry
+instead of failing it.
+
+After a refusal, the connection sends `{h2, Conn, stream_available}` once, the
+first time a slot frees: one of your streams ends, or the server raises its
+limit. Nothing is sent if no request was refused, or after a GOAWAY.
+
+```erlang
+{ok, Conn} = h2:connect("example.com", 443, #{notify_stream_available => true}).
+```
+
+```erlang
+request(Conn, Headers) ->
+    case h2:request(Conn, <<"GET">>, <<"/">>, Headers) of
+        {error, max_streams_exceeded} ->
+            receive
+                {h2, Conn, stream_available} -> request(Conn, Headers);
+                {h2, Conn, {goaway, _, _}} -> {error, goaway}
+            end;
+        Other ->
+            Other
+    end.
+```
+
+Notes:
+
+- Another process using the same connection can take the slot first, so the
+  retry can be refused again. That refusal arms the next notice.
+- If the server lowers its limit below the number of open streams, the notice
+  waits until enough streams have ended.
+- Timeouts and the queue of waiting requests are yours to manage.
 
 ## Server
 
