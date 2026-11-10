@@ -581,12 +581,13 @@ terminate(Reason, _StateName, #state{socket = Socket, transport = Transport, goa
         true ->
             ok
     end,
-    Transport:close(Socket),
     %% Notify owner exactly once that the connection is gone.
     PeeledReason = peel_reason(Reason),
     notify_owner({h2, self(), {closed, PeeledReason}}, State),
     %% Also tell each per-stream handler so a bidi call process can clean up.
     notify_all_handlers({closed, PeeledReason}, State),
+    %% Close last, so a slow close never delays the notifications above.
+    close_socket(Transport, Socket),
     ok.
 
 code_change(_OldVsn, StateName, State, _Extra) ->
@@ -858,8 +859,16 @@ closing(info, {ssl_closed, Socket}, #state{socket = Socket} = State) ->
 closing(info, {timeout, Timer, close_timeout}, #state{close_timer = Timer} = State) ->
     {stop, {shutdown, close_timeout}, State};
 
+closing(info, {tcp, Socket, _Data}, #state{socket = Socket} = State) ->
+    %% Drop incoming data, but keep reading: the socket is {active, once},
+    %% so without re-arming it the peer's close would never be seen and the
+    %% connection would wait for close_timeout.
+    _ = set_active(gen_tcp, Socket),
+    {keep_state, State};
+closing(info, {ssl, Socket, _Data}, #state{socket = Socket} = State) ->
+    _ = set_active(ssl, Socket),
+    {keep_state, State};
 closing(info, {tcp, _Socket, _Data}, State) ->
-    %% Ignore incoming data
     {keep_state, State};
 closing(info, {ssl, _Socket, _Data}, State) ->
     {keep_state, State};
@@ -3601,6 +3610,18 @@ shutdown_write(gen_tcp, Socket) ->
     gen_tcp:shutdown(Socket, write);
 shutdown_write(ssl, Socket) ->
     ssl:shutdown(Socket, write).
+
+%% In the server role, ssl:close/1 sends close_notify, then waits up to 5 s
+%% for a silent peer to close TCP. The connection reads nothing more, so
+%% shutdown/2 sends close_notify and closes both directions, and close/1 then
+%% returns without waiting. gen_tcp:close/1 does not block.
+close_socket(gen_tcp, Socket) ->
+    _ = gen_tcp:close(Socket),
+    ok;
+close_socket(ssl, Socket) ->
+    _ = ssl:shutdown(Socket, read_write),
+    _ = ssl:close(Socket),
+    ok.
 
 %% Stop the gen_statem with Reason, replying {error, Reason} to any waiters
 %% that called wait_connected before we reached the connected state.
