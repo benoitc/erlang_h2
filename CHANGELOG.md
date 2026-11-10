@@ -2,6 +2,19 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- When the other side of a connection went away, stream handlers and the
+  owner could learn it only about five seconds later. A server closing a TLS
+  connection waited for the client to answer, and a connection that had
+  stopped on a protocol error stopped watching the socket after the next bytes
+  arrived, so it noticed the close only when its five second timer fired. The
+  owner and stream handlers are now told before the socket is closed, the TLS
+  close no longer waits for the peer, and a closing connection keeps watching
+  for the peer to close.
+
 ## [0.15.0] - 2026-11-08
 
 ### Added
