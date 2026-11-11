@@ -135,6 +135,10 @@
     %% `{h2, Conn, stream_available}' to the owner once, the first time a
     %% stream slot frees. Default false.
     notify_stream_available => boolean(),
+    %% The most body bytes one response may carry. A response that declares
+    %% or sends more is cancelled, and its stream gets
+    %% `{stream_reset, StreamId, body_too_large}'. Default infinity.
+    max_body_size => pos_integer() | infinity,
     timeout => timeout(),
     connect_timeout => timeout(),
     sync => boolean()
@@ -161,6 +165,11 @@
     settings => h2_settings:settings(),
     %% Connection-level receive window shared by all streams. Default 65535.
     connection_window_size => 65535..2147483647,
+    %% The most body bytes one request may carry. A request that declares
+    %% more is answered 413 before the handler sees it; one that sends more
+    %% is answered 413 if no response has started, and its handler gets
+    %% `{stream_reset, StreamId, body_too_large}'. Default infinity.
+    max_body_size => pos_integer() | infinity,
     acceptors => pos_integer(),
     %% RFC 8441: when true, advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1 and
     %% accept Extended CONNECT requests carrying the `:protocol` pseudo-header.
@@ -252,7 +261,7 @@ connect_tcp(Host, Port, Opts, Timeout) ->
 
 start_connection(Mode, Socket, Opts) ->
     ConnOpts = maps:with([settings, connection_window_size, notify_peer_settings,
-                          notify_stream_available], Opts),
+                          notify_stream_available, max_body_size], Opts),
     Timeout = maps:get(timeout, Opts, ?DEFAULT_TIMEOUT_MS),
     case h2_connection:start_link(Mode, Socket, ConnOpts) of
         {ok, Pid} ->
@@ -718,7 +727,8 @@ accept_handshake(Socket, Handler, ConnOpts) ->
 %% truth for both the built-in acceptor path and serve_socket/2, so the two
 %% cannot drift.
 conn_opts(Opts) ->
-    maps:merge(maps:with([connection_window_size, notify_peer_settings], Opts),
+    maps:merge(maps:with([connection_window_size, notify_peer_settings,
+                          max_body_size], Opts),
                #{settings => maps:get(settings, Opts, #{}),
                  enable_connect_protocol => maps:get(enable_connect_protocol, Opts, false)}).
 
