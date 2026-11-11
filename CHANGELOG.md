@@ -2,7 +2,7 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.17.0] - 2026-11-11
 
 ### Fixed
 
