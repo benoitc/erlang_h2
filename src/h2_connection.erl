@@ -140,9 +140,14 @@
     expected_body_length :: undefined | non_neg_integer(),
     received_body_length = 0 :: non_neg_integer(),
     body_forbidden = false :: boolean(),
-    %% Set once the client's initial (2xx+) response HEADERS has been dispatched.
-    %% Interim 1xx responses do NOT set this; subsequent HEADERS after it are trailers.
+    %% Set once the final (2xx+) response HEADERS has been dispatched (client)
+    %% or sent (server). Interim 1xx responses do NOT set this; on the client,
+    %% subsequent HEADERS after it are trailers.
     response_seen_final = false :: boolean(),
+    %% Server: a final response that has no content (HEAD, 204, 304; RFC 9110
+    %% §6.4.1) went out and ended the stream on its HEADERS. Later send_data
+    %% and send_trailers succeed and send nothing.
+    no_content_sent = false :: boolean(),
     %% Request method, captured server-side to decide body-forbidden and tunnel rules.
     request_method :: undefined | binary(),
     %% RFC 8441: Extended CONNECT protocol token (e.g. <<"websocket">>).
@@ -202,7 +207,9 @@
     closed_streams = queue:new() :: queue:queue(non_neg_integer()),
     closed_streams_count = 0 :: non_neg_integer(),
     %% Longer-lived compact id → reason map. Survives eviction from `streams`.
-    closed_reasons = #{} :: #{non_neg_integer() => end_stream | rst},
+    %% no_content: closed by END_STREAM after a no-content response was sent;
+    %% classified as end_stream everywhere (see recently_closed_reason/2).
+    closed_reasons = #{} :: #{non_neg_integer() => end_stream | no_content | rst},
     closed_reasons_q = queue:new() :: queue:queue(non_neg_integer()),
     closed_reasons_count = 0 :: non_neg_integer(),
     next_stream_id :: non_neg_integer(),  % 1 for client, 2 for server
@@ -2199,7 +2206,15 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
                             {ok, connected,
                              too_large(StreamId, Stream, true, State0a)};
                         BodyViolation ->
-                            State0b = sent_rst(StreamId, protocol_error, State0a),
+                            %% RFC 9113 §8.1.1: malformed message. The bytes
+                            %% are never delivered; the owner (or stream
+                            %% handler), which has seen the request or
+                            %% response, is told the stream failed.
+                            State0r = dispatch_stream_event(
+                                        StreamId,
+                                        {stream_reset, StreamId, protocol_error},
+                                        State0a),
+                            State0b = sent_rst(StreamId, protocol_error, State0r),
                             State1 = close_stream(StreamId, rst, State0b),
                             {ok, connected, State1};
                         true ->
@@ -2265,7 +2280,15 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
 %% beyond the closed_reasons retention window; callers fall back to
 %% `in_closed_stream_range/2`.
 recently_closed_reason(StreamId, #state{closed_reasons = Reasons}) ->
-    maps:get(StreamId, Reasons, unknown).
+    case maps:get(StreamId, Reasons, unknown) of
+        no_content -> end_stream;
+        Reason     -> Reason
+    end.
+
+%% True when StreamId was closed after a no-content response was sent and its
+%% record has since been evicted from the streams map.
+closed_no_content(StreamId, #state{closed_reasons = Reasons}) ->
+    maps:get(StreamId, Reasons, unknown) =:= no_content.
 
 %% Fallback heuristic for stream ids evicted from the closed-streams FIFO.
 %% Treats both peer-initiated ids (up to last_peer_stream_id) and our own
@@ -2575,6 +2598,9 @@ handle_send_response(From, StreamId, Status, Headers, Opts,
         _ when Status =:= 101 ->
             %% RFC 9113 §8.6: HTTP/2 MUST NOT generate 101 Switching Protocols.
             {keep_state, State, [{reply, From, {error, status_101_forbidden}}]};
+        {ok, #stream{response_seen_final = true}} when Status < 200 ->
+            %% RFC 9110 §15.2: interim responses precede the final one.
+            {keep_state, State, [{reply, From, {error, final_response_sent}}]};
         {ok, #stream{state = StreamState, request_method = ReqMethod} = Stream}
           when StreamState == open; StreamState == half_closed_remote ->
             %% RFC 7540 §8.3: a CONNECT 2xx response MUST NOT carry
@@ -2589,7 +2615,8 @@ handle_send_response(From, StreamId, Status, Headers, Opts,
                      [{reply, From, {error, banned_header_in_tunnel_response}}]};
                 false ->
                     StatusBin = integer_to_binary(Status),
-                    AllHeaders = [{<<":status">>, StatusBin} | Headers],
+                    AllHeaders = [{<<":status">>, StatusBin}
+                                  | outbound_response_headers(Status, Headers)],
                     case validate_outbound_response(AllHeaders) of
                         {error, _} = Err ->
                             {keep_state, State, [{reply, From, Err}]};
@@ -2599,16 +2626,16 @@ handle_send_response(From, StreamId, Status, Headers, Opts,
                             {keep_state, State, [{reply, From, SErr}]};
                         ok ->
                     {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
-                    %% RFC 9110 §9.3.2 / §15.4: body-forbidden responses
-                    %% (HEAD / 204 / 304) terminate at the header block —
-                    %% end the stream here so later send_data is a no-op
-                    %% on the wire and the peer's stream state matches ours.
-                    BodyForbidden = ReqMethod =:= <<"HEAD">>
-                                    orelse Status =:= 204 orelse Status =:= 304,
-                    case send_header_block(StreamId, HeaderBlock, BodyForbidden, State) of
+                    %% RFC 9110 §6.4.1: a final response with no content
+                    %% (HEAD / 204 / 304) terminates at the header block.
+                    %% End the stream here; later send_data and send_trailers
+                    %% then succeed without touching the wire. A 1xx never
+                    %% ends the stream, even on HEAD.
+                    NoContent = no_content_status(ReqMethod, Status),
+                    case send_header_block(StreamId, HeaderBlock, NoContent, State) of
                         ok ->
                             NewTunnel = IsConnectRequest andalso IsSuccess,
-                            NewState = case BodyForbidden of
+                            NewState = case NoContent of
                                 true ->
                                     case StreamState of
                                         open -> half_closed_local;
@@ -2617,9 +2644,13 @@ handle_send_response(From, StreamId, Status, Headers, Opts,
                                 false ->
                                     StreamState
                             end,
+                            %% body_forbidden is left alone: it guards the
+                            %% inbound request body, which an early 204 does
+                            %% not forbid.
                             Stream1 = Stream#stream{response_headers = AllHeaders,
                                                     tunnel = NewTunnel,
-                                                    body_forbidden = BodyForbidden,
+                                                    response_seen_final = Status >= 200,
+                                                    no_content_sent = NoContent,
                                                     state = NewState},
                             State0 = put_stream(StreamId, Stream1, State),
                             State1 = State0#state{encode_context = EncCtx1},
@@ -2668,12 +2699,17 @@ handle_respond(From, StreamId, Status, Headers, Body,
                       conn_window_size = ConnWindow,
                       peer_max_frame_size = MaxFrameSize} = State) ->
     case maps:find(StreamId, Streams) of
+        _ when Status >= 100, Status < 200, Status =/= 101 ->
+            %% respond/5 sends a complete response; a 1xx is interim and
+            %% goes through send_response/4 (RFC 9110 §15.2).
+            {keep_state, State, [{reply, From, {error, informational_status}}]};
         {ok, #stream{state = St, request_method = ReqMethod,
                      window_size = StreamWindow} = Stream}
           when (St == open orelse St == half_closed_remote)
                andalso Status =/= 101
                andalso ReqMethod =/= <<"CONNECT">> ->
-            AllHeaders = [{<<":status">>, integer_to_binary(Status)} | Headers],
+            AllHeaders = [{<<":status">>, integer_to_binary(Status)}
+                          | outbound_response_headers(Status, Headers)],
             case validate_outbound_response(AllHeaders) of
                 {error, _} = Err ->
                     {keep_state, State, [{reply, From, Err}]};
@@ -2683,18 +2719,19 @@ handle_respond(From, StreamId, Status, Headers, Body,
                     {keep_state, State, [{reply, From, SErr}]};
                 ok ->
             {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
-            BodyForbidden = ReqMethod =:= <<"HEAD">>
-                            orelse Status =:= 204 orelse Status =:= 304,
+            NoContent = no_content_status(ReqMethod, Status),
             HeadersFit = byte_size(HeaderBlock) =< MaxFrameSize,
             BodySize = byte_size(Body),
             if
-                %% Headers-only end-of-stream (body forbidden, or empty body).
-                %% send_header_block also handles CONTINUATION for big blocks.
-                BodyForbidden orelse BodySize =:= 0 ->
+                %% Headers-only end-of-stream (no-content response, whose body
+                %% is dropped, or empty body). send_header_block also handles
+                %% CONTINUATION for big blocks.
+                NoContent orelse BodySize =:= 0 ->
                     case send_header_block(StreamId, HeaderBlock, true, State) of
                         ok ->
-                            finish_respond(From, StreamId, Stream, AllHeaders,
-                                           EncCtx1, St, 0, State);
+                            finish_respond(From, StreamId,
+                                           Stream#stream{no_content_sent = NoContent},
+                                           AllHeaders, EncCtx1, St, 0, State);
                         {error, R} ->
                             {stop_and_reply, {shutdown, {send_failed, R}},
                              [{reply, From, {error, R}}], State}
@@ -2747,6 +2784,7 @@ finish_respond(From, StreamId, #stream{window_size = StreamWindow} = Stream,
         half_closed_remote -> closed
     end,
     Stream1 = Stream#stream{response_headers = AllHeaders, state = NewSt,
+                            response_seen_final = true,
                             window_size = StreamWindow - BodySize},
     State0 = put_stream(StreamId, Stream1, State),
     State1 = State0#state{encode_context = EncCtx1,
@@ -2797,6 +2835,19 @@ data_frames(StreamId, Bin, MaxFrameSize, End) ->
     <<Chunk:MaxFrameSize/binary, Rest/binary>> = Bin,
     [h2_frame:encode_iodata({data, StreamId, Chunk, false})
      | data_frames(StreamId, Rest, MaxFrameSize, End)].
+
+%% RFC 9110 §6.4.1: a final response to HEAD, and any 204 or 304, has no
+%% content. A 1xx is interim and never ends the stream (§15.2).
+no_content_status(ReqMethod, Status) ->
+    Status >= 200 andalso
+        (ReqMethod =:= <<"HEAD">> orelse Status =:= 204 orelse Status =:= 304).
+
+%% RFC 9110 §8.6: a server MUST NOT send Content-Length in a 1xx or 204
+%% response. Drop it if the caller set one; 304 and HEAD keep theirs.
+outbound_response_headers(Status, Headers) when Status < 200; Status =:= 204 ->
+    [H || {Name, _} = H <- Headers, Name =/= <<"content-length">>];
+outbound_response_headers(_Status, Headers) ->
+    Headers.
 
 %% RFC 7540 §8.3: forbidden on a 2xx CONNECT response.
 has_banned_tunnel_header(Headers) ->
@@ -3170,14 +3221,44 @@ handle_call_early(From, Request, StateName, #state{waiters = Waiters} = State) -
             {keep_state, State, [{reply, From, {error, {not_ready, StateName}}}]}
     end.
 
+%% Server-side gate for send_data and send_trailers, run before the stream
+%% state checks:
+%%   - after a no-content response (HEAD, 204, 304) the stream already ended on
+%%     its HEADERS, so a body or trailers the caller still offers is dropped and
+%%     the call returns ok (RFC 9110 §6.4.1). This holds after the stream record
+%%     has been evicted, through the bounded closed_reasons map;
+%%   - after only a 1xx, DATA or trailers would follow an interim response,
+%%     which is malformed (RFC 9110 §15.2): refused with no_final_response.
+after_response_gate(From, StreamId, #state{mode = server, streams = Streams} = State,
+                    Send) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream{no_content_sent = true}} ->
+            {keep_state, State, [{reply, From, ok}]};
+        {ok, #stream{response_seen_final = false, response_headers = [_ | _]}} ->
+            {keep_state, State, [{reply, From, {error, no_final_response}}]};
+        {ok, _} ->
+            Send();
+        error ->
+            case closed_no_content(StreamId, State) of
+                true  -> {keep_state, State, [{reply, From, ok}]};
+                false -> Send()
+            end
+    end;
+after_response_gate(_From, _StreamId, _State, Send) ->
+    Send().
+
 %% Per-stream calls that are valid in every state where streams exist:
 %% `settings' (a server may answer before the SETTINGS ack), `connected',
 %% and both goaway states (RFC 9113 6.8 keeps existing streams alive after
 %% a GOAWAY). Returns `false' for anything else.
 handle_stream_call(From, {send_data, StreamId, Data, EndStream}, State) ->
-    handle_send_data(From, StreamId, Data, EndStream, State);
+    after_response_gate(From, StreamId, State, fun() ->
+        handle_send_data(From, StreamId, Data, EndStream, State)
+    end);
 handle_stream_call(From, {send_data_blocking, StreamId, Data, EndStream, Timeout}, State) ->
-    handle_send_data_blocking(From, StreamId, Data, EndStream, Timeout, State);
+    after_response_gate(From, StreamId, State, fun() ->
+        handle_send_data_blocking(From, StreamId, Data, EndStream, Timeout, State)
+    end);
 handle_stream_call(From, {consume, StreamId, ByteCount}, State) ->
     handle_consume(From, StreamId, ByteCount, State);
 handle_stream_call(From, {send_response, StreamId, Status, Headers}, State) ->
@@ -3187,7 +3268,9 @@ handle_stream_call(From, {send_response, StreamId, Status, Headers, Opts}, State
 handle_stream_call(From, {respond, StreamId, Status, Headers, Body}, State) ->
     handle_respond(From, StreamId, Status, Headers, Body, State);
 handle_stream_call(From, {send_trailers, StreamId, Trailers}, State) ->
-    handle_send_trailers(From, StreamId, Trailers, State);
+    after_response_gate(From, StreamId, State, fun() ->
+        handle_send_trailers(From, StreamId, Trailers, State)
+    end);
 handle_stream_call(From, {cancel_stream, StreamId, ErrorCode}, State) ->
     handle_cancel_stream(From, StreamId, ErrorCode, State);
 handle_stream_call(From, {set_stream_handler, StreamId, Pid, Opts}, State) ->
@@ -3394,6 +3477,13 @@ b2i(false) -> 0.
 close_stream(StreamId, Reason, #state{streams = Streams} = State0) ->
     %% Flip state via put_stream/3 so the counters are decremented once
     %% (idempotent: a stream already closed has Old = closed, delta 0).
+    %% A stream that ended on a no-content response is remembered as
+    %% `no_content' in closed_reasons, so send_data after the record is
+    %% evicted still succeeds (after_response_gate/4).
+    KeptReason = case maps:find(StreamId, Streams) of
+        {ok, #stream{no_content_sent = true}} when Reason =:= end_stream -> no_content;
+        _ -> Reason
+    end,
     State = case maps:find(StreamId, Streams) of
         {ok, Stream} ->
             %% A blocking send_data/5 caller parked on this stream can never
@@ -3418,7 +3508,7 @@ close_stream(StreamId, Reason, #state{streams = Streams} = State0) ->
     Q1 = queue:in(StreamId, Q),
     N1 = N + 1,
     {Streams2, Q2, N2} = evict_old_closed(Streams1, Q1, N1),
-    Reasons1 = maps:put(StreamId, Reason, Reasons),
+    Reasons1 = maps:put(StreamId, KeptReason, Reasons),
     RQ1 = queue:in(StreamId, RQ),
     RN1 = RN + 1,
     {Reasons2, RQ2, RN2} = evict_old_reasons(Reasons1, RQ1, RN1),

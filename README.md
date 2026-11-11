@@ -151,6 +151,21 @@ end.
 Use the granular `send_response/4` + `send_data/4` (or `send_data/4` in chunks)
 when the body is streamed or produced incrementally.
 
+### Responses with no content
+
+A final response to HEAD, and any 204 or 304, has no content (RFC 9110 §6.4.1). The server ends the stream on its HEADERS, so you can keep the same code path as for GET: a body passed to `respond/5`, and any later `send_data` or `send_trailers`, is dropped and the call returns `ok`. A `content-length` you set on a 1xx or 204 is removed; on 304 and HEAD it is kept.
+
+Send 1xx (100, 103) with `send_response/4` before the final response. `respond/5` refuses them with `{error, informational_status}`:
+
+```erlang
+Handler = fun(Conn, StreamId, _Method, _Path, _Headers) ->
+    ok = h2:send_response(Conn, StreamId, 103, [{<<"link">>, <<"</app.css>; rel=preload">>}]),
+    h2:respond(Conn, StreamId, 200, [{<<"content-type">>, <<"text/html">>}], Html)
+end.
+```
+
+A 1xx after the final response returns `{error, final_response_sent}`, and `send_data` or `send_trailers` after only a 1xx returns `{error, no_final_response}`.
+
 Options to `h2:start_server/2,3`:
 
 ```erlang
