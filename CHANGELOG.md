@@ -2,6 +2,19 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- New option `max_body_size`, for clients and servers: the most body bytes
+  one stream may receive. Without it a peer could send a body of any size.
+  A server answers a request that declares more with 413 Content Too Large
+  before its handler runs, and one that sends more with 413 while no response
+  has started; either way the stream is then reset. A client cancels a
+  response over the limit. The handler or the requester gets
+  `{stream_reset, StreamId, body_too_large}`. The default is `infinity`, so
+  nothing changes unless you set it.
+
 ## [0.15.1] - 2026-11-10
 
 ### Fixed

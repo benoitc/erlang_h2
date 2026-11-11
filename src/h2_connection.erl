@@ -167,6 +167,12 @@
     owner_monitor = undefined :: undefined | reference(),
     buffer = <<>> :: binary(),
 
+    %% The most body bytes one stream may receive (`max_body_size`), or
+    %% `infinity`. A request over it is answered 413 by the connection; a
+    %% response over it is cancelled; the owner sees `body_too_large` either
+    %% way. Not a SETTINGS value: RFC 9113 has none for body size.
+    max_body_size = infinity :: pos_integer() | infinity,
+
     %% Settings
     local_settings :: h2_settings:settings(),
     peer_settings :: h2_settings:settings(),
@@ -562,6 +568,7 @@ init({Mode, Socket, Owner, Opts}) ->
         scheme = Scheme,
         enable_connect_protocol = EnableConnectProtocol,
         notify_peer_settings = maps:get(notify_peer_settings, Opts, false) =:= true,
+        max_body_size = max_body_size(Opts),
         notify_stream_available = Mode =:= client andalso
             maps:get(notify_stream_available, Opts, false) =:= true
     },
@@ -1583,6 +1590,10 @@ handle_server_initial(StreamId, Stream, Headers, Protocol, EndStream, State) ->
     case parse_content_length(Headers) of
         {error, Err} ->
             stream_reject(StreamId, Err, State);
+        {ok, ExpectedCL} when is_integer(ExpectedCL),
+                              ExpectedCL > State#state.max_body_size ->
+            %% Declared too large: answered before the owner ever sees it.
+            {ok, connected, too_large(StreamId, Stream, false, State)};
         {ok, ExpectedCL} ->
             case end_stream_body_mismatch(ExpectedCL, EndStream) of
                 true ->
@@ -1627,6 +1638,9 @@ handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State) ->
     case parse_content_length(Headers) of
         {error, Err} ->
             stream_reject(StreamId, Err, State);
+        {ok, ExpectedCL} when is_integer(ExpectedCL),
+                              ExpectedCL > State#state.max_body_size ->
+            {ok, connected, too_large(StreamId, Stream, true, State)};
         {ok, ExpectedCL} ->
             BodyForbidden = Stream#stream.request_method =:= <<"HEAD">>
                             orelse Status =:= 204 orelse Status =:= 304,
@@ -1729,6 +1743,52 @@ strip_pseudo(Headers) ->
 
 stream_reject(StreamId, ErrorCode, State) ->
     {ok, connected, sent_rst(StreamId, ErrorCode, State)}.
+
+%% A stream whose body is over `max_body_size`.
+%%
+%% Server: answered 413 (RFC 9110 §15.5.14) if no response has started, then
+%% reset with NO_ERROR, which RFC 9113 §8.1 provides for a server that has
+%% responded before the request ended; with a response already under way,
+%% reset with CANCEL. Client: reset with CANCEL. `Notify` says whether the
+%% owner has already seen the stream and must be told.
+%%
+%% Each reset is a `sent_rst/3` and so counts against the per-second budget of
+%% resets this peer has caused (MadeYouReset): a peer cannot use oversized
+%% bodies to make the connection send resets without limit.
+too_large(StreamId, Stream, Notify, #state{mode = Mode} = State0) ->
+    State1 = case Notify of
+                 true -> dispatch_stream_event(
+                           StreamId, {stream_reset, StreamId, body_too_large},
+                           State0);
+                 false -> State0
+             end,
+    State2 = put_stream(StreamId, Stream, State1),
+    Code = case Mode =:= server andalso
+                Stream#stream.response_headers =:= [] of
+               true ->
+                   case answer_413(StreamId, State2) of
+                       {ok, S} -> {no_error, S};
+                       error -> {cancel, State2}
+                   end;
+               false -> {cancel, State2}
+           end,
+    {ErrorCode, State3} = Code,
+    close_stream(StreamId, rst, sent_rst(StreamId, ErrorCode, State3)).
+
+answer_413(StreamId, #state{encode_context = EncCtx} = State) ->
+    Headers = [{<<":status">>, <<"413">>}, {<<"content-length">>, <<"0">>}],
+    {Block, EncCtx1} = h2_hpack:encode(Headers, EncCtx),
+    case send_header_block(StreamId, Block, true, State) of
+        ok -> {ok, State#state{encode_context = EncCtx1}};
+        {error, _} -> error
+    end.
+
+max_body_size(Opts) ->
+    case maps:get(max_body_size, Opts, infinity) of
+        infinity -> infinity;
+        N when is_integer(N), N > 0 -> N;
+        Other -> error({badarg, {max_body_size, Other}})
+    end.
 
 stream_reject_and_close(StreamId, ErrorCode, State) ->
     State1 = sent_rst(StreamId, ErrorCode, State),
@@ -2128,11 +2188,16 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
                          orelse (ExpectedCL =/= undefined andalso ReceivedSoFar + DataSize > ExpectedCL)
                          orelse (EndStream andalso ExpectedCL =/= undefined
                                  andalso ReceivedSoFar + DataSize =/= ExpectedCL)),
+                    TooLarge = (not IsTunnel) andalso
+                        ReceivedSoFar + DataSize > State#state.max_body_size,
                     if
                         FlowControlled > StreamWindow ->
                             State0b = sent_rst(StreamId, flow_control_error, State0a),
                             State1 = close_stream(StreamId, rst, State0b),
                             {ok, connected, State1};
+                        TooLarge ->
+                            {ok, connected,
+                             too_large(StreamId, Stream, true, State0a)};
                         BodyViolation ->
                             State0b = sent_rst(StreamId, protocol_error, State0a),
                             State1 = close_stream(StreamId, rst, State0b),
