@@ -18,8 +18,11 @@
 - Field syntax: names restricted to RFC 7230 `tchar` (rejects SP/HTAB/colon in regular headers, DEL, non-ASCII); values reject NUL/CR/LF and leading/trailing SP/HTAB.
 - Connection-specific headers rejected (`Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding`, `Upgrade`).
 - `Content-Length` enforcement (§8.1.1): mismatched duplicates, non-numeric/negative values, DATA overshoot or END_STREAM mismatch → stream `PROTOCOL_ERROR`.
-- Body forbidden on HEAD responses, 1xx, 204, 304 — enforced via stream flag.
-- 1xx interim responses delivered as a distinct `informational` event; 101 rejected on both send and receive (§8.6).
+- Responses with no content (HEAD, 204, 304; RFC 9110 §6.4.1). Server: the response is one HEADERS block (plus CONTINUATION) with END_STREAM. A body or trailers offered anyway are dropped and `respond/5`, `send_data` and `send_trailers` return `ok`; no flow-control window is charged. Client: DATA after such a response is rejected and never delivered (stream `PROTOCOL_ERROR` without END_STREAM on HEADERS, connection `STREAM_CLOSED` after it, §5.1).
+- `Content-Length` is removed from 1xx and 204 responses the server sends (RFC 9110 §8.6); kept on 304 and HEAD.
+- A request body still arriving after an early 204 is accepted.
+- A `Content-Length` mismatch delivers `{stream_reset, StreamId, protocol_error}` to the owner or stream handler.
+- 1xx interim responses delivered as a distinct `informational` event; 101 rejected on both send and receive (§8.6). The server never ends the stream on a 1xx, even on HEAD; `respond/5` refuses 1xx (`{error, informational_status}`), a 1xx after the final response returns `{error, final_response_sent}`, and DATA or trailers after only a 1xx return `{error, no_final_response}`.
 - `SETTINGS_MAX_HEADER_LIST_SIZE` enforced in both directions (outbound: `{error, header_list_too_large}`; inbound: stream `PROTOCOL_ERROR`).
 - Padded DATA: full padded payload counted against the flow-control window; post-reset DATA still consumes the connection window.
 - Oversized HEADERS blocks automatically split into HEADERS + CONTINUATION chain (§4.2).

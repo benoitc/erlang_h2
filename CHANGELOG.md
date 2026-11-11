@@ -2,6 +2,32 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- `send_data` and `send_trailers` after a 204, 304 or HEAD response failed
+  with `invalid_stream_state`, so a server that ended an empty 204 with
+  `send_data` got an error on every such response. They now succeed and send
+  nothing, as `respond/5` already did.
+- A 100 or 103 sent on a HEAD request ended the stream, so the final response
+  could not be sent. A 1xx never ends the stream now.
+- `content-length` set on a 1xx or 204 response was sent, which HTTP forbids.
+  It is now removed. It is still sent on 304 and HEAD responses.
+- A server that answered 204 before the request body had fully arrived reset
+  the rest of the upload as a protocol error. The body is now accepted.
+- When a response or request body did not match its `content-length`, the
+  stream was reset but the requester or handler was never told and waited
+  until it timed out. It is now told the stream was reset with a protocol
+  error.
+
+### Added
+
+- `respond/5` with a 1xx status returns `{error, informational_status}`. Send
+  1xx with `send_response/4`. A 1xx after the final response returns
+  `{error, final_response_sent}`, and `send_data` or `send_trailers` after only
+  a 1xx returns `{error, no_final_response}`.
+
 ## [0.16.0] - 2026-11-11
 
 ### Added
