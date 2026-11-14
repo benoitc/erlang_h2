@@ -177,6 +177,7 @@ Options to `h2:start_server/2,3`:
   acceptors               => pos_integer(),       %% default: schedulers
   backlog                 => pos_integer(),       %% listen queue, default: 1024
   transport               => ssl | tcp,           %% default: ssl
+  goaway_timeout          => timeout(),           %% graceful shutdown bound, default: 3000
   enable_connect_protocol => boolean()}           %% RFC 8441, default: false
 ```
 
@@ -192,6 +193,22 @@ Handler = fun(Conn, StreamId, Method, Path, Headers) ->
     my_app:handle(Conn, StreamId, Method, Path, Scheme, Authority, AppHeaders)
 end.
 ```
+
+### Graceful shutdown
+
+Call `h2:goaway/1` on a connection to stop it taking new requests while the ones already running finish. It sends GOAWAY (RFC 9113 §6.8), keeps serving the open streams, and closes the connection once they have all ended:
+
+```erlang
+ok = h2:goaway(Conn),
+receive
+    {h2, Conn, {closed, goaway_drained}} -> ok;   %% every stream finished
+    {h2, Conn, {closed, goaway_timeout}} -> ok    %% goaway_timeout ran out first
+end.
+```
+
+The wait is bounded by the `goaway_timeout` option (default 3000 ms, `infinity` for no limit). Override it for one shutdown with `h2:goaway(Conn, #{timeout => Ms})`. A GOAWAY with an error code, `h2:goaway(Conn, protocol_error)`, closes without waiting.
+
+Requests the client sends after the final GOAWAY are not processed and never reach your handler, so the client can retry them on a new connection. When the client sends GOAWAY first, the built-in server answers the same way: it finishes the requests already sent, then closes. The same applies to `h2:goaway/1` on a client connection: its own requests still get their responses.
 
 ### Scaling the acceptor pool
 
@@ -557,6 +574,13 @@ brew install summerwind/h2spec/h2spec
 
 rebar3 ct --suite=test/h2_interop_SUITE
 ```
+
+`test/h2_goaway_interop_SUITE.erl` checks graceful shutdown against curl
+(nghttp2): responses in flight when the server sends GOAWAY arrive whole,
+and a later request goes to a new connection. It needs curl with HTTP2
+support and skips otherwise. `h2_grpc_interop_SUITE` (grpcurl) and
+`h2_grpc_client_interop_SUITE` (grpcio) cover the same case for a gRPC call
+in each direction.
 
 Without h2spec on `PATH` the suite skips cleanly. The generic and HPACK
 groups are run in observe mode — failures are logged with full output for

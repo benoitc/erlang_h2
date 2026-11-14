@@ -122,3 +122,31 @@ jobs:
         with:
           name: grpc-client-interop-logs
           path: _build/test/logs
+
+  curl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '29.0'
+          install-rebar: false
+      - uses: actions/cache@v4
+        id: rebar3
+        with:
+          path: ~/.local/rebar3
+          key: rebar3-${{ env.REBAR3_VERSION }}
+      - name: Download rebar3
+        if: steps.rebar3.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/fetch-rebar3.sh "$REBAR3_VERSION" ~/.local/rebar3
+      - run: echo "$HOME/.local/rebar3" >> "$GITHUB_PATH"
+      - name: Check curl has HTTP2
+        run: curl -V | grep -q HTTP2 && curl -V | head -1
+      - run: rebar3 ct --suite=test/h2_goaway_interop_SUITE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: curl-interop-logs
+          path: _build/test/logs

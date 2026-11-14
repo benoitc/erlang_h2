@@ -19,13 +19,13 @@
 -export([init_per_suite/1, end_per_suite/1]).
 -export([init_per_testcase/2, end_per_testcase/2]).
 
--export([bidi_stream_echo_test/1, unary_echo_test/1]).
+-export([bidi_stream_echo_test/1, unary_echo_test/1, goaway_mid_call_test/1]).
 
 suite() ->
     [{timetrap, {seconds, 60}}].
 
 all() ->
-    [bidi_stream_echo_test, unary_echo_test].
+    [bidi_stream_echo_test, unary_echo_test, goaway_mid_call_test].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(h2),
@@ -37,10 +37,21 @@ init_per_suite(Config) ->
 end_per_suite(_Config) ->
     ok.
 
-init_per_testcase(_TestCase, Config) ->
+init_per_testcase(TestCase, Config) ->
     process_flag(trap_exit, true),
-    Handler = fun(Conn, StreamId, _Method, _Path, _Headers) ->
-        grpc_echo(Conn, StreamId)
+    Handler = case TestCase of
+        goaway_mid_call_test ->
+            %% Start a graceful shutdown while the call is in flight and
+            %% answer only after the old 100 ms drain would have closed.
+            fun(Conn, StreamId, _Method, _Path, _Headers) ->
+                ok = h2:goaway(Conn),
+                timer:sleep(300),
+                grpc_echo(Conn, StreamId)
+            end;
+        _ ->
+            fun(Conn, StreamId, _Method, _Path, _Headers) ->
+                grpc_echo(Conn, StreamId)
+            end
     end,
     {ok, ServerRef} = h2:start_server(0, #{handler => Handler, transport => tcp}),
     Port = h2:server_port(ServerRef),
@@ -72,6 +83,14 @@ bidi_stream_echo_test(Config) ->
 
 %% Single request/response over the same echo path.
 unary_echo_test(Config) ->
+    Input = "{\"payload\":\"cGluZw==\"}\n",   %% cGluZw== = "ping"
+    Output = run_grpcurl(Config, "echo.Echo/BidiStream", Input),
+    ?assert(contains(Output, "cGluZw==")),
+    assert_ok_exit(Output).
+
+%% RFC 9113 §6.8: the server sends GOAWAY while a call is running; the call
+%% still completes with its messages and an OK status.
+goaway_mid_call_test(Config) ->
     Input = "{\"payload\":\"cGluZw==\"}\n",   %% cGluZw== = "ping"
     Output = run_grpcurl(Config, "echo.Echo/BidiStream", Input),
     ?assert(contains(Output, "cGluZw==")),

@@ -139,6 +139,10 @@
     %% or sends more is cancelled, and its stream gets
     %% `{stream_reset, StreamId, body_too_large}'. Default infinity.
     max_body_size => pos_integer() | infinity,
+    %% Graceful shutdown bound: after `goaway/1' sends its final GOAWAY, the
+    %% connection stays open until the streams still open have ended, or
+    %% this many milliseconds have passed. Default 3000.
+    goaway_timeout => timeout(),
     timeout => timeout(),
     connect_timeout => timeout(),
     sync => boolean()
@@ -170,6 +174,10 @@
     %% is answered 413 if no response has started, and its handler gets
     %% `{stream_reset, StreamId, body_too_large}'. Default infinity.
     max_body_size => pos_integer() | infinity,
+    %% Graceful shutdown bound: after `goaway/1' sends its final GOAWAY, the
+    %% connection stays open until the streams still open have ended, or
+    %% this many milliseconds have passed. Default 3000.
+    goaway_timeout => timeout(),
     acceptors => pos_integer(),
     %% RFC 8441: when true, advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1 and
     %% accept Extended CONNECT requests carrying the `:protocol` pseudo-header.
@@ -261,7 +269,8 @@ connect_tcp(Host, Port, Opts, Timeout) ->
 
 start_connection(Mode, Socket, Opts) ->
     ConnOpts = maps:with([settings, connection_window_size, notify_peer_settings,
-                          notify_stream_available, max_body_size], Opts),
+                          notify_stream_available, max_body_size,
+                          goaway_timeout], Opts),
     Timeout = maps:get(timeout, Opts, ?DEFAULT_TIMEOUT_MS),
     case h2_connection:start_link(Mode, Socket, ConnOpts) of
         {ok, Pid} ->
@@ -728,7 +737,7 @@ accept_handshake(Socket, Handler, ConnOpts) ->
 %% cannot drift.
 conn_opts(Opts) ->
     maps:merge(maps:with([connection_window_size, notify_peer_settings,
-                          max_body_size], Opts),
+                          max_body_size, goaway_timeout], Opts),
                #{settings => maps:get(settings, Opts, #{}),
                  enable_connect_protocol => maps:get(enable_connect_protocol, Opts, false)}).
 
@@ -737,6 +746,10 @@ handle_server_connection(Socket, Handler, ConnOpts, Transport) ->
         ssl -> fun ssl:controlling_process/2;
         gen_tcp -> fun gen_tcp:controlling_process/2
     end,
+    %% Trap exits so the connection's own exit arrives as a message: a clean
+    %% end (peer close, drained GOAWAY) ends this process `normal', as
+    %% serve_socket/2 documents, and an abnormal one is passed on.
+    process_flag(trap_exit, true),
     case h2_connection:start_link(server, Socket, self(), ConnOpts) of
         {ok, Conn} ->
             case TransferFn(Socket, Conn) of
@@ -812,12 +825,29 @@ server_connection_loop(Conn, Handler) ->
         {h2, Conn, {closed, _Reason}} ->
             ok;
         {h2, Conn, {goaway, _LastStreamId, _ErrorCode}} ->
-            ok;
+            %% The client is leaving. Requests it already sent may still
+            %% complete (RFC 9113 §6.8), so answer with a graceful GOAWAY:
+            %% the connection closes once they have ended.
+            _ = ignore_errors(fun() -> h2:goaway(Conn) end),
+            server_connection_loop(Conn, Handler);
+        {'EXIT', Conn, Reason} ->
+            exit(clean_exit(Reason));
+        {'EXIT', _From, normal} ->
+            %% A linked caller ending normally leaves the connection up,
+            %% as it did before exits were trapped.
+            server_connection_loop(Conn, Handler);
+        {'EXIT', _From, Reason} ->
+            exit(Reason);
         Other ->
             logger:debug("h2 server_connection_loop: unexpected message ~tp",
                          [Other]),
             server_connection_loop(Conn, Handler)
     end.
+
+clean_exit(normal) -> normal;
+clean_exit(shutdown) -> normal;
+clean_exit({shutdown, _}) -> normal;
+clean_exit(Reason) -> Reason.
 
 invoke_peer_settings(Module, Conn, Settings) when is_atom(Module) ->
     _ = code:ensure_loaded(Module),
@@ -978,14 +1008,26 @@ unset_stream_handler(Conn, StreamId) ->
     h2_connection:unset_stream_handler(Conn, StreamId).
 
 %% @doc Initiate graceful connection shutdown.
+%%
+%% Sends GOAWAY so the peer opens no new streams, lets the streams already
+%% open finish, then closes the connection. The owner gets
+%% `{h2, Conn, {closed, goaway_drained}}' once they have all ended, or
+%% `{closed, goaway_timeout}' if the `goaway_timeout' option ran out first.
 -spec goaway(connection()) -> ok | {error, term()}.
 goaway(Conn) ->
     h2_connection:send_goaway(Conn).
 
-%% @doc Initiate connection shutdown with error code.
--spec goaway(connection(), error_code()) -> ok | {error, term()}.
-goaway(Conn, ErrorCode) ->
-    h2_connection:send_goaway(Conn, ErrorCode).
+%% @doc Initiate connection shutdown with an error code, or with options.
+%%
+%% With an error code other than `no_error' the connection closes right after
+%% the final GOAWAY. With a map, `error' sets the code (default `no_error')
+%% and `timeout' overrides the connection's `goaway_timeout' for this
+%% shutdown.
+-spec goaway(connection(), error_code() | #{error => error_code(),
+                                            timeout => timeout()}) ->
+    ok | {error, term()}.
+goaway(Conn, ErrorCodeOrOpts) ->
+    h2_connection:send_goaway(Conn, ErrorCodeOrOpts).
 
 %% @doc Close the connection immediately.
 -spec close(connection()) -> ok.

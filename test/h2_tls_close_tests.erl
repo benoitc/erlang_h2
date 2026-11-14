@@ -23,9 +23,9 @@ close_test_() ->
        {timeout, 30, fun() -> peer_closes(ssl) end}},
       {"TCP: handler told promptly when the server sees tcp_closed first",
        {timeout, 30, fun() -> peer_closes(gen_tcp) end}},
-      {"TLS: handler told promptly when GOAWAY stops the owner first",
+      {"TLS: handler told promptly when a peer GOAWAY ends the connection",
        {timeout, 30, fun() -> goaway_owner_exit_first(ssl) end}},
-      {"TCP: handler told promptly when GOAWAY stops the owner first",
+      {"TCP: handler told promptly when a peer GOAWAY ends the connection",
        {timeout, 30, fun() -> goaway_owner_exit_first(gen_tcp) end}},
       {"TLS: peer close seen after a connection error and more data",
        {timeout, 30, fun() -> close_after_connection_error(ssl) end}},
@@ -46,12 +46,13 @@ peer_closes(T) ->
         h2:stop_server(Ref)
     end.
 
-%% The peer sends GOAWAY and keeps TCP open. The server owner loop returns on
-%% the GOAWAY, so the connection stops through its owner's exit while the peer
-%% is still there. The relay passes the GOAWAY, then forwards nothing more
-%% with both sockets open.
+%% The peer sends GOAWAY and keeps TCP open. The server answers with its own
+%% GOAWAY and drains (RFC 9113 §6.8); with goaway_timeout 0 the open stream
+%% ends the drain at once, so the connection stops while the peer is still
+%% there. The relay passes the GOAWAY, then forwards nothing more with both
+%% sockets open.
 goaway_owner_exit_first(T) ->
-    {Ref, Relay, Sock, Conn} = server_with_stream(T),
+    {Ref, Relay, Sock, Conn} = server_with_stream(T, #{goaway_timeout => 0}),
     try
         freeze_after_next(Relay),
         MRef = monitor(process, Conn),
@@ -129,12 +130,15 @@ client_close() ->
 %% A server whose handler makes the test process the request stream's handler
 %% and answers nothing; a raw client, through a relay, opens one stream on it.
 server_with_stream(T) ->
+    server_with_stream(T, #{}).
+
+server_with_stream(T, Opts) ->
     Self = self(),
     Handler = fun(Conn, StreamId, _M, _P, _H) ->
                       ok = h2:set_stream_handler(Conn, StreamId, Self),
                       Self ! {registered, Conn}
               end,
-    {ok, Ref} = start_server(T, Handler),
+    {ok, Ref} = start_server(T, Handler, Opts),
     {Relay, RelayPort} = relay(h2:server_port(Ref)),
     {ok, Sock} = connect(T, RelayPort),
     Headers = [{<<":method">>, <<"GET">>}, {<<":path">>, <<"/">>},
@@ -147,11 +151,11 @@ server_with_stream(T) ->
     Conn = receive {registered, C} -> C after 5000 -> error(no_request) end,
     {Ref, Relay, Sock, Conn}.
 
-start_server(ssl, Handler) ->
+start_server(ssl, Handler, Opts) ->
     #{server := {Cert, Key}} = certs(),
-    h2:start_server(0, #{cert => Cert, key => Key, handler => Handler});
-start_server(gen_tcp, Handler) ->
-    h2:start_server(0, #{transport => tcp, handler => Handler}).
+    h2:start_server(0, Opts#{cert => Cert, key => Key, handler => Handler});
+start_server(gen_tcp, Handler, Opts) ->
+    h2:start_server(0, Opts#{transport => tcp, handler => Handler}).
 
 connect(ssl, Port) ->
     ssl:connect("localhost", Port, [binary, {active, false}, {verify, verify_none},

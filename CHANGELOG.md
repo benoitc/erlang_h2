@@ -2,6 +2,31 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- `h2:goaway/1` closed the connection about 100 ms later even when requests
+  were still running, so their responses were lost and the handler failed
+  when it answered. The connection now stays open until the requests already
+  accepted have finished, then closes (#41).
+- When a client sent GOAWAY, the built-in server dropped the connection at
+  once, cutting off the responses to requests the client had already sent.
+  It now finishes them before closing.
+- A peer that opened streams after our final GOAWAY could get the connection
+  closed with a protocol error. Those streams are now ignored, as the
+  specification requires, and the peer can retry them elsewhere.
+- A process returned by `h2:serve_socket/2` exited with a shutdown reason
+  instead of `normal` when the client closed the connection without sending
+  GOAWAY, which also took down a linked caller.
+
+### Added
+
+- `goaway_timeout` option for clients and servers: how long a graceful
+  shutdown waits for open requests before closing anyway. Default 3 seconds.
+- `h2:goaway/2` also takes a map, `#{error => Code, timeout => Ms}`, to set
+  the wait for one shutdown.
+
 ## [0.17.0] - 2026-11-11
 
 ### Fixed

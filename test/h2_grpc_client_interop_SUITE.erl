@@ -21,13 +21,14 @@
 -export([init_per_suite/1, end_per_suite/1]).
 -export([init_per_testcase/2, end_per_testcase/2]).
 
--export([bidi_echo_test/1, large_message_flow_control_test/1]).
+-export([bidi_echo_test/1, large_message_flow_control_test/1,
+         client_goaway_mid_call_test/1]).
 
 suite() ->
     [{timetrap, {seconds, 60}}].
 
 all() ->
-    [bidi_echo_test, large_message_flow_control_test].
+    [bidi_echo_test, large_message_flow_control_test, client_goaway_mid_call_test].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(h2),
@@ -84,6 +85,24 @@ large_message_flow_control_test(Config) ->
     ?assertEqual([Big], Echoed),
     ?assertEqual(<<"0">>, proplists:get_value(<<"grpc-status">>, Trailers)),
     _ = h2:close(Client).
+
+%% RFC 9113 §6.8 from the client side: our client sends GOAWAY in the middle
+%% of a bidi call and keeps streaming past the old 100 ms drain; grpcio still
+%% echoes every message and ends the call OK, and our connection then closes.
+client_goaway_mid_call_test(Config) ->
+    Port = server_port(?config(server, Config)),
+    {ok, Client} = connect(Port),
+    ok = h2:wait_connected(Client),
+    {ok, Sid} = open_grpc_stream(Client, Port),
+    ok = h2:send_data(Client, Sid, grpc_frame(<<"before">>), false),
+    ok = h2:goaway(Client),
+    timer:sleep(300),
+    {Echoed, Trailers} = grpc_bidi(Client, Sid, [<<"after">>], 15000),
+    ?assertEqual([<<"before">>, <<"after">>], Echoed),
+    ?assertEqual(<<"0">>, proplists:get_value(<<"grpc-status">>, Trailers)),
+    receive {h2, Client, {closed, _}} -> ok
+    after 5000 -> ct:fail(client_not_closed)
+    end.
 
 %% ============================================================================
 %% gRPC client glue (no protobuf: identity-serialized bytes both ways)
