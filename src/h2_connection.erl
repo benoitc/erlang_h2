@@ -39,6 +39,9 @@
 -define(SETTINGS_TIMEOUT_MS, 5000).
 -define(CLOSE_TIMEOUT_MS, 5000).
 -define(GOAWAY_DRAIN_MS, 100).
+%% Default bound on a graceful shutdown: how long streams still open after
+%% the final GOAWAY may run before the connection closes anyway.
+-define(GOAWAY_TIMEOUT_MS, 3000).
 %% RFC 9113 §5.1: post-close error classification needs to know whether the
 %% stream was closed via END_STREAM (connection-scoped error) or RST_STREAM
 %% (stream-scoped). We keep two layered caches so the lookup is exact for
@@ -228,6 +231,15 @@
     goaway_received = false :: boolean(),
     last_stream_id = 0 :: non_neg_integer(),
     goaway_error = no_error :: atom(),
+    %% Last stream id of the latest GOAWAY we sent. RFC 9113 §6.8: a later
+    %% GOAWAY never carries a higher one, and frames on peer streams above it
+    %% are discarded.
+    goaway_last_id :: non_neg_integer() | undefined,
+    %% True once the final GOAWAY of a graceful shutdown is out: the
+    %% connection closes when its last stream ends.
+    goaway_draining = false :: boolean(),
+    %% How long a graceful shutdown waits for open streams (goaway_timeout).
+    goaway_timeout = ?GOAWAY_TIMEOUT_MS :: timeout(),
 
     %% Timers
     settings_timer :: reference() | undefined,
@@ -464,10 +476,20 @@ cancel_stream(Conn, StreamId, ErrorCode) ->
 send_goaway(Conn) ->
     send_goaway(Conn, no_error).
 
-%% @doc Send GOAWAY frame with error code.
--spec send_goaway(pid(), atom()) -> ok | {error, term()}.
+%% @doc Send GOAWAY frame with an error code, or with options
+%% `#{error => ErrorCode, timeout => timeout()}'. `timeout' bounds how long
+%% a graceful shutdown waits for open streams (default: the connection's
+%% `goaway_timeout' option).
+-spec send_goaway(pid(), atom() | map()) -> ok | {error, term()}.
+send_goaway(Conn, Opts) when is_map(Opts) ->
+    ErrorCode = maps:get(error, Opts, no_error),
+    Timeout = case maps:find(timeout, Opts) of
+        {ok, T} -> goaway_timeout(T);
+        error -> default
+    end,
+    gen_statem:call(Conn, {send_goaway, ErrorCode, Timeout});
 send_goaway(Conn, ErrorCode) ->
-    gen_statem:call(Conn, {send_goaway, ErrorCode}).
+    gen_statem:call(Conn, {send_goaway, ErrorCode, default}).
 
 %% @doc Close the connection.
 -spec close(pid()) -> ok.
@@ -576,6 +598,8 @@ init({Mode, Socket, Owner, Opts}) ->
         enable_connect_protocol = EnableConnectProtocol,
         notify_peer_settings = maps:get(notify_peer_settings, Opts, false) =:= true,
         max_body_size = max_body_size(Opts),
+        goaway_timeout = goaway_timeout(maps:get(goaway_timeout, Opts,
+                                                 ?GOAWAY_TIMEOUT_MS)),
         notify_stream_available = Mode =:= client andalso
             maps:get(notify_stream_available, Opts, false) =:= true
     },
@@ -736,8 +760,8 @@ connected({call, From}, {send_request, Method, Path, Headers, EndStream}, State)
 connected({call, From}, {send_request_headers, Headers, EndStream, Opts}, State) ->
     handle_send_request_headers(From, Headers, EndStream, Opts, State);
 
-connected({call, From}, {send_goaway, ErrorCode}, State) ->
-    handle_send_goaway(From, ErrorCode, connected, State);
+connected({call, From}, {send_goaway, ErrorCode, Timeout}, State) ->
+    handle_send_goaway(From, ErrorCode, Timeout, State);
 
 connected({call, From}, wait_connected, State) ->
     %% Already connected, reply immediately
@@ -777,12 +801,29 @@ goaway_sent(info, {ssl_closed, Socket}, #state{socket = Socket} = State) ->
     {stop, {shutdown, ssl_closed}, State};
 
 goaway_sent(info, {timeout, Timer, goaway_drain},
-            #state{close_timer = Timer, last_peer_stream_id = LastId,
-                   goaway_error = ErrorCode} = State) ->
-    %% Drain window elapsed — send the real GOAWAY with the actual last
-    %% peer-initiated stream id and close.
-    State1 = send_goaway_frame(LastId, ErrorCode, State#state{close_timer = undefined}),
-    {stop, {shutdown, goaway_drained}, State1};
+            #state{close_timer = Timer, goaway_error = ErrorCode} = State) ->
+    %% Drain window elapsed: send the real GOAWAY with the last peer stream
+    %% id. RFC 9113 §6.8: streams at or below it may still complete, so a
+    %% graceful shutdown closes once they have; an error one closes now.
+    State1 = send_goaway_frame(final_goaway_last_id(State), ErrorCode,
+                               State#state{close_timer = undefined}),
+    case ErrorCode =:= no_error andalso count_active_streams(State1) > 0 of
+        true ->
+            Timer1 = start_goaway_timer(State1#state.goaway_timeout),
+            {keep_state, State1#state{goaway_draining = true, close_timer = Timer1}};
+        false ->
+            {stop, {shutdown, goaway_drained}, State1}
+    end;
+
+goaway_sent(info, goaway_complete, #state{goaway_draining = true} = State) ->
+    %% Posted by maybe_drained/1 when the last stream closed.
+    case count_active_streams(State) of
+        0 -> {stop, {shutdown, goaway_drained}, State};
+        _ -> keep_state_and_data
+    end;
+
+goaway_sent(info, {timeout, Timer, goaway_timeout}, #state{close_timer = Timer} = State) ->
+    {stop, {shutdown, goaway_timeout}, State};
 
 goaway_sent(info, {timeout, Timer, close_timeout}, #state{close_timer = Timer} = State) ->
     {stop, {shutdown, close_timeout}, State};
@@ -793,6 +834,10 @@ goaway_sent({call, From}, {send_request_headers, _, _, _}, State) ->
     {keep_state, State, [{reply, From, {error, goaway_sent}}]};
 
 goaway_sent({call, From}, wait_connected, State) ->
+    {keep_state, State, [{reply, From, ok}]};
+
+goaway_sent({call, From}, {send_goaway, _ErrorCode, _Timeout}, State) ->
+    %% Shutdown already under way; a second GOAWAY adds nothing.
     {keep_state, State, [{reply, From, ok}]};
 
 goaway_sent({call, From}, Request, State) ->
@@ -828,8 +873,8 @@ goaway_received({call, From}, {send_request, _, _, _, _}, State) ->
 goaway_received({call, From}, {send_request_headers, _, _, _}, State) ->
     {keep_state, State, [{reply, From, {error, goaway_received}}]};
 
-goaway_received({call, From}, {send_goaway, ErrorCode}, State) ->
-    handle_send_goaway(From, ErrorCode, goaway_received, State);
+goaway_received({call, From}, {send_goaway, ErrorCode, Timeout}, State) ->
+    handle_send_goaway(From, ErrorCode, Timeout, State);
 
 goaway_received({call, From}, wait_connected, State) ->
     {keep_state, State, [{reply, From, ok}]};
@@ -1074,7 +1119,13 @@ handle_frame(StateName, {goaway, LastStreamId, ErrorCodeInt, _DebugData}, State)
     notify_all_handlers({goaway, LastStreamId, ErrorCode}, State),
     State1 = State#state{goaway_received = true, last_stream_id = LastStreamId},
     case StateName of
-        goaway_sent -> {stop, {shutdown, goaway_exchange}, State1};
+        goaway_sent ->
+            %% Both sides are shutting down. Streams still open may finish
+            %% (RFC 9113 §6.8); our own drain closes the connection after.
+            case count_active_streams(State1) of
+                0 -> {stop, {shutdown, goaway_exchange}, State1};
+                _ -> {ok, goaway_sent, State1}
+            end;
         _ -> {ok, goaway_received, State1}
     end;
 
@@ -1108,8 +1159,10 @@ handle_frame(_StateName, {window_update, StreamId, Increment}, #state{streams = 
         error ->
             %% RFC 9113 §5.1: a frame other than HEADERS/PRIORITY on an idle
             %% stream is a connection PROTOCOL_ERROR. An "evicted closed"
-            %% stream just gets ignored (loose end-of-lifecycle).
-            case in_closed_stream_range(StreamId, State) of
+            %% stream just gets ignored (loose end-of-lifecycle), as is a
+            %% stream refused by our GOAWAY.
+            case in_closed_stream_range(StreamId, State)
+                 orelse above_goaway(StreamId, State) of
                 true  -> {ok, connected, State};
                 false -> {error, protocol_error, State}
             end
@@ -1149,7 +1202,12 @@ handle_frame(_StateName, {rst_stream, StreamId, ErrorCode},
                     State1 = close_stream(StreamId, rst, State0a),
                     {ok, connected, State1};
                 false ->
-                    {error, protocol_error, State0}
+                    %% RFC 9113 §6.8: a stream our GOAWAY refused is
+                    %% discarded, not an idle stream.
+                    case above_goaway(StreamId, State0) of
+                        true  -> {ok, connected, State0};
+                        false -> {error, protocol_error, State0}
+                    end
             end
     end;
 
@@ -1336,7 +1394,18 @@ handle_headers(StreamId, HeaderBlock, EndStream, EndHeaders, _Priority, #state{m
                     reject_header_block(StreamId, stream_closed, HeaderBlock,
                                         EndHeaders, State);
                 unknown ->
-                    handle_headers_new(StreamId, HeaderBlock, EndStream, EndHeaders, Mode, State)
+                    case above_goaway(StreamId, State) of
+                        true ->
+                            %% RFC 9113 §6.8: a new stream after our final
+                            %% GOAWAY is not processed (the peer may retry
+                            %% it elsewhere), but its field block is still
+                            %% decoded to keep HPACK state in step.
+                            discard_header_block(StreamId, HeaderBlock,
+                                                 EndHeaders, State);
+                        false ->
+                            handle_headers_new(StreamId, HeaderBlock, EndStream,
+                                               EndHeaders, Mode, State)
+                    end
             end
     end.
 
@@ -1458,6 +1527,11 @@ reject_header_block(StreamId, ErrorCode, HeaderBlock, EndHeaders, State0) ->
         refused_stream -> _ = send_rst_stream(StreamId, ErrorCode, State0), State0;
         _              -> sent_rst(StreamId, ErrorCode, State0)
     end,
+    discard_header_block(StreamId, HeaderBlock, EndHeaders, State).
+
+%% Decode a field block whose headers are dropped (buffering any CONTINUATION
+%% frames), so the HPACK dynamic table stays in step with the peer.
+discard_header_block(StreamId, HeaderBlock, EndHeaders, State) ->
     case EndHeaders of
         true ->
             decode_discarded_block(HeaderBlock, State);
@@ -1796,6 +1870,10 @@ max_body_size(Opts) ->
         N when is_integer(N), N > 0 -> N;
         Other -> error({badarg, {max_body_size, Other}})
     end.
+
+goaway_timeout(infinity) -> infinity;
+goaway_timeout(Ms) when is_integer(Ms), Ms >= 0 -> Ms;
+goaway_timeout(Other) -> error({badarg, {goaway_timeout, Other}}).
 
 stream_reject_and_close(StreamId, ErrorCode, State) ->
     State1 = sent_rst(StreamId, ErrorCode, State),
@@ -2270,7 +2348,13 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
                                 true ->
                                     {ok, connected, sent_rst(StreamId, stream_closed, State0a)};
                                 false ->
-                                    {error, protocol_error, State0a}
+                                    %% RFC 9113 §6.8: DATA on a stream our
+                                    %% GOAWAY refused is dropped once counted
+                                    %% against the connection window (above).
+                                    case above_goaway(StreamId, State0a) of
+                                        true  -> {ok, connected, State0a};
+                                        false -> {error, protocol_error, State0a}
+                                    end
                             end
                     end
             end
@@ -3181,19 +3265,49 @@ dispatch_stream_event(StreamId, Event, #state{streams = Streams} = State) ->
             notify_owner({h2, self(), Event}, State)
     end.
 
-handle_send_goaway(From, ErrorCode, _CurrentState, State) ->
-    %% RFC 7540 §6.8: two-phase GOAWAY. Send a "shutdown warning" first with
-    %% LastStreamID = 2^31-1 and NO_ERROR so the peer can finish in-flight
-    %% streams; after a brief drain, send the real GOAWAY with the actual
-    %% last_peer_stream_id and close.
+handle_send_goaway(From, ErrorCode, Timeout, State) ->
+    %% RFC 9113 §6.8: two-phase GOAWAY. Send a "shutdown warning" first with
+    %% LastStreamID = 2^31-1 and NO_ERROR so requests already in flight are
+    %% still accepted; after a brief drain, send the real GOAWAY with the
+    %% actual last_peer_stream_id, then close once the open streams end
+    %% (bounded by goaway_timeout).
     State1 = send_goaway_frame(?MAX_STREAM_ID, no_error, State),
     notify_owner({h2, self(), goaway_sent}, State1),
     DrainTimer = erlang:start_timer(?GOAWAY_DRAIN_MS, self(), goaway_drain),
     State2 = State1#state{
         goaway_error = ErrorCode,
-        close_timer = DrainTimer
+        close_timer = DrainTimer,
+        goaway_timeout = case Timeout of
+            default -> State1#state.goaway_timeout;
+            _ -> Timeout
+        end
     },
     {next_state, goaway_sent, State2, [{reply, From, ok}]}.
+
+%% Last stream id for the final GOAWAY: the highest peer stream we accepted,
+%% or one whose field block is still arriving in CONTINUATION frames, since
+%% it reaches the application once complete (RFC 9113 §8.7).
+final_goaway_last_id(#state{last_peer_stream_id = Last, mode = Mode,
+                            expecting_continuation = {StreamId, _}})
+  when StreamId > Last ->
+    case is_peer_initiated(StreamId, Mode) of
+        true -> StreamId;
+        false -> Last
+    end;
+final_goaway_last_id(#state{last_peer_stream_id = Last}) ->
+    Last.
+
+start_goaway_timer(infinity) -> undefined;
+start_goaway_timer(Ms) -> erlang:start_timer(Ms, self(), goaway_timeout).
+
+%% RFC 9113 §6.8: true for a peer-initiated stream above the last stream id
+%% of the GOAWAY we sent. Such a stream was never processed; its frames are
+%% discarded instead of being treated as frames on an idle stream.
+above_goaway(StreamId, #state{goaway_last_id = Last, mode = Mode})
+  when is_integer(Last), StreamId > Last ->
+    is_peer_initiated(StreamId, Mode);
+above_goaway(_StreamId, _State) ->
+    false.
 
 %% ============================================================================
 %% Internal: Common Call Handling
@@ -3416,9 +3530,17 @@ put_stream(StreamId, Stream, #state{streams = Streams, mode = Mode,
                          active_stream_count = AC + DA,
                          peer_active_stream_count = PC + DP},
     case DA < 0 of
-        true -> maybe_stream_available(State1);
+        true -> maybe_drained(maybe_stream_available(State1));
         false -> State1
     end.
+
+%% During a graceful shutdown, tell the goaway_sent state the last stream has
+%% closed so it can close the connection once the current event is handled.
+maybe_drained(#state{goaway_draining = true, active_stream_count = 0} = State) ->
+    self() ! goaway_complete,
+    State;
+maybe_drained(State) ->
+    State.
 
 %% RFC 9113 §5.1.2: a request refused at the peer's concurrency limit marks
 %% the connection blocked, so the owner can be told when a slot frees.
@@ -3722,10 +3844,18 @@ send_frame(Frame, State) ->
 sock_send(#state{socket = Socket, transport = Transport}, IoData) ->
     Transport:send(Socket, IoData).
 
-send_goaway_frame(LastStreamId, ErrorCode, State) ->
+%% RFC 9113 §6.8: "Endpoints MUST NOT increase the value they send in the
+%% last stream identifier", so a later GOAWAY (an error during a graceful
+%% drain) is clamped to the previous one.
+send_goaway_frame(LastStreamId0, ErrorCode, #state{goaway_last_id = Prev} = State) ->
+    LastStreamId = case Prev of
+        undefined -> LastStreamId0;
+        _ -> min(Prev, LastStreamId0)
+    end,
     Frame = h2_frame:goaway(LastStreamId, ErrorCode, <<>>),
     _ = sock_send(State, h2_frame:encode_iodata(Frame)),
-    State#state{goaway_sent = true, goaway_error = ErrorCode}.
+    State#state{goaway_sent = true, goaway_error = ErrorCode,
+                goaway_last_id = LastStreamId}.
 
 send_rst_stream(StreamId, ErrorCode, State) ->
     Frame = h2_frame:rst_stream(StreamId, ErrorCode),

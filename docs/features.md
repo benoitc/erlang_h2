@@ -12,7 +12,7 @@
 - Flow control at both connection and stream level, including `SETTINGS_INITIAL_WINDOW_SIZE` retroactive adjustment with signed 32-bit overflow detection.
 - Configurable connection receive window: `connection_window_size` (client and server, 65535..2147483647, default 65535) is granted with one stream-0 `WINDOW_UPDATE` after our SETTINGS and is the refill target afterwards.
 - SETTINGS negotiation: synchronous ACK timing, `SETTINGS_TIMEOUT`, validation of each parameter's legal range.
-- Two-phase GOAWAY: graceful drain window before socket close.
+- Graceful GOAWAY (§6.8): a warning GOAWAY (last stream id 2^31-1), then the real one after 100 ms. Streams at or below its last stream id run to completion and the connection closes when the last one ends, bounded by `goaway_timeout` (default 3000 ms; per call with `h2:goaway(Conn, #{timeout => Ms})`). Streams the peer opens above it are discarded: their header blocks are still decoded to keep HPACK in step and their DATA still counts against the connection window. A later GOAWAY never raises the last stream id. On a client GOAWAY the built-in server finishes the client's requests the same way.
 - CONTINUATION interleaving: only CONTINUATION frames on the same stream accepted between HEADERS and END_HEADERS; anything else is a `PROTOCOL_ERROR`.
 - Pseudo-header validation: required set per direction, order rule, lowercase header names, `:path` non-empty for non-CONNECT, `:authority` / `Host` consistency.
 - Field syntax: names restricted to RFC 7230 `tchar` (rejects SP/HTAB/colon in regular headers, DEL, non-ASCII); values reject NUL/CR/LF and leading/trailing SP/HTAB.
@@ -63,7 +63,7 @@ h2:send_trailers/3
 h2:cancel/2,3
 h2:set_stream_handler/3,4
 h2:unset_stream_handler/2
-h2:goaway/1,2
+h2:goaway/1,2         %% /2 takes an error code or #{error, timeout}
 h2:close/1
 h2:controlling_process/2
 

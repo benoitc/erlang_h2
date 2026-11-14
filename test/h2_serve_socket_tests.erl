@@ -14,6 +14,7 @@ serve_socket_test_() ->
     {timeout, 60,
      [fun serves_request/0,
       fun teardown_on_client_disconnect/0,
+      fun plain_close_exits_normal/0,
       fun settings_pass_through/0]}.
 
 alpn_test_() ->
@@ -64,6 +65,34 @@ teardown_on_client_disconnect() ->
     ?assert(is_process_alive(Acceptor)),
 
     cleanup(undefined, Acceptor, LSock).
+
+%% A client that closes its socket without sending GOAWAY is also a clean
+%% disconnect: the process exits `normal', not with the connection's
+%% `{shutdown, tcp_closed}', so a linked caller is not taken down.
+plain_close_exits_normal() ->
+    {ok, _} = application:ensure_all_started(h2),
+    {ok, L} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(L),
+    Self = self(),
+    _ = spawn(fun() ->
+                      {ok, S} = gen_tcp:accept(L, 5000),
+                      ok = gen_tcp:controlling_process(S, Self),
+                      Self ! {accepted, S}
+              end),
+    {ok, C} = gen_tcp:connect("127.0.0.1", Port, [binary, {active, false}], 5000),
+    S = receive {accepted, A} -> A after 5000 -> error(no_accept) end,
+    {ok, Pid} = h2:serve_socket(S, #{handler => fun echo_handler/5}),
+    MRef = erlang:monitor(process, Pid),
+    ok = gen_tcp:send(C, [<<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>,
+                          h2_frame:encode(h2_frame:settings([]))]),
+    {ok, _} = gen_tcp:recv(C, 0, 5000),
+    ok = gen_tcp:close(C),
+    receive
+        {'DOWN', MRef, process, Pid, Reason} -> ?assertEqual(normal, Reason)
+    after 5000 ->
+        error(connection_still_alive)
+    end,
+    gen_tcp:close(L).
 
 %% An option handed to serve_socket/2 reaches the connection: the client sees
 %% the server's SETTINGS_MAX_CONCURRENT_STREAMS.
