@@ -45,6 +45,12 @@
 
 -include("h2.hrl").
 
+%% Small helpers shared by the send paths. They are functions so that each rule
+%% is written once; they are inlined so that sharing them costs nothing on the
+%% request path.
+-compile({inline, [check_outbound/3, validate_outbound/2, after_local_end/1,
+                   close_if_ended/3, send_failed/3, client_stream_slot/1]}).
+
 -define(SETTINGS_TIMEOUT_MS, 5000).
 -define(CLOSE_TIMEOUT_MS, 5000).
 -define(GOAWAY_DRAIN_MS, 100).
@@ -2129,170 +2135,168 @@ handle_consume(From, StreamId, ByteCount, #state{streams = Streams} = State) ->
 %% Internal: Send Operations
 %% ============================================================================
 
-handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client, next_stream_id = StreamId,
-                                                        peer_max_concurrent_streams = MaxStreams,
-                                                        peer_initial_window_size = InitialWindow,
-                                                        scheme = Scheme,
-                                                        encode_context = EncCtx} = State) ->
-    ActiveStreams = count_active_streams(State),
-
-    case MaxStreams of
-        N when is_integer(N), ActiveStreams >= N ->
+handle_send_request(From, Method, Path, Headers, EndStream,
+                    #state{mode = client, next_stream_id = StreamId,
+                           scheme = Scheme} = State) ->
+    case client_stream_slot(State) of
+        full ->
             {keep_state, mark_stream_blocked(State),
              [{reply, From, {error, max_streams_exceeded}}]};
-        _ ->
-            IsConnect = Method =:= <<"CONNECT">>,
+        ok ->
             Host = proplists:get_value(<<"host">>, Headers),
-            %% RFC 7540 §8.3: CONNECT MUST omit :scheme/:path; :authority required.
-            %% For non-CONNECT, RFC 9113 §8.3.1 makes :authority optional — omit
-            %% it rather than injecting an empty string when host is missing.
-            case {IsConnect, Host} of
-                {true, undefined} ->
+            case Method =:= <<"CONNECT">> andalso Host =:= undefined of
+                true ->
+                    %% RFC 7540 §8.3: CONNECT carries :authority.
                     {keep_state, State, [{reply, From, {error, missing_authority}}]};
-                _ ->
-                    PseudoBase = [{<<":method">>, Method}],
-                    Pseudo1 = case IsConnect of
-                        true  -> PseudoBase;
-                        false -> PseudoBase
-                                 ++ [{<<":path">>, Path},
-                                     {<<":scheme">>, Scheme}]
-                    end,
-                    Pseudo = case Host of
-                        undefined -> Pseudo1;
-                        _         -> Pseudo1 ++ [{<<":authority">>, Host}]
-                    end,
-                    AllHeaders = Pseudo
-                                 ++ lists:filter(fun({N1, _}) -> N1 =/= <<"host">> end, Headers),
-
-            case h2_headers:validate_outbound_request(AllHeaders) of
-                {error, _} = Err ->
-                    {keep_state, State, [{reply, From, Err}]};
-                ok ->
-                    case check_peer_max_header_list_size(AllHeaders, State) of
-                        {error, _} = SErr ->
-                            {keep_state, State, [{reply, From, SErr}]};
+                false ->
+                    AllHeaders = request_pseudo_headers(Method, Path, Scheme, Host)
+                                 ++ lists:filter(fun({N, _}) -> N =/= <<"host">> end,
+                                                 Headers),
+                    case check_outbound(request, AllHeaders, State) of
+                        {error, _} = Err ->
+                            {keep_state, State, [{reply, From, Err}]};
                         ok ->
-                    {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
-
-                    RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
-                    StreamState = case EndStream of
-                        true -> half_closed_local;
-                        false -> open
-                    end,
-                    %% RFC 7540 §8.3: tunnel is only established on the 2xx
-                    %% response; do NOT pre-set tunnel=true here. The client-side
-                    %% flip happens in handle_client_initial.
-                    Stream = #stream{
-                        id = StreamId,
-                        state = StreamState,
-                        window_size = InitialWindow,
-                        recv_window_size = RecvWindow,
-                        tunnel = false,
-                        request_method = Method
-                    },
-
-                    case send_header_block(StreamId, HeaderBlock, EndStream, State) of
-                        ok ->
-                            State0 = put_stream(StreamId, Stream, State),
-                            State1 = State0#state{
-                                encode_context = EncCtx1,
-                                next_stream_id = StreamId + 2
-                            },
-                            {keep_state, State1, [{reply, From, {ok, StreamId}}]};
-                        {error, SendReason} ->
-                            {stop_and_reply,
-                             {shutdown, {send_failed, SendReason}},
-                             [{reply, From, {error, SendReason}}],
-                             State}
+                            Stream = new_client_stream(Method, EndStream, State),
+                            open_client_stream(From, Stream, AllHeaders, EndStream,
+                                               {ok, StreamId}, State)
                     end
-                    end
-            end
             end
     end;
-
 handle_send_request(From, _Method, _Path, _Headers, _EndStream, State) ->
     {keep_state, State, [{reply, From, {error, not_client}}]}.
 
+%% Pseudo-headers of a request built from method, path and the `host' header.
+%% RFC 7540 §8.3: CONNECT omits :scheme and :path. For the other methods
+%% RFC 9113 §8.3.1 makes :authority optional, so it is left out rather than
+%% sent empty when there is no host.
+request_pseudo_headers(Method, Path, Scheme, Host) ->
+    Base = case Method of
+        <<"CONNECT">> -> [{<<":method">>, Method}];
+        _ -> [{<<":method">>, Method}, {<<":path">>, Path}, {<<":scheme">>, Scheme}]
+    end,
+    case Host of
+        undefined -> Base;
+        _         -> Base ++ [{<<":authority">>, Host}]
+    end.
+
 handle_send_request_headers(From, Headers, EndStream, Opts,
                             #state{mode = client, next_stream_id = StreamId,
-                                   peer_max_concurrent_streams = MaxStreams,
-                                   peer_initial_window_size = InitialWindow,
-                                   peer_settings = PeerSettings,
-                                   encode_context = EncCtx} = State) ->
-    ActiveStreams = count_active_streams(State),
-    case MaxStreams of
-        N when is_integer(N), ActiveStreams >= N ->
+                                   peer_settings = PeerSettings} = State) ->
+    case client_stream_slot(State) of
+        full ->
             {keep_state, mark_stream_blocked(State),
              [{reply, From, {error, max_streams_exceeded}}]};
-        _ ->
+        ok ->
             Method = proplists:get_value(<<":method">>, Headers),
             Protocol = proplists:get_value(<<":protocol">>, Headers),
-            %% RFC 8441: client MUST NOT send Extended CONNECT until peer has
-            %% advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1; method MUST be
-            %% CONNECT when `:protocol` is present.
-            ExtendedConnectGuard = case Protocol of
-                undefined -> ok;
-                _ when Method =/= <<"CONNECT">> ->
-                    {error, extended_connect_method};
-                _ ->
-                    case h2_settings:get(enable_connect_protocol, PeerSettings) of
-                        1 -> ok;
-                        _ -> {error, extended_connect_disabled}
-                    end
+            Checked = case extended_connect_guard(Method, Protocol, PeerSettings) of
+                ok -> check_outbound(request, Headers, State);
+                {error, _} = GuardErr -> GuardErr
             end,
-            case ExtendedConnectGuard of
-                {error, _} = ECErr ->
-                    {keep_state, State, [{reply, From, ECErr}]};
-                ok ->
-            case h2_headers:validate_outbound_request(Headers) of
+            case Checked of
                 {error, _} = Err ->
                     {keep_state, State, [{reply, From, Err}]};
                 ok ->
-            case check_peer_max_header_list_size(Headers, State) of
-                {error, _} = SErr ->
-                    {keep_state, State, [{reply, From, SErr}]};
-                ok ->
-            {HeaderBlock, EncCtx1} = h2_hpack:encode(Headers, EncCtx),
-            RecvWindow = h2_settings:get(initial_window_size, State#state.local_settings),
-            StreamState = case EndStream of true -> half_closed_local; false -> open end,
-            {Handler, DispatchMode, FlowControl} = stream_opts(Opts),
-            %% RFC 7540 §8.3 / RFC 8441: tunnel only opens on the 2xx response.
-            Stream = #stream{
-                id = StreamId,
-                state = StreamState,
-                window_size = InitialWindow,
-                recv_window_size = RecvWindow,
-                tunnel = false,
-                protocol = Protocol,
-                request_method = Method,
-                handler = Handler,
-                dispatch_mode = DispatchMode,
-                flow_control = FlowControl
-            },
-            case send_header_block(StreamId, HeaderBlock, EndStream, State) of
-                ok ->
-                    State0 = put_stream(StreamId, Stream, State),
-                    State1 = State0#state{
-                        encode_context = EncCtx1,
-                        next_stream_id = StreamId + 2
-                    },
+                    {Handler, DispatchMode, FlowControl} = stream_opts(Opts),
+                    Stream0 = new_client_stream(Method, EndStream, State),
+                    Stream = Stream0#stream{protocol = Protocol,
+                                            handler = Handler,
+                                            dispatch_mode = DispatchMode,
+                                            flow_control = FlowControl},
                     Reply = case report_peer_settings(Opts) of
                         true  -> {ok, StreamId, PeerSettings};
                         false -> {ok, StreamId}
                     end,
-                    {keep_state, State1, [{reply, From, Reply}]};
-                {error, SendReason} ->
-                    {stop_and_reply,
-                     {shutdown, {send_failed, SendReason}},
-                     [{reply, From, {error, SendReason}}],
-                     State}
-            end
-            end
-            end
+                    open_client_stream(From, Stream, Headers, EndStream, Reply, State)
             end
     end;
 handle_send_request_headers(From, _Headers, _EndStream, _Opts, State) ->
     {keep_state, State, [{reply, From, {error, not_client}}]}.
+
+%% RFC 8441: a client MUST NOT send Extended CONNECT until the peer has
+%% advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1, and the method MUST be
+%% CONNECT when `:protocol' is present.
+extended_connect_guard(_Method, undefined, _PeerSettings) ->
+    ok;
+extended_connect_guard(Method, _Protocol, _PeerSettings) when Method =/= <<"CONNECT">> ->
+    {error, extended_connect_method};
+extended_connect_guard(_Method, _Protocol, PeerSettings) ->
+    case h2_settings:get(enable_connect_protocol, PeerSettings) of
+        1 -> ok;
+        _ -> {error, extended_connect_disabled}
+    end.
+
+%% RFC 9113 §5.1.2: may this client open one more stream under the peer's
+%% SETTINGS_MAX_CONCURRENT_STREAMS?
+client_stream_slot(#state{peer_max_concurrent_streams = Max} = State)
+  when is_integer(Max) ->
+    case count_active_streams(State) >= Max of
+        true  -> full;
+        false -> ok
+    end;
+client_stream_slot(_State) ->
+    ok.
+
+%% The record of the stream the next request opens. RFC 7540 §8.3: the stream
+%% is not a tunnel yet; handle_client_initial sets that on the 2xx response.
+new_client_stream(Method, EndStream,
+                  #state{next_stream_id = StreamId,
+                         peer_initial_window_size = InitialWindow,
+                         local_settings = LocalSettings}) ->
+    #stream{
+        id = StreamId,
+        state = case EndStream of
+                    true  -> half_closed_local;
+                    false -> open
+                end,
+        window_size = InitialWindow,
+        recv_window_size = h2_settings:get(initial_window_size, LocalSettings),
+        tunnel = false,
+        request_method = Method
+    }.
+
+%% Encode and write the request HEADERS (already checked with
+%% check_outbound/3), then store the stream and take its id.
+open_client_stream(From, #stream{id = StreamId} = Stream, Headers, EndStream, Reply,
+                   #state{encode_context = EncCtx} = State) ->
+    {HeaderBlock, EncCtx1} = h2_hpack:encode(Headers, EncCtx),
+    case send_header_block(StreamId, HeaderBlock, EndStream, State) of
+        ok ->
+            State1 = put_stream(StreamId, Stream, State),
+            {keep_state,
+             State1#state{encode_context = EncCtx1, next_stream_id = StreamId + 2},
+             [{reply, From, Reply}]};
+        {error, Reason} ->
+            send_failed(From, Reason, State)
+    end.
+
+%% RFC 9113 §8.2, §6.5.2: a header block we are about to send must be well
+%% formed and fit the peer's SETTINGS_MAX_HEADER_LIST_SIZE. Validation comes
+%% first. `request' and `response' take the full list, pseudo-headers included.
+check_outbound(Kind, Headers, State) ->
+    case validate_outbound(Kind, Headers) of
+        ok -> check_peer_max_header_list_size(Headers, State);
+        {error, _} = Err -> Err
+    end.
+
+validate_outbound(request, Headers)  -> h2_headers:validate_outbound_request(Headers);
+validate_outbound(response, Headers) -> h2_headers:validate_outbound_response(Headers);
+validate_outbound(trailers, Headers) -> h2_headers:validate_trailers(Headers, true).
+
+%% A socket write failed: the connection is over. Answer the caller with the
+%% reason and stop.
+send_failed(From, Reason, State) ->
+    {stop_and_reply, {shutdown, {send_failed, Reason}},
+     [{reply, From, {error, Reason}}], State}.
+
+%% Stream state once our END_STREAM has gone out (RFC 9113 §5.1).
+after_local_end(open)               -> half_closed_local;
+after_local_end(half_closed_remote) -> closed;
+after_local_end(StreamState)        -> StreamState.
+
+%% Close the stream when both sides have ended.
+close_if_ended(StreamId, closed, State) -> close_stream(StreamId, end_stream, State);
+close_if_ended(_StreamId, _StreamState, State) -> State.
 
 %% Resolve per-stream creation options into {Handler, DispatchMode, FlowControl}.
 %% `handler' takes priority (events route to the pid from creation, race-free);
@@ -2332,25 +2336,19 @@ handle_send_response(From, StreamId, Status, Headers, Opts,
             %% RFC 7540 §8.3: a CONNECT 2xx response MUST NOT carry
             %% Content-Length or Transfer-Encoding; the stream becomes a
             %% tunnel only when the 2xx goes out, never before.
-            IsConnectRequest = ReqMethod =:= <<"CONNECT">>,
-            IsSuccess        = Status >= 200 andalso Status < 300,
-            case IsConnectRequest andalso IsSuccess andalso
-                 h2_headers:has_banned_tunnel_header(Headers) of
-                true ->
-                    {keep_state, State,
-                     [{reply, From, {error, banned_header_in_tunnel_response}}]};
-                false ->
-                    StatusBin = integer_to_binary(Status),
-                    AllHeaders = [{<<":status">>, StatusBin}
-                                  | h2_headers:outbound_response_headers(Status, Headers)],
-                    case h2_headers:validate_outbound_response(AllHeaders) of
-                        {error, _} = Err ->
-                            {keep_state, State, [{reply, From, Err}]};
-                        ok ->
-                    case check_peer_max_header_list_size(AllHeaders, State) of
-                        {error, _} = SErr ->
-                            {keep_state, State, [{reply, From, SErr}]};
-                        ok ->
+            IsTunnel = ReqMethod =:= <<"CONNECT">>
+                       andalso Status >= 200 andalso Status < 300,
+            AllHeaders = [{<<":status">>, integer_to_binary(Status)}
+                          | h2_headers:outbound_response_headers(Status, Headers)],
+            Checked = case IsTunnel andalso
+                           h2_headers:has_banned_tunnel_header(Headers) of
+                true  -> {error, banned_header_in_tunnel_response};
+                false -> check_outbound(response, AllHeaders, State)
+            end,
+            case Checked of
+                {error, _} = Err ->
+                    {keep_state, State, [{reply, From, Err}]};
+                ok ->
                     {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
                     %% RFC 9110 §6.4.1: a final response with no content
                     %% (HEAD / 204 / 304) terminates at the header block.
@@ -2360,42 +2358,28 @@ handle_send_response(From, StreamId, Status, Headers, Opts,
                     NoContent = h2_headers:no_content_status(ReqMethod, Status),
                     case send_header_block(StreamId, HeaderBlock, NoContent, State) of
                         ok ->
-                            NewTunnel = IsConnectRequest andalso IsSuccess,
                             NewState = case NoContent of
-                                true ->
-                                    case StreamState of
-                                        open -> half_closed_local;
-                                        half_closed_remote -> closed
-                                    end;
-                                false ->
-                                    StreamState
+                                true  -> after_local_end(StreamState);
+                                false -> StreamState
                             end,
                             %% body_forbidden is left alone: it guards the
                             %% inbound request body, which an early 204 does
                             %% not forbid.
                             Stream1 = Stream#stream{response_headers = AllHeaders,
-                                                    tunnel = NewTunnel,
+                                                    tunnel = IsTunnel,
                                                     response_seen_final = Status >= 200,
                                                     no_content_sent = NoContent,
                                                     state = NewState},
                             State0 = put_stream(StreamId, Stream1, State),
                             State1 = State0#state{encode_context = EncCtx1},
-                            State2 = case NewState of
-                                closed -> close_stream(StreamId, end_stream, State1);
-                                _      -> State1
-                            end,
                             Reply = case report_peer_settings(Opts) of
                                 true  -> {ok, State#state.peer_settings};
                                 false -> ok
                             end,
-                            {keep_state, State2, [{reply, From, Reply}]};
+                            {keep_state, close_if_ended(StreamId, NewState, State1),
+                             [{reply, From, Reply}]};
                         {error, SendReason} ->
-                            {stop_and_reply,
-                             {shutdown, {send_failed, SendReason}},
-                             [{reply, From, {error, SendReason}}],
-                             State}
-                    end
-                    end
+                            send_failed(From, SendReason, State)
                     end
             end;
         {ok, _} ->
@@ -2436,59 +2420,56 @@ handle_respond(From, StreamId, Status, Headers, Body,
                andalso ReqMethod =/= <<"CONNECT">> ->
             AllHeaders = [{<<":status">>, integer_to_binary(Status)}
                           | h2_headers:outbound_response_headers(Status, Headers)],
-            case h2_headers:validate_outbound_response(AllHeaders) of
+            case check_outbound(response, AllHeaders, State) of
                 {error, _} = Err ->
                     {keep_state, State, [{reply, From, Err}]};
                 ok ->
-            case check_peer_max_header_list_size(AllHeaders, State) of
-                {error, _} = SErr ->
-                    {keep_state, State, [{reply, From, SErr}]};
-                ok ->
-            {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
-            NoContent = h2_headers:no_content_status(ReqMethod, Status),
-            HeadersFit = byte_size(HeaderBlock) =< MaxFrameSize,
-            BodySize = byte_size(Body),
-            if
-                %% Headers-only end-of-stream (no-content response, whose body
-                %% is dropped, or empty body). send_header_block also handles
-                %% CONTINUATION for big blocks.
-                NoContent orelse BodySize =:= 0 ->
-                    case send_header_block(StreamId, HeaderBlock, true, State) of
-                        ok ->
-                            finish_respond(From, StreamId,
-                                           Stream#stream{no_content_sent = NoContent},
-                                           AllHeaders, EncCtx1, St, 0, State);
-                        {error, R} ->
-                            {stop_and_reply, {shutdown, {send_failed, R}},
-                             [{reply, From, {error, R}}], State}
-                    end;
-                %% Coalesce HEADERS + every DATA frame into one write when the
-                %% whole body is within the peer's flow-control windows and the
-                %% coalesce cap. HeadersFit keeps the HEADERS within one frame;
-                %% data_frames/4 chunks the body to MaxFrameSize. BodySize > 0
-                %% here (the empty/forbidden case is handled by the branch above).
-                HeadersFit
-                andalso BodySize =< ConnWindow
-                andalso BodySize =< StreamWindow
-                andalso BodySize =< ?MAX_COALESCED_BODY_BYTES ->
-                    IoData = [h2_frame:encode(
-                                h2_frame:headers(StreamId, HeaderBlock, false))
-                              | data_frames(StreamId, Body, MaxFrameSize, true)],
-                    case sock_send(State, IoData) of
-                        ok ->
-                            finish_respond(From, StreamId, Stream, AllHeaders,
-                                           EncCtx1, St, BodySize, State);
-                        {error, R} ->
-                            {stop_and_reply, {shutdown, {send_failed, R}},
-                             [{reply, From, {error, R}}], State}
-                    end;
-                %% Oversized headers/body: let the granular path split frames and
-                %% apply flow control. Drop EncCtx1 so the dynamic table is only
-                %% updated once, by the fallback encode.
-                true ->
-                    {keep_state, State, [{reply, From, need_fallback}]}
-            end
-            end
+                    {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
+                    NoContent = h2_headers:no_content_status(ReqMethod, Status),
+                    HeadersFit = byte_size(HeaderBlock) =< MaxFrameSize,
+                    BodySize = byte_size(Body),
+                    if
+                        %% Headers-only end-of-stream (no-content response,
+                        %% whose body is dropped, or empty body).
+                        %% send_header_block also handles CONTINUATION for big
+                        %% blocks.
+                        NoContent orelse BodySize =:= 0 ->
+                            case send_header_block(StreamId, HeaderBlock, true, State) of
+                                ok ->
+                                    finish_respond(From, StreamId,
+                                                   Stream#stream{no_content_sent = NoContent},
+                                                   AllHeaders, EncCtx1, St, 0, State);
+                                {error, R} ->
+                                    send_failed(From, R, State)
+                            end;
+                        %% Coalesce HEADERS + every DATA frame into one write
+                        %% when the whole body is within the peer's
+                        %% flow-control windows and the coalesce cap.
+                        %% HeadersFit keeps the HEADERS within one frame;
+                        %% data_frames/4 chunks the body to MaxFrameSize.
+                        %% BodySize > 0 here (the empty/forbidden case is
+                        %% handled by the branch above).
+                        HeadersFit
+                        andalso BodySize =< ConnWindow
+                        andalso BodySize =< StreamWindow
+                        andalso BodySize =< ?MAX_COALESCED_BODY_BYTES ->
+                            IoData = [h2_frame:encode(
+                                        h2_frame:headers(StreamId, HeaderBlock, false))
+                                      | data_frames(StreamId, Body, MaxFrameSize, true)],
+                            case sock_send(State, IoData) of
+                                ok ->
+                                    finish_respond(From, StreamId, Stream, AllHeaders,
+                                                   EncCtx1, St, BodySize, State);
+                                {error, R} ->
+                                    send_failed(From, R, State)
+                            end;
+                        %% Oversized headers/body: let the granular path split
+                        %% frames and apply flow control. Drop EncCtx1 so the
+                        %% dynamic table is only updated once, by the fallback
+                        %% encode.
+                        true ->
+                            {keep_state, State, [{reply, From, need_fallback}]}
+                    end
             end;
         {ok, _} ->
             %% Wrong stream state: let the granular path produce the right error.
@@ -2505,21 +2486,14 @@ handle_respond(From, _StreamId, _Status, _Headers, _Body, State) ->
 finish_respond(From, StreamId, #stream{window_size = StreamWindow} = Stream,
                AllHeaders, EncCtx1, OldState, BodySize,
                #state{conn_window_size = ConnWindow} = State) ->
-    NewSt = case OldState of
-        open -> half_closed_local;
-        half_closed_remote -> closed
-    end,
+    NewSt = after_local_end(OldState),
     Stream1 = Stream#stream{response_headers = AllHeaders, state = NewSt,
                             response_seen_final = true,
                             window_size = StreamWindow - BodySize},
     State0 = put_stream(StreamId, Stream1, State),
     State1 = State0#state{encode_context = EncCtx1,
                           conn_window_size = ConnWindow - BodySize},
-    State2 = case NewSt of
-        closed -> close_stream(StreamId, end_stream, State1);
-        _      -> State1
-    end,
-    {keep_state, State2, [{reply, From, ok}]}.
+    {keep_state, close_if_ended(StreamId, NewSt, State1), [{reply, From, ok}]}.
 
 %% RFC 9113 §4.2: a HEADERS frame's payload must not exceed
 %% SETTINGS_MAX_FRAME_SIZE advertised by the peer. If our encoded block is
@@ -2585,10 +2559,7 @@ handle_send_data(From, StreamId, Data, EndStream, #state{streams = Streams} = St
                         {ok, State2} ->
                             {keep_state, State2, [{reply, From, ok}]};
                         {error, Reason, State2} ->
-                            {stop_and_reply,
-                             {shutdown, {send_failed, Reason}},
-                             [{reply, From, {error, Reason}}],
-                             State2}
+                            send_failed(From, Reason, State2)
                     end
             end;
         {ok, _} ->
@@ -2622,10 +2593,7 @@ handle_send_data_blocking(From, StreamId, Data, EndStream, Timeout,
                             {keep_state, State3}
                     end;
                 {error, Reason, State2} ->
-                    {stop_and_reply,
-                     {shutdown, {send_failed, Reason}},
-                     [{reply, From, {error, Reason}}],
-                     State2}
+                    send_failed(From, Reason, State2)
             end;
         {ok, _} ->
             {keep_state, State, [{reply, From, {error, invalid_stream_state}}]};
@@ -2729,35 +2697,24 @@ handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams} = State
             {keep_state, State, [{reply, From, {error, tunnel_no_trailers}}]};
         {ok, #stream{state = StreamState, send_buffer = Buffer} = Stream}
           when StreamState == open; StreamState == half_closed_remote ->
-            case h2_headers:validate_trailers(Trailers, true) of
+            case check_outbound(trailers, Trailers, State) of
                 {error, _} = Err ->
                     {keep_state, State, [{reply, From, Err}]};
-                ok ->
-            case check_peer_max_header_list_size(Trailers, State) of
-                {error, _} = SErr ->
-                    {keep_state, State, [{reply, From, SErr}]};
-                ok ->
-            case Buffer of
-                <<>> ->
+                ok when Buffer =:= <<>> ->
                     %% Nothing buffered: emit the trailers (END_STREAM) now.
                     case emit_trailers_frame(StreamId, Trailers, Stream, State) of
                         {ok, State1} ->
                             {keep_state, State1, [{reply, From, ok}]};
                         {error, SendReason, State1} ->
-                            {stop_and_reply,
-                             {shutdown, {send_failed, SendReason}},
-                             [{reply, From, {error, SendReason}}],
-                             State1}
+                            send_failed(From, SendReason, State1)
                     end;
-                _ ->
+                ok ->
                     %% DATA still draining under the flow-control window: queue the
                     %% trailers so END_STREAM goes out strictly after that DATA.
                     %% flush_stream/2 emits them once the buffer empties.
                     Stream1 = Stream#stream{pending_trailers = Trailers},
                     {keep_state, put_stream(StreamId, Stream1, State),
                      [{reply, From, ok}]}
-            end
-            end
             end;
         {ok, _} ->
             {keep_state, State, [{reply, From, {error, invalid_stream_state}}]};
@@ -2776,20 +2733,12 @@ emit_trailers_frame(StreamId, Trailers,
         {error, Reason} ->
             {error, Reason, State};
         ok ->
-            NewStreamState = case StreamState of
-                open               -> half_closed_local;
-                half_closed_remote -> closed;
-                _                  -> StreamState
-            end,
+            NewStreamState = after_local_end(StreamState),
             Stream1 = Stream#stream{state = NewStreamState,
                                     pending_trailers = undefined},
             State1 = put_stream(StreamId, Stream1,
                                 State#state{encode_context = EncCtx1}),
-            State2 = case NewStreamState of
-                closed -> close_stream(StreamId, end_stream, State1);
-                _      -> State1
-            end,
-            {ok, State2}
+            {ok, close_if_ended(StreamId, NewStreamState, State1)}
     end.
 
 handle_cancel_stream(From, StreamId, ErrorCode, #state{streams = Streams} = State) ->
@@ -3323,14 +3272,8 @@ flush_stream_one_chunk(StreamId, #state{streams = Streams,
                             {error, Reason, State};
                         ok ->
                             NewStreamState = case IsEnd of
-                                true ->
-                                    case StreamState of
-                                        open -> half_closed_local;
-                                        half_closed_remote -> closed;
-                                        _ -> StreamState
-                                    end;
-                                false ->
-                                    StreamState
+                                true  -> after_local_end(StreamState);
+                                false -> StreamState
                             end,
                             NewConnWindow = ConnWindow - ToSend,
                             NewStreamWindow = StreamWindow - ToSend,
@@ -3372,11 +3315,7 @@ emit_end_stream_data(StreamId, #stream{state = StreamState} = Stream, State) ->
         {error, Reason} ->
             {error, Reason, State};
         ok ->
-            NewStreamState = case StreamState of
-                open -> half_closed_local;
-                half_closed_remote -> closed;
-                _ -> StreamState
-            end,
+            NewStreamState = after_local_end(StreamState),
             Stream1 = Stream#stream{pending_end_stream = false,
                                     state = NewStreamState},
             State1 = put_stream(StreamId, Stream1, State),
