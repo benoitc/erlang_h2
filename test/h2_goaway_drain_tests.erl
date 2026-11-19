@@ -36,7 +36,13 @@ goaway_drain_test_() ->
       {"per-call timeout bounds the drain",
        {timeout, 30, fun call_timeout_bounds_drain/0}},
       {"h2 client: own request completes after its GOAWAY",
-       {timeout, 30, fun client_goaway_drains/0}}]}.
+       {timeout, 30, fun client_goaway_drains/0}},
+      {"goaway before the peer acknowledges SETTINGS is accepted and drains",
+       {timeout, 30, fun before_settings_ack/0}},
+      {"goaway with SETTINGS never acknowledged is bounded by goaway_timeout",
+       {timeout, 30, fun settings_never_acked/0}},
+      {"h2 client: goaway before its SETTINGS are acknowledged",
+       {timeout, 30, fun client_before_settings_ack/0}}]}.
 
 %% ---------------------------------------------------------------------------
 %% Cases
@@ -264,6 +270,98 @@ client_goaway_drains() ->
         flush()
     end.
 
+%% A server answers requests as soon as it has the client preface, before the
+%% client acknowledges its SETTINGS (RFC 9113 §3.4). A handler may call
+%% goaway/1 in that window; RFC 9113 §6.8 allows GOAWAY at any time.
+before_settings_ack() ->
+    {Ref, Sock, Ctx} = connect_no_ack(held_handler(), #{}),
+    try
+        _ = request(Sock, 1, Ctx, true),
+        {Conn, H1} = wait_request(1),
+        ?assertEqual(ok, h2:goaway(Conn)),
+        {Frames1, open} = read_until(Sock, fun is_final_goaway/1, 2000),
+        ?assertEqual([{goaway, ?MAX_ID, 0}, {goaway, 1, 0}], goaways(Frames1)),
+        %% The late acknowledgement does not disturb the drain.
+        ok = gen_tcp:send(Sock, h2_frame:encode(h2_frame:settings_ack())),
+        timer:sleep(100),
+        H1 ! {reply, <<"done">>},
+        {Frames2, closed} = read_until(Sock, fun(_) -> false end, 3000),
+        ?assertMatch([{headers, 1, _}, {data, 1, <<"done">>, true}],
+                     stream_frames(1, Frames2)),
+        ?assertEqual([], goaways(Frames2)),
+        ?assertEqual(ok, wait_reply_result(H1))
+    after
+        close(Ref, Sock)
+    end.
+
+settings_never_acked() ->
+    {Ref, Sock, Ctx} = connect_no_ack(watch_handler(), #{goaway_timeout => 300}),
+    try
+        _ = request(Sock, 1, Ctx, false),
+        {Conn, _H1} = wait_request(1),
+        ?assertEqual(ok, h2:goaway(Conn)),
+        {_, open} = read_until(Sock, fun is_final_goaway/1, 2000),
+        T0 = now_ms(),
+        {_, closed} = read_until(Sock, fun(_) -> false end, 3000),
+        ?assert(now_ms() - T0 < 1500),
+        ?assertEqual(goaway_timeout, wait_handler_closed())
+    after
+        close(Ref, Sock)
+    end.
+
+%% The client has the server's SETTINGS but no acknowledgement of its own: it
+%% is not `connected' yet (a state h2:connect/3 never hands out, reached here
+%% through h2_connection). goaway/1 is accepted, a wait_connected/1 caller is
+%% released with an error, and the owner is not told `connected' afterwards.
+client_before_settings_ack() ->
+    process_flag(trap_exit, true),
+    {ok, LS} = gen_tcp:listen(0, [binary, {active, false}, {packet, raw},
+                                  {reuseaddr, true}]),
+    {ok, Port} = inet:port(LS),
+    Test = self(),
+    Peer = spawn_link(fun() ->
+        {ok, S} = gen_tcp:accept(LS, 5000),
+        {ok, ?PREFACE} = gen_tcp:recv(S, byte_size(?PREFACE), 5000),
+        ok = gen_tcp:send(S, h2_frame:encode(h2_frame:settings([]))),
+        %% The client acknowledges our SETTINGS: it has processed them.
+        {_, open} = read_until(S, fun(F) -> F =:= {settings_ack} end, 5000),
+        Test ! {peer, ready},
+        {Frames, _} = read_until(S, fun is_final_goaway/1, 5000),
+        Test ! {peer, goaways(Frames)},
+        %% Acknowledge late, as a slow peer would.
+        _ = gen_tcp:send(S, h2_frame:encode(h2_frame:settings_ack())),
+        receive stop -> ok after 5000 -> ok end
+    end),
+    %% h2:connect/3 returns only once connected, so start the connection the
+    %% way it does, without the wait.
+    {ok, CSock} = gen_tcp:connect("127.0.0.1", Port,
+                                  [binary, {active, false}, {packet, raw}], 5000),
+    {ok, Client} = h2_connection:start_link(client, CSock, #{}),
+    ok = gen_tcp:controlling_process(CSock, Client),
+    ok = h2_connection:activate(Client),
+    try
+        receive {peer, ready} -> ok after 5000 -> error(peer_not_ready) end,
+        Waiter = spawn_link(fun() -> Test ! {waited, h2:wait_connected(Client)} end),
+        timer:sleep(50),
+        ?assertEqual(ok, h2:goaway(Client)),
+        ?assertMatch({error, _},
+                     receive {waited, R} -> R after 2000 -> error({stuck, Waiter}) end),
+        ?assertEqual([{goaway, ?MAX_ID, 0}, {goaway, 0, 0}],
+                     receive {peer, G} -> G after 5000 -> error(no_goaway) end),
+        ?assertEqual(goaway_drained,
+                     receive {h2, Client, {closed, Reason}} -> Reason
+                     after 3000 -> error(no_closed) end),
+        ?assertEqual(not_connected,
+                     receive {h2, Client, connected} -> connected
+                     after 0 -> not_connected end)
+    after
+        try h2:close(Client) catch _:_ -> ok end,
+        unlink(Peer),
+        exit(Peer, kill),
+        gen_tcp:close(LS),
+        flush()
+    end.
+
 %% ---------------------------------------------------------------------------
 %% Handlers
 %% ---------------------------------------------------------------------------
@@ -321,6 +419,15 @@ connect(Handler, Opts) ->
     ok = gen_tcp:send(Sock, [?PREFACE,
                              h2_frame:encode(h2_frame:settings([])),
                              h2_frame:encode(h2_frame:settings_ack())]),
+    {Ref, Sock, h2_hpack:new_context()}.
+
+%% As connect/2, but the client never acknowledges the server's SETTINGS, so
+%% the server stays in its `settings' state.
+connect_no_ack(Handler, Opts) ->
+    {ok, Ref} = h2:start_server(0, Opts#{transport => tcp, handler => Handler}),
+    {ok, Sock} = gen_tcp:connect("127.0.0.1", h2:server_port(Ref),
+                                 [binary, {active, false}, {packet, raw}], 5000),
+    ok = gen_tcp:send(Sock, [?PREFACE, h2_frame:encode(h2_frame:settings([]))]),
     {Ref, Sock, h2_hpack:new_context()}.
 
 req_headers() ->

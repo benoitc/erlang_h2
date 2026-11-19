@@ -2,6 +2,16 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.18.2] - 2026-11-19
+
+### Fixed
+
+- `h2:goaway/1` called from a request handler could return a `not_ready`
+  error and do nothing. It happened when the handler ran before the client
+  had acknowledged the server's settings, which is common for the first
+  request on a connection. The shutdown is now accepted at that point and
+  the requests already running still finish.
+
 ## [0.18.1] - 2026-11-19
 
 ### Fixed

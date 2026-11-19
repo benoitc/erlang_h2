@@ -716,6 +716,21 @@ settings({call, From}, activate, State) ->
 %% just because the SETTINGS-ACK has not arrived yet. Handle the response-side
 %% calls here exactly as `connected` does (the connection stays in `settings`
 %% until the ACK arrives, then transitions normally).
+%% RFC 9113 §6.8: GOAWAY may be sent at any time, and our own SETTINGS are
+%% already out. A server handler can ask for it here, because requests are
+%% dispatched before the client acknowledges our SETTINGS. The connection will
+%% never report `connected', so wait_connected callers are released and the
+%% SETTINGS timer is dropped; the drain is bounded by goaway_timeout instead.
+settings({call, From}, {send_goaway, ErrorCode, Timeout},
+         #state{settings_timer = Timer, waiters = Waiters} = State) ->
+    ok = cancel_timer(Timer),
+    Replies = [{reply, Waiter, {error, goaway_sent}} || Waiter <- Waiters],
+    State1 = State#state{settings_timer = undefined, waiters = [],
+                         connected_notified = true},
+    {next_state, goaway_sent, State2, Actions} =
+        handle_send_goaway(From, ErrorCode, Timeout, State1),
+    {next_state, goaway_sent, State2, Replies ++ Actions};
+
 settings({call, From}, Request, State) ->
     case handle_stream_call(From, Request, State) of
         false  -> handle_call_early(From, Request, settings, State);
