@@ -126,7 +126,7 @@ The library satisfies the gRPC bidi contract over a single stream: both peers se
 - **Stream priorities (§5.3)** — deprecated by RFC 9218 (Extensible Priorities). PRIORITY frames and the PRIORITY block on HEADERS are parsed and self-dependency is rejected (§5.3.1), but the priority signal is otherwise ignored; no scheduler applies it.
 - **HTTP/2 cleartext upgrade (§3.2)** — this release is ALPN-only. Starting an h2 connection over prior knowledge TCP is supported (`transport => tcp`), but `Upgrade: h2c` from an HTTP/1.1 request is not.
 - **Alt-Svc advertisement** — library concern, leave to the caller.
-- **WebTransport (RFC 9220)** — separate framing/setting; deferred.
+- **The WebTransport session layer** (streams, datagrams and flow control inside the tunnel): it lives in [erlang-webtransport](https://github.com/benoitc/erlang-webtransport). This library supplies what it builds on: Extended CONNECT, extension SETTINGS, the peer's SETTINGS, the TLS version, and the capsule codec.
 - **WebSocket framing on top of an Extended CONNECT tunnel** — out of scope here; this library exposes the tunnel via `:protocol`, the framing layer belongs in a dedicated module.
 
 ## Internal modules
@@ -137,17 +137,19 @@ Useful to know when extending or debugging:
 |---|---|
 | `h2_connection` | `gen_statem` owning the socket; one process per connection. |
 | `h2_app` / `h2_sup` | Application callback and top-level supervisor. `h2_sup` is a `simple_one_for_one` parent of per-server listeners, so calling `h2:start_server/2` from a short-lived process no longer tears the listener down when the caller exits. |
-| `h2_listener` | Per-server process spawned under `h2_sup`: owns the listen socket and the acceptor pool. |
+| `h2` | Besides the public API, holds the accept loop and the per-connection serving code. It is here, not in `h2_listener`, because `h2:serve_socket/2` runs the same code in a process the caller owns (a listener that picks h2 or HTTP/1.1 by ALPN, for example). |
+| `h2_listener` | Per-server process spawned under `h2_sup`: owns the listen socket and the lifetime of the acceptors, which run the loop `h2` gives it. |
 | `h2_server` | Standalone escript entry point; not used by `h2:start_server/2`. |
 | `h2_frame` | Pure frame encode/decode with per-type stream-id 0 and size validation. |
 | `h2_hpack` | HPACK context type, encode/decode, size updates, Huffman. |
 | `h2_settings` | Typed settings map, encode/decode/validate, parameter defaults. |
 | `h2_error` | HTTP/2 error code ↔ atom ↔ format-string mapping. |
+| `h2_capsule` / `h2_varint` | Capsule Protocol (RFC 9297) and variable-length integer codecs, for protocols carried in an Extended CONNECT tunnel. |
 
 ## Testing
 
-- `rebar3 eunit` — 310 unit tests and 800 PropEr properties across frame/HPACK/settings/varint.
-- `rebar3 ct --suite=test/h2_compliance_SUITE` — 81 Common Test cases: RFC compliance, client/server round-trips, CONNECT and Extended CONNECT tunnels, API-parity with `quic_h3`, malformed-message enforcement, flow-control accounting, error paths.
+- `rebar3 eunit` — unit tests, raw-socket behaviour tests, and PropEr properties across frame/HPACK/settings/varint.
+- `rebar3 ct --suite=test/h2_compliance_SUITE` — RFC compliance, client/server round-trips, CONNECT and Extended CONNECT tunnels, API-parity with `quic_h3`, malformed-message enforcement, flow-control accounting, error paths.
 - `rebar3 ct --suite=test/h2_interop_SUITE` — external interop via h2spec (generic + HPACK).
 - `rebar3 ct --suite=test/h2_grpc_interop_SUITE` — gRPC interop: a real gRPC client (grpcurl) drives an h2-hosted echo service over a bidi stream. Skipped when grpcurl is absent.
 - `rebar3 ct --suite=test/h2_grpc_client_interop_SUITE` — gRPC interop, other direction: our h2 client drives a real grpc-python echo server (identity-serialized bytes, no protobuf) over a bidi stream, exercising client half-close and flow control. Skipped when python3/grpcio is absent (set GRPC_PYTHON to pick the interpreter).

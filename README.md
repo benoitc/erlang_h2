@@ -4,7 +4,7 @@ HTTP/2 client and server for Erlang/OTP.
 
 - Full **RFC 7540 / RFC 9113** protocol (frames, streams, flow control, SETTINGS negotiation, GOAWAY, CONTINUATION, malformed-message enforcement).
 - **RFC 7541** HPACK with static + dynamic tables and Huffman coding.
-- **RFC 7540 §8.3** CONNECT tunnel mode for bidirectional byte streams.
+- **RFC 9113 §8.5** CONNECT tunnel mode for bidirectional byte streams.
 - **RFC 8441** Extended CONNECT (`:protocol` pseudo-header) for bootstrapping WebSockets and similar protocols over HTTP/2.
 - **gRPC-style bidirectional streaming**: interleaved DATA both ways on one stream, per-stream event handlers owned by per-call processes, receive/send backpressure, and trailers.
 - ALPN `h2` over TLS 1.2+ by default; cleartext (`h2c` over plain TCP) also supported.
@@ -221,7 +221,7 @@ h2:start_server(8443, #{cert => ..., key => ..., handler => ...,
 
 Default is `erlang:system_info(schedulers)` (one per core). 100 is a good ceiling for high connection-rate workloads; going higher rarely helps. Complementary knobs: kernel `somaxconn` / `tcp_max_syn_backlog`, OS-level SSL session cache, and a `handler` that spawns per request (the built-in server loop already does).
 
-## CONNECT tunnels (RFC 7540 §8.3)
+## CONNECT tunnels (RFC 9113 §8.5)
 
 Open a bidirectional byte tunnel through an h2 proxy:
 
@@ -513,13 +513,15 @@ One port, TLS picks per connection. Handshake in the per-connection process, not
 
 | Module | Purpose |
 |---|---|
-| `h2` | Public API (client + server). |
+| `h2` | Public API (client + server), and the code that serves an accepted socket. |
 | `h2_connection` | `gen_statem` per-connection state machine. |
-| `h2_server` | TLS listener + acceptor pool. |
+| `h2_listener` | Owns a server's listen socket and its acceptors. |
 | `h2_frame` | Frame encode/decode. |
 | `h2_hpack` | HPACK encoder/decoder. |
 | `h2_settings` | SETTINGS encode/decode/validate. |
+| `h2_capsule`, `h2_varint` | Capsule and variable-length integer codecs (RFC 9297, RFC 9000 §16) for protocols carried in a tunnel. |
 | `h2_error` | Error code mappings. |
+| `h2_server`, `h2_client` | Standalone command-line server and client (escripts), not used by the library. |
 
 ## Performance
 
@@ -553,8 +555,8 @@ values through a table-driven Huffman state machine.
 
 ```bash
 rebar3 compile
-rebar3 eunit          # 310 tests + 800 PropEr properties
-rebar3 ct             # 81 compliance + 6 h2spec interop cases
+rebar3 eunit          # unit tests + PropEr properties
+rebar3 ct             # compliance, robustness and interop suites
 rebar3 dialyzer       # clean
 rebar3 xref           # clean
 rebar3 ex_doc         # HTML docs
