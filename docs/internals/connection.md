@@ -19,13 +19,23 @@ The file is cut into sections by banner comments. In order:
 | Data Handling | `handle_data/3` appends socket bytes to the buffer; `process_frames/2` decodes frames one at a time and enforces the reset budget. |
 | Frame Handling | `handle_frame/3`, one clause per frame type. |
 | Settings Handling | Applying the peer's SETTINGS and our own once acknowledged. |
-| Headers Handling | Header blocks and CONTINUATION, then HTTP message validation: pseudo-headers, Content-Length, trailers, CONNECT tunnels. The largest section. |
+| Headers Handling | Header blocks and CONTINUATION, then what to do with a request, a response or trailers once `h2_headers` has judged them: create the stream, tell the owner, or reset. |
 | Data Frame Handling | DATA frames, body-length checks, receive windows, WINDOW_UPDATE. |
 | Send Operations | Requests, responses, data and trailers going out; send buffers; callers blocked on a full window. |
 | Common Call Handling | Calls that work in several states (`handle_stream_call/3`, `handle_call_common/4`, `handle_common/4`). |
-| Stream Management | The stream table, the active-stream counters, closing, and the memory of closed streams. |
+| Stream Management | The stream table, the active-stream counters and closing. |
 | Frame Sending | Writing frames to the socket; `sent_rst/3` and the reset budget. |
 | Utilities | Socket helpers, timers, owner notification. |
+
+## What lives outside this file
+
+Two parts need no connection state and are separate modules. Change them
+there, not here.
+
+| Module | What it does | Why it is separate |
+| --- | --- | --- |
+| `h2_headers` | Judges a decoded header list (request, response, trailers, outbound) and reads it (status, content length, method and path). | It is a pure function of the headers. `h2_connection` only decides what a verdict means for the stream. |
+| `h2_closed_streams` | Remembers how recently closed streams ended, within two fixed bounds. | The bounds are a safety property and are tested on their own. `close_stream/3` is the only writer. |
 
 ## How a frame is handled
 
@@ -55,7 +65,7 @@ written out in several places and the copies drifted apart.
 | `send_rst_stream/3` | send an RST_STREAM the application asked for (`h2:cancel`), or a pre-admission REFUSED_STREAM | not counted: these are not abuse |
 | `dispatch_stream_event/3` | deliver any per-stream event | handler, buffer or owner is chosen in one place; buffered events are replayed in order |
 | `put_stream/3` | store a stream record | the active-stream counters stay exact |
-| `close_stream/3` | close a stream | blocked senders are released, the close reason is remembered for late frames, old records are evicted |
+| `close_stream/3` | close a stream | blocked senders are released, the close reason is remembered for late frames (`h2_closed_streams`), old records are evicted |
 | `bump_flood_counter/2` | count a frame the peer can send cheaply | the per-second cap for that frame type |
 | `notify_owner/2` | send a connection event | one place that knows who the owner is |
 

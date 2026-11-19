@@ -86,11 +86,12 @@ Section names are the banner comments in `src/h2_connection.erl`.
 | Public calls, options, their types | `src/h2.erl` | `h2_compliance_SUITE` (api_parity group) |
 | Listening, accepting, serving a socket you accepted | `src/h2.erl`, `src/h2_listener.erl` | `h2_listener_*_tests`, `h2_serve_socket_tests` |
 | Connection start, preface, SETTINGS exchange | `h2_connection`: the state sections, Settings Handling | `h2_settings_flood_tests`, `h2_peer_settings_notify_tests`, `h2_ext_settings_tests` |
-| Request and response header rules, trailers, tunnels | `h2_connection`: Headers Handling | `h2_compliance_SUITE`, `h2_no_content_tests`, `h2_reset_notify_tests` |
+| Whether a header list is well formed (pseudo-headers, field syntax, Content-Length, trailers) | `src/h2_headers.erl` | in-module tests, `h2_compliance_SUITE`, `h2_interop_SUITE` |
+| What a request, response or trailers do to a stream; tunnels | `h2_connection`: Headers Handling | `h2_compliance_SUITE`, `h2_no_content_tests`, `h2_reset_notify_tests` |
 | Receiving DATA, body length, receive windows | `h2_connection`: Data Frame Handling | `h2_conn_window_tests`, `h2_max_body_size_tests` |
 | Sending responses, data, trailers, send windows | `h2_connection`: Send Operations | `h2_coalesce_tests`, `h2_grpc_tests`, `h2_grpc_frame_tests` |
 | Which process receives an event | `dispatch_stream_event/3` | `h2_grpc_tests`, `h2_reset_notify_tests` |
-| Stream table, counts, closing | `h2_connection`: Stream Management | `h2_stream_count_tests`, `h2_stream_available_tests` |
+| Stream table, counts, closing | `h2_connection`: Stream Management, `src/h2_closed_streams.erl` | `h2_stream_count_tests`, `h2_stream_available_tests` |
 | Limits against a hostile peer | the macros at the top of `h2_connection`, `sent_rst/3`, `bump_flood_counter/2` | `h2_made_you_reset_tests`, `h2_settings_flood_tests`, `h2_robustness_SUITE` |
 | GOAWAY and shutdown | `h2_connection`: goaway_sent, goaway_received, closing | `h2_goaway_drain_tests`, `h2_goaway_cancel_tests`, `h2_goaway_interop_SUITE`, `h2_tls_close_tests` |
 | Frame layout and frame-level validation | `src/h2_frame.erl` | in-module tests, `h2_prop_tests` |
@@ -100,7 +101,8 @@ Section names are the banner comments in `src/h2_connection.erl`.
 ## If you want to...
 
 **Add or tighten a protocol rule.** Find where the frame is handled (the
-table above). Decide whether a violation is a stream error or a connection
+table above). A rule about the headers themselves goes in `h2_headers` and
+returns `{error, Code}`; the connection turns that into a reset. Decide whether a violation is a stream error or a connection
 error; the RFC says which. For a stream error call `reset_stream/3`, never
 `sent_rst/3` plus your own cleanup: `reset_stream/3` also tells the handler
 and closes the stream. For a connection error return

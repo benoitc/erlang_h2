@@ -53,14 +53,11 @@
 -define(GOAWAY_TIMEOUT_MS, 3000).
 %% RFC 9113 §5.1: post-close error classification needs to know whether the
 %% stream was closed via END_STREAM (connection-scoped error) or RST_STREAM
-%% (stream-scoped). We keep two layered caches so the lookup is exact for
-%% both recent and less-recent streams:
-%%   * full #stream record for the last ?CLOSED_STREAMS_LIMIT ids
-%%     (needed for body/trailers follow-up logic that depends on the record),
-%%   * a compact id → reason side map for the last ?CLOSED_REASONS_LIMIT ids.
-%% Beyond both bounds we fall back to a stream-id-range heuristic.
--define(CLOSED_STREAMS_LIMIT, 100).
--define(CLOSED_REASONS_LIMIT, 10000).
+%% (stream-scoped). h2_closed_streams remembers that, within bounds: the full
+%% #stream record of the most recently closed streams stays in `streams`
+%% (needed for body/trailers follow-up logic that depends on the record), and
+%% a compact id → reason map covers many more. Beyond both bounds we fall back
+%% to a stream-id-range heuristic (in_closed_stream_range/2).
 %% RFC 9113 §10.5: mitigate PING and RST_STREAM floods. Counters reset every
 %% second; exceeding the limit triggers GOAWAY(ENHANCE_YOUR_CALM).
 -define(PING_FLOOD_LIMIT_PER_SEC, 20).
@@ -214,16 +211,9 @@
     %% peer_active: peer-initiated streams in open / half_closed_*.
     active_stream_count = 0 :: non_neg_integer(),
     peer_active_stream_count = 0 :: non_neg_integer(),
-    %% FIFO of closed stream ids in close order, bounded by ?CLOSED_STREAMS_LIMIT.
-    %% When the limit is exceeded the oldest id is evicted from `streams`.
-    closed_streams = queue:new() :: queue:queue(non_neg_integer()),
-    closed_streams_count = 0 :: non_neg_integer(),
-    %% Longer-lived compact id → reason map. Survives eviction from `streams`.
-    %% no_content: closed by END_STREAM after a no-content response was sent;
-    %% classified as end_stream everywhere (see recently_closed_reason/2).
-    closed_reasons = #{} :: #{non_neg_integer() => end_stream | no_content | rst},
-    closed_reasons_q = queue:new() :: queue:queue(non_neg_integer()),
-    closed_reasons_count = 0 :: non_neg_integer(),
+    %% Bounded memory of closed streams (see h2_closed_streams): which ids
+    %% still have their record in `streams`, and how each one closed.
+    closed = h2_closed_streams:new() :: h2_closed_streams:t(),
     next_stream_id :: non_neg_integer(),  % 1 for client, 2 for server
     last_peer_stream_id = 0 :: non_neg_integer(),
 
@@ -2016,18 +2006,15 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
     end.
 
 %% Exact lookup for recently-closed streams. Returns `unknown` for ids
-%% beyond the closed_reasons retention window; callers fall back to
+%% beyond the h2_closed_streams retention window; callers fall back to
 %% `in_closed_stream_range/2`.
-recently_closed_reason(StreamId, #state{closed_reasons = Reasons}) ->
-    case maps:get(StreamId, Reasons, unknown) of
-        no_content -> end_stream;
-        Reason     -> Reason
-    end.
+recently_closed_reason(StreamId, #state{closed = Closed}) ->
+    h2_closed_streams:reason(StreamId, Closed).
 
 %% True when StreamId was closed after a no-content response was sent and its
 %% record has since been evicted from the streams map.
-closed_no_content(StreamId, #state{closed_reasons = Reasons}) ->
-    maps:get(StreamId, Reasons, unknown) =:= no_content.
+closed_no_content(StreamId, #state{closed = Closed}) ->
+    h2_closed_streams:no_content(StreamId, Closed).
 
 %% Fallback heuristic for stream ids evicted from the closed-streams FIFO.
 %% Treats both peer-initiated ids (up to last_peer_stream_id) and our own
@@ -2976,7 +2963,7 @@ handle_call_early(From, Request, StateName, #state{waiters = Waiters} = State) -
 %%   - after a no-content response (HEAD, 204, 304) the stream already ended on
 %%     its HEADERS, so a body or trailers the caller still offers is dropped and
 %%     the call returns ok (RFC 9110 §6.4.1). This holds after the stream record
-%%     has been evicted, through the bounded closed_reasons map;
+%%     has been evicted, through the bounded h2_closed_streams memory;
 %%   - after only a 1xx, DATA or trailers would follow an interim response,
 %%     which is malformed (RFC 9110 §15.2): refused with no_final_response.
 after_response_gate(From, StreamId, #state{mode = server, streams = Streams} = State,
@@ -3236,7 +3223,7 @@ close_stream(StreamId, Reason, #state{streams = Streams} = State0) ->
     %% Flip state via put_stream/3 so the counters are decremented once
     %% (idempotent: a stream already closed has Old = closed, delta 0).
     %% A stream that ended on a no-content response is remembered as
-    %% `no_content' in closed_reasons, so send_data after the record is
+    %% `no_content' in h2_closed_streams, so send_data after the record is
     %% evicted still succeeds (after_response_gate/4).
     KeptReason = case maps:find(StreamId, Streams) of
         {ok, #stream{no_content_sent = true}} when Reason =:= end_stream -> no_content;
@@ -3257,35 +3244,9 @@ close_stream(StreamId, Reason, #state{streams = Streams} = State0) ->
         error ->
             State0
     end,
-    #state{streams = Streams1,
-           closed_streams = Q,
-           closed_streams_count = N,
-           closed_reasons = Reasons,
-           closed_reasons_q = RQ,
-           closed_reasons_count = RN} = State,
-    Q1 = queue:in(StreamId, Q),
-    N1 = N + 1,
-    {Streams2, Q2, N2} = evict_old_closed(Streams1, Q1, N1),
-    Reasons1 = maps:put(StreamId, KeptReason, Reasons),
-    RQ1 = queue:in(StreamId, RQ),
-    RN1 = RN + 1,
-    {Reasons2, RQ2, RN2} = evict_old_reasons(Reasons1, RQ1, RN1),
-    State#state{streams = Streams2,
-                closed_streams = Q2, closed_streams_count = N2,
-                closed_reasons = Reasons2,
-                closed_reasons_q = RQ2, closed_reasons_count = RN2}.
-
-evict_old_closed(Streams, Q, N) when N =< ?CLOSED_STREAMS_LIMIT ->
-    {Streams, Q, N};
-evict_old_closed(Streams, Q, N) ->
-    {{value, OldId}, Q1} = queue:out(Q),
-    evict_old_closed(maps:remove(OldId, Streams), Q1, N - 1).
-
-evict_old_reasons(Reasons, Q, N) when N =< ?CLOSED_REASONS_LIMIT ->
-    {Reasons, Q, N};
-evict_old_reasons(Reasons, Q, N) ->
-    {{value, OldId}, Q1} = queue:out(Q),
-    evict_old_reasons(maps:remove(OldId, Reasons), Q1, N - 1).
+    #state{streams = Streams1, closed = Closed} = State,
+    {Evicted, Closed1} = h2_closed_streams:add(StreamId, KeptReason, Closed),
+    State#state{streams = maps:without(Evicted, Streams1), closed = Closed1}.
 
 %% O(1): active_stream_count is kept in sync by put_stream/3.
 count_active_streams(#state{active_stream_count = N}) ->

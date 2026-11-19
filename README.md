@@ -515,6 +515,8 @@ One port, TLS picks per connection. Handshake in the per-connection process, not
 |---|---|
 | `h2` | Public API (client + server), and the code that serves an accepted socket. |
 | `h2_connection` | `gen_statem` per-connection state machine. |
+| `h2_headers` | Header list validation and reading. |
+| `h2_closed_streams` | Bounded memory of closed streams. |
 | `h2_listener` | Owns a server's listen socket and its acceptors. |
 | `h2_frame` | Frame encode/decode. |
 | `h2_hpack` | HPACK encoder/decoder. |
