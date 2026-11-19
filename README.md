@@ -47,7 +47,7 @@ Messages delivered to the owner process:
 | `{h2, Conn, {informational, StreamId, Status, Headers}}` | 1xx interim response (100/103/…) |
 | `{h2, Conn, {data, StreamId, Data, EndStream}}` | response body fragment (an empty final frame marks end-of-stream for body-less responses) |
 | `{h2, Conn, {trailers, StreamId, Headers}}` | response trailers |
-| `{h2, Conn, {stream_reset, StreamId, ErrorCode}}` | peer sent RST_STREAM |
+| `{h2, Conn, {stream_reset, StreamId, ErrorCode}}` | the stream was reset: the peer sent RST_STREAM, or h2 reset it because of what the peer sent |
 | `{h2, Conn, {goaway, LastStreamId, ErrorCode}}` | peer is shutting down |
 | `{h2, Conn, {closed, Reason}}` | connection closed |
 

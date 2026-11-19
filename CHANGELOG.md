@@ -2,6 +2,19 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.18.1] - 2026-11-19
+
+### Fixed
+
+- When h2 reset a stream because of what the peer sent, for example trailers
+  on a CONNECT tunnel, malformed headers or a flow-control violation, the
+  stream handler was not told and kept waiting on a dead stream. It now
+  receives a `stream_reset` event with the error code. On a client without a
+  stream handler the owner receives it, so a request answered with a
+  malformed response fails at once instead of hanging.
+- In a few of these cases the stream was reset for the peer but stayed open
+  on our side. It is now closed, and later calls on it return an error.
+
 ## [0.18.0] - 2026-11-15
 
 ### Fixed
