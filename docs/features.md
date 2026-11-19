@@ -131,7 +131,7 @@ The library satisfies the gRPC bidi contract over a single stream: both peers se
 
 ## Internal modules
 
-Useful to know when extending or debugging:
+Useful to know when extending or debugging. [Architecture](architecture.md) explains how they fit together and which of them are public.
 
 | Module | Role |
 |---|---|
@@ -147,6 +147,8 @@ Useful to know when extending or debugging:
 | `h2_capsule` / `h2_varint` | Capsule Protocol (RFC 9297) and variable-length integer codecs, for protocols carried in an Extended CONNECT tunnel. |
 
 ## Testing
+
+[Contributing](contributing.md) says how to run these, how to write a new test, and which file covers which area.
 
 - `rebar3 eunit` — unit tests, raw-socket behaviour tests, and PropEr properties across frame/HPACK/settings/varint.
 - `rebar3 ct --suite=test/h2_compliance_SUITE` — RFC compliance, client/server round-trips, CONNECT and Extended CONNECT tunnels, API-parity with `quic_h3`, malformed-message enforcement, flow-control accounting, error paths.

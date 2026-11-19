@@ -1,8 +1,17 @@
 %% @doc HTTP/2 Connection State Machine (RFC 9113)
 %%
-%% This module implements the HTTP/2 connection protocol using gen_statem.
-%% It handles both client and server modes, managing the connection preface,
-%% settings exchange, stream lifecycle, flow control, and frame dispatch.
+%% One process per connection, client or server. It owns the socket and is
+%% the single writer of everything streams share: the HPACK tables, the
+%% connection flow-control window, the stream table and the order of frames
+%% on the wire. Besides the states below it holds frame dispatch, HTTP message
+%% validation, flow control in both directions, the routing of events to the
+%% owner or a stream handler, and the limits that bound what a peer can make
+%% it do.
+%%
+%% This module is internal: use the `h2' module. Before changing it, read
+%% `docs/architecture.md' and `docs/internals/connection.md', which name the
+%% functions every change should go through (`reset_stream/3',
+%% `dispatch_stream_event/3', `put_stream/3', `close_stream/3').
 %%
 %% States:
 %% - preface: Exchanging connection preface

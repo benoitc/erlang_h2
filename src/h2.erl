@@ -3,6 +3,11 @@
 %% This module provides the public API for HTTP/2 client and server operations.
 %% It wraps the h2_connection state machine with a clean interface.
 %%
+%% It also holds the server side of a connection's life: the accept loop the
+%% listener runs and the process that owns each accepted connection and starts
+%% a handler per request. That code is here, not in `h2_listener', because
+%% `serve_socket/2' runs the same loop in a process the caller owns.
+%%
 %% == Client Usage ==
 %%
 %% ```
