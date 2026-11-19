@@ -1605,8 +1605,8 @@ decode_and_process_headers_validated(Mode, StreamId, Headers, EndStream, State1)
             end,
             Validation = case {Kind, IsTunnel} of
                 {trailers, true} -> {error, protocol_error};  %% §8.3
-                {trailers, false} -> validate_trailers(Headers, EndStream);
-                {_, _} -> validate_initial_headers(Mode, Headers)
+                {trailers, false} -> h2_headers:validate_trailers(Headers, EndStream);
+                {_, _} -> h2_headers:validate_initial_headers(Mode, Headers)
             end,
             case Validation of
                 ok ->
@@ -1625,7 +1625,7 @@ classify_headers(client, StreamId, Headers, State) ->
     case maps:find(StreamId, State#state.streams) of
         {ok, #stream{response_seen_final = true}} -> trailers;
         {ok, _} ->
-            case parse_status(Headers) of
+            case h2_headers:parse_status(Headers) of
                 {ok, S} when S >= 100, S =< 199 -> interim;
                 _ -> initial
             end;
@@ -1661,15 +1661,15 @@ dispatch_headers(client, interim, StreamId, _Stream, Headers, false, State) ->
         true ->
             stream_reject(StreamId, protocol_error, State);
         false ->
-            {ok, Status} = parse_status(Headers),
+            {ok, Status} = h2_headers:parse_status(Headers),
             State1 = dispatch_stream_event(StreamId,
-                        {informational, StreamId, Status, strip_pseudo(Headers)}, State),
+                        {informational, StreamId, Status, h2_headers:strip_pseudo(Headers)}, State),
             {ok, connected, State1}
     end;
 
 %% Client receives the final response HEADERS.
 dispatch_headers(client, initial, StreamId, Stream, Headers, EndStream, State) ->
-    case parse_status(Headers) of
+    case h2_headers:parse_status(Headers) of
         malformed    -> stream_reject(StreamId, protocol_error, State);
         {ok, Status} -> handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State)
     end;
@@ -1681,7 +1681,7 @@ dispatch_headers(client, trailers, StreamId, Stream, Headers, _EndStream, State)
 %% ---- Initial-HEADERS handlers ------------------------------------------------
 
 handle_server_initial(StreamId, Stream, Headers, Protocol, EndStream, State) ->
-    case parse_content_length(Headers) of
+    case h2_headers:parse_content_length(Headers) of
         {error, Err} ->
             stream_reject(StreamId, Err, State);
         {ok, ExpectedCL} when is_integer(ExpectedCL),
@@ -1689,7 +1689,7 @@ handle_server_initial(StreamId, Stream, Headers, Protocol, EndStream, State) ->
             %% Declared too large: answered before the owner ever sees it.
             {ok, connected, too_large(StreamId, Stream, false, State)};
         {ok, ExpectedCL} ->
-            case end_stream_body_mismatch(ExpectedCL, EndStream) of
+            case h2_headers:end_stream_body_mismatch(ExpectedCL, EndStream) of
                 true ->
                     %% RFC 9113 §8.1: END_STREAM + CL>0 is malformed.
                     stream_reject(StreamId, protocol_error, State);
@@ -1700,7 +1700,7 @@ handle_server_initial(StreamId, Stream, Headers, Protocol, EndStream, State) ->
     end.
 
 commit_server_initial(StreamId, Stream, Headers, Protocol, ExpectedCL, EndStream, State) ->
-    {Method, Path, OtherHeaders} = extract_request_headers(Headers),
+    {Method, Path, OtherHeaders} = h2_headers:extract_request_headers(Headers),
     %% RFC 7540 §8.3: a CONNECT stream becomes a tunnel only once the 2xx
     %% response is sent. Keep tunnel=false here; handle_send_response flips it.
     Stream1 = Stream#stream{
@@ -1729,7 +1729,7 @@ commit_server_initial(StreamId, Stream, Headers, Protocol, ExpectedCL, EndStream
     end.
 
 handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State) ->
-    case parse_content_length(Headers) of
+    case h2_headers:parse_content_length(Headers) of
         {error, Err} ->
             stream_reject(StreamId, Err, State);
         {ok, ExpectedCL} when is_integer(ExpectedCL),
@@ -1758,7 +1758,7 @@ handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State) ->
             },
             State1 = put_stream(StreamId, Stream1, State),
             State2 = dispatch_stream_event(StreamId,
-                        {response, StreamId, Status, strip_pseudo(Headers)}, State1),
+                        {response, StreamId, Status, h2_headers:strip_pseudo(Headers)}, State1),
             finalize_client_initial(StreamId, EndStream, ExpectedCL, BodyForbidden, State2)
     end.
 
@@ -1817,10 +1817,6 @@ deliver_trailers(StreamId, #stream{state = StreamState} = Stream, Headers, State
 extended_connect_allowed(undefined, _State) -> true;
 extended_connect_allowed(_Proto, #state{enable_connect_protocol = Flag}) -> Flag.
 
-end_stream_body_mismatch(undefined, _EndStream) -> false;
-end_stream_body_mismatch(CL, true) when CL > 0  -> true;
-end_stream_body_mismatch(_, _)                  -> false.
-
 stream_state_after_end(true)  -> half_closed_remote;
 stream_state_after_end(false) -> open.
 
@@ -1830,9 +1826,6 @@ apply_remote_end(StreamState, false) -> StreamState;
 apply_remote_end(open, true)              -> half_closed_remote;
 apply_remote_end(half_closed_local, true) -> closed;
 apply_remote_end(Other, true)             -> Other.
-
-strip_pseudo(Headers) ->
-    lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers).
 
 stream_reject(StreamId, ErrorCode, State) ->
     {ok, connected, reset_stream(StreamId, ErrorCode, State)}.
@@ -1887,337 +1880,12 @@ goaway_timeout(infinity) -> infinity;
 goaway_timeout(Ms) when is_integer(Ms), Ms >= 0 -> Ms;
 goaway_timeout(Other) -> error({badarg, {goaway_timeout, Other}}).
 
-%% RFC 9113 §8.1.1: Content-Length parser. Multiple headers with the same
-%% value collapse into one; mismatched values are malformed. Non-numeric or
-%% negative values are malformed.
-parse_content_length(Headers) ->
-    Values = [V || {<<"content-length">>, V} <- Headers],
-    case lists:usort(Values) of
-        [] ->
-            {ok, undefined};
-        [Single] ->
-            case parse_nonneg_integer(Single) of
-                {ok, N} -> {ok, N};
-                error -> {error, protocol_error}
-            end;
-        _ ->
-            {error, protocol_error}
-    end.
-
-parse_nonneg_integer(Bin) ->
-    try binary_to_integer(Bin) of
-        N when N >= 0 -> {ok, N};
-        _ -> error
-    catch
-        _:_ -> error
-    end.
-
-%% Validate an initial request/response HEADERS block per RFC 7540 §8.1.2.
-%% Checks: pseudo-header order/set/duplicates, lowercase header names,
-%% connection-specific headers, TE header restriction, :path syntax
-%% (requests), :authority vs Host consistency (requests).
-validate_initial_headers(Mode, Headers) ->
-    Checks = [
-        fun() -> check_pseudo_order(Headers) end,
-        fun() -> check_pseudo_set(Mode, Headers) end,
-        fun() -> check_lowercase_names(Headers) end,
-        fun() -> check_connection_headers(Headers) end,
-        fun() -> check_request_specific(Mode, Headers) end
-    ],
-    run_checks(Checks).
-
-%% Validate a trailing HEADERS block per RFC 7540 §8.1:
-%% MUST have END_STREAM and MUST NOT contain any pseudo-header.
-validate_trailers(Headers, true) ->
-    Checks = [
-        fun() -> check_no_pseudo_in_trailers(Headers) end,
-        fun() -> check_lowercase_names(Headers) end,
-        fun() -> check_connection_headers(Headers) end
-    ],
-    run_checks(Checks);
-validate_trailers(_Headers, false) ->
-    {error, protocol_error}.
-
-run_checks([]) -> ok;
-run_checks([F | Rest]) ->
-    case F() of
-        ok -> run_checks(Rest);
-        Err -> Err
-    end.
-
-check_no_pseudo_in_trailers(Headers) ->
-    case [N || {<<$:, _/binary>> = N, _} <- Headers] of
-        [] -> ok;
-        _ -> {error, protocol_error}
-    end.
-
-%% RFC 9113 §8.2: field names are lowercase RFC 7230 tchar (pseudo-headers
-%% start with ':'); values must not contain NUL/CR/LF nor have leading or
-%% trailing SP/HTAB.
-check_lowercase_names(Headers) ->
-    Bad = lists:any(fun bad_field/1, Headers),
-    case Bad of
-        true -> {error, protocol_error};
-        false -> ok
-    end.
-
-bad_field({<<>>, _}) -> true;
-bad_field({<<$:, Rest/binary>>, Value}) ->
-    %% Pseudo-header: rest must be lowercase tchar too.
-    not valid_name_bytes(Rest) orelse bad_value(Value);
-bad_field({Name, Value}) ->
-    not valid_name_bytes(Name) orelse bad_value(Value).
-
-%% Allowed bytes in a header field name: lowercase ALPHA, DIGIT, and
-%%   !#$%&'*+-.^_`|~
-valid_name_bytes(<<>>) -> true;
-valid_name_bytes(<<C, Rest/binary>>) ->
-    Ok = (C >= $a andalso C =< $z)
-         orelse (C >= $0 andalso C =< $9)
-         orelse lists:member(C, "!#$%&'*+-.^_`|~"),
-    Ok andalso valid_name_bytes(Rest).
-
-%% RFC 7230 §3.2.6 `token` — same alphabet as a header field name but
-%% case-insensitive (uppercase also allowed). Used for RFC 8441 `:protocol`.
-valid_token(<<>>)       -> false;
-valid_token(Bin) when is_binary(Bin) -> valid_token_bytes(Bin);
-valid_token(_)          -> false.
-
-valid_token_bytes(<<>>) -> true;
-valid_token_bytes(<<C, Rest/binary>>) ->
-    Ok = (C >= $a andalso C =< $z)
-         orelse (C >= $A andalso C =< $Z)
-         orelse (C >= $0 andalso C =< $9)
-         orelse lists:member(C, "!#$%&'*+-.^_`|~"),
-    Ok andalso valid_token_bytes(Rest).
-
-%% A value is bad if empty-after-trimming is fine, but leading/trailing SP/HTAB
-%% or any NUL/CR/LF byte is forbidden.
-bad_value(<<>>) -> false;
-bad_value(<<C, _/binary>>) when C =:= $\s; C =:= $\t -> true;
-bad_value(Bin) ->
-    Last = binary:last(Bin),
-    case Last of
-        $\s -> true;
-        $\t -> true;
-        _ -> has_bad_value_byte(Bin)
-    end.
-
-has_bad_value_byte(<<>>) -> false;
-has_bad_value_byte(<<0, _/binary>>) -> true;
-has_bad_value_byte(<<$\n, _/binary>>) -> true;
-has_bad_value_byte(<<$\r, _/binary>>) -> true;
-has_bad_value_byte(<<_, Rest/binary>>) -> has_bad_value_byte(Rest).
-
-%% RFC 7540 §8.1.2.2: reject connection-specific headers; TE only allowed with
-%% the exact value "trailers".
-check_connection_headers(Headers) ->
-    Banned = [<<"connection">>, <<"proxy-connection">>, <<"keep-alive">>,
-              <<"transfer-encoding">>, <<"upgrade">>, <<"host">>],
-    %% We only ban Host as duplicate-check target, not here — Host handled in check_authority_host.
-    BannedStrict = Banned -- [<<"host">>],
-    Bad = lists:any(
-        fun({Name, _}) -> lists:member(Name, BannedStrict) end, Headers),
-    case Bad of
-        true -> {error, protocol_error};
-        false -> check_te_header(Headers)
-    end.
-
-check_te_header(Headers) ->
-    case [V || {<<"te">>, V} <- Headers] of
-        [] -> ok;
-        [<<"trailers">>] -> ok;
-        _ -> {error, protocol_error}
-    end.
-
-check_request_specific(server, Headers) ->
-    Method = proplists:get_value(<<":method">>, Headers),
-    case Method of
-        undefined -> ok;  %% already caught in check_pseudo_set
-        <<"CONNECT">> ->
-            %% CONNECT has no :path/:scheme but :authority (no userinfo) still applies.
-            check_authority_host(Headers);
-        _ ->
-            case check_path(Headers) of
-                ok -> check_authority_host(Headers);
-                Err -> Err
-            end
-    end;
-check_request_specific(client, _Headers) ->
-    ok.
-
-check_path(Headers) ->
-    case proplists:get_value(<<":path">>, Headers) of
-        undefined -> ok;  %% already caught
-        <<>> -> {error, protocol_error};
-        Path ->
-            case proplists:get_value(<<":scheme">>, Headers) of
-                undefined -> ok;
-                Scheme when Scheme =:= <<"http">>; Scheme =:= <<"https">> ->
-                    Method = proplists:get_value(<<":method">>, Headers),
-                    case {binary_part(Path, 0, 1), Method, Path} of
-                        {<<"/">>, _, _} -> ok;
-                        {<<"*">>, <<"OPTIONS">>, <<"*">>} -> ok;
-                        _ -> {error, protocol_error}
-                    end;
-                _ -> ok
-            end
-    end.
-
-check_authority_host(Headers) ->
-    case proplists:get_value(<<":authority">>, Headers) of
-        undefined -> ok;
-        Authority ->
-            %% RFC 9113 §8.3.1: `:authority` MUST NOT include the deprecated
-            %% userinfo subcomponent for http/https schemes.
-            case binary:match(Authority, <<"@">>) of
-                nomatch -> check_host_consistency(Authority, Headers);
-                _       -> {error, protocol_error}
-            end
-    end.
-
-check_host_consistency(Authority, Headers) ->
-    case proplists:get_value(<<"host">>, Headers) of
-        undefined -> ok;
-        Host ->
-            case string:equal(Authority, Host, true) of
-                true  -> ok;
-                false -> {error, protocol_error}
-            end
-    end.
-
-check_pseudo_order(Headers) ->
-    check_pseudo_order(Headers, pseudo).
-
-check_pseudo_order([], _) -> ok;
-check_pseudo_order([{<<$:, _/binary>>, _} | Rest], pseudo) ->
-    check_pseudo_order(Rest, pseudo);
-check_pseudo_order([{<<$:, _/binary>>, _} | _], regular) ->
-    {error, protocol_error};
-check_pseudo_order([{_, _} | Rest], _) ->
-    check_pseudo_order(Rest, regular).
-
-check_pseudo_set(server, Headers) ->
-    Pseudos = [N || {<<$:, _/binary>> = N, _} <- Headers],
-    Uniq = lists:usort(Pseudos),
-    case length(Pseudos) =:= length(Uniq) of
-        false -> {error, protocol_error};
-        true ->
-            %% RFC 8441 §4: `:protocol` is allowed only with method CONNECT.
-            Allowed = [<<":method">>, <<":scheme">>, <<":path">>, <<":authority">>,
-                       <<":protocol">>],
-            case [N || N <- Pseudos, not lists:member(N, Allowed)] of
-                [] ->
-                    Method = proplists:get_value(<<":method">>, Headers),
-                    Protocol = proplists:get_value(<<":protocol">>, Headers),
-                    case {Method, Protocol} of
-                        {undefined, _} -> {error, protocol_error};
-                        {_, undefined} when Method =:= <<"CONNECT">> ->
-                            %% Vanilla CONNECT (RFC 7540 §8.3): `:authority`
-                            %% required, `:scheme`/`:path` MUST be omitted.
-                            HasScheme = proplists:is_defined(<<":scheme">>, Headers),
-                            HasPath   = proplists:is_defined(<<":path">>, Headers),
-                            case {proplists:get_value(<<":authority">>, Headers),
-                                  HasScheme, HasPath} of
-                                {undefined, _, _} -> {error, protocol_error};
-                                {_, true, _} -> {error, protocol_error};
-                                {_, _, true} -> {error, protocol_error};
-                                _ -> ok
-                            end;
-                        {<<"CONNECT">>, _} ->
-                            %% Extended CONNECT (RFC 8441 §4): `:method=CONNECT`
-                            %% plus `:protocol` (RFC 7230 token), `:scheme`,
-                            %% `:path`, `:authority` all REQUIRED.
-                            case valid_token(Protocol) of
-                                false -> {error, protocol_error};
-                                true ->
-                            case {proplists:get_value(<<":scheme">>, Headers),
-                                  proplists:get_value(<<":path">>, Headers),
-                                  proplists:get_value(<<":authority">>, Headers)} of
-                                {undefined, _, _} -> {error, protocol_error};
-                                {_, undefined, _} -> {error, protocol_error};
-                                {_, <<>>, _} -> {error, protocol_error};
-                                {_, _, undefined} -> {error, protocol_error};
-                                _ -> ok
-                            end
-                            end;
-                        {_, P} when P =/= undefined ->
-                            %% `:protocol` without method CONNECT is malformed.
-                            {error, protocol_error};
-                        _ ->
-                            case {proplists:get_value(<<":scheme">>, Headers),
-                                  proplists:get_value(<<":path">>, Headers)} of
-                                {undefined, _} -> {error, protocol_error};
-                                {_, undefined} -> {error, protocol_error};
-                                {_, <<>>} -> {error, protocol_error};
-                                _ -> ok
-                            end
-                    end;
-                _Unknown ->
-                    {error, protocol_error}
-            end
-    end;
-check_pseudo_set(client, Headers) ->
-    Pseudos = [N || {<<$:, _/binary>> = N, _} <- Headers],
-    Uniq = lists:usort(Pseudos),
-    case length(Pseudos) =:= length(Uniq) of
-        false -> {error, protocol_error};
-        true ->
-            case [N || N <- Pseudos, N =/= <<":status">>] of
-                [] ->
-                    case proplists:get_value(<<":status">>, Headers) of
-                        undefined -> {error, protocol_error};
-                        _ -> ok
-                    end;
-                _Unknown ->
-                    {error, protocol_error}
-            end
-    end.
-
-extract_request_headers(Headers) ->
-    Method = proplists:get_value(<<":method">>, Headers, <<"GET">>),
-    Path = proplists:get_value(<<":path">>, Headers, <<"/">>),
-    %% Strip pseudo-headers from the user-visible list, except `:protocol`
-    %% (RFC 8441), `:authority` and `:scheme`. Adapters need these to
-    %% reconstruct the request authority/scheme for virtual hosting and
-    %% reverse-proxy use; a compliant client may send `:authority` without a
-    %% `host` header, so it is not always recoverable otherwise. Consumers
-    %% that forward or reflect the header list MUST strip these pseudo-headers
-    %% first. `:method` and `:path` are already exposed as separate fields.
-    OtherHeaders = lists:filter(
-        fun({<<":protocol">>, _}) -> true;
-           ({<<":authority">>, _}) -> true;
-           ({<<":scheme">>, _})    -> true;
-           ({Name, _})             -> not is_pseudo_header(Name)
-        end, Headers),
-    {Method, Path, OtherHeaders}.
-
-%% RFC 9113 §8.3.2: :status MUST be present on a response HEADERS, exactly
-%% three ASCII digits in the range 100..599. Anything else is a malformed
-%% response and must trigger a stream PROTOCOL_ERROR.
-parse_status(Headers) ->
-    case proplists:get_value(<<":status">>, Headers) of
-        %% RFC 9113 §8.6: HTTP/2 MUST NOT accept 101 Switching Protocols.
-        <<"101">> -> malformed;
-        <<D1, D2, D3>> when D1 >= $1, D1 =< $5, D2 >= $0, D2 =< $9, D3 >= $0, D3 =< $9 ->
-            {ok, (D1 - $0) * 100 + (D2 - $0) * 10 + (D3 - $0)};
-        _ ->
-            malformed
-    end.
-
-%% RFC 9113 §6.5.2 / RFC 7541 §4.1: per-header overhead is 32 bytes plus the
-%% name and value octets. Returns the advisory "header list size" sum.
-header_list_size(Headers) ->
-    lists:foldl(fun({N, V}, Acc) ->
-        Acc + 32 + byte_size(N) + byte_size(V)
-    end, 0, Headers).
-
 %% Enforce peer-advertised SETTINGS_MAX_HEADER_LIST_SIZE before encoding.
 check_peer_max_header_list_size(Headers, #state{peer_settings = PS}) ->
     case h2_settings:get(max_header_list_size, PS) of
         unlimited -> ok;
         Max when is_integer(Max) ->
-            case header_list_size(Headers) > Max of
+            case h2_headers:header_list_size(Headers) > Max of
                 true  -> {error, header_list_too_large};
                 false -> ok
             end
@@ -2228,26 +1896,11 @@ check_local_max_header_list_size(Headers, #state{local_settings = LS}) ->
     case h2_settings:get(max_header_list_size, LS) of
         unlimited -> ok;
         Max when is_integer(Max) ->
-            case header_list_size(Headers) > Max of
+            case h2_headers:header_list_size(Headers) > Max of
                 true  -> {error, protocol_error};
                 false -> ok
             end
     end.
-
-%% RFC 9113 §8.1.1, §8.2: validate every outbound header block.
-%% The existing Mode parameter of validate_initial_headers refers to the
-%% *receiver*'s role (server validates requests, client validates responses),
-%% so for outbound validation we flip: sending a request → server rules,
-%% sending a response → client rules.
-validate_outbound_request(Headers) ->
-    validate_initial_headers(server, Headers).
-
-validate_outbound_response(Headers) ->
-    %% Status 101 already rejected before calling.
-    validate_initial_headers(client, Headers).
-
-is_pseudo_header(<<$:, _/binary>>) -> true;
-is_pseudo_header(_) -> false.
 
 %% ============================================================================
 %% Internal: Data Frame Handling
@@ -2524,7 +2177,7 @@ handle_send_request(From, Method, Path, Headers, EndStream, #state{mode = client
                     AllHeaders = Pseudo
                                  ++ lists:filter(fun({N1, _}) -> N1 =/= <<"host">> end, Headers),
 
-            case validate_outbound_request(AllHeaders) of
+            case h2_headers:validate_outbound_request(AllHeaders) of
                 {error, _} = Err ->
                     {keep_state, State, [{reply, From, Err}]};
                 ok ->
@@ -2604,7 +2257,7 @@ handle_send_request_headers(From, Headers, EndStream, Opts,
                 {error, _} = ECErr ->
                     {keep_state, State, [{reply, From, ECErr}]};
                 ok ->
-            case validate_outbound_request(Headers) of
+            case h2_headers:validate_outbound_request(Headers) of
                 {error, _} = Err ->
                     {keep_state, State, [{reply, From, Err}]};
                 ok ->
@@ -2695,15 +2348,15 @@ handle_send_response(From, StreamId, Status, Headers, Opts,
             IsConnectRequest = ReqMethod =:= <<"CONNECT">>,
             IsSuccess        = Status >= 200 andalso Status < 300,
             case IsConnectRequest andalso IsSuccess andalso
-                 has_banned_tunnel_header(Headers) of
+                 h2_headers:has_banned_tunnel_header(Headers) of
                 true ->
                     {keep_state, State,
                      [{reply, From, {error, banned_header_in_tunnel_response}}]};
                 false ->
                     StatusBin = integer_to_binary(Status),
                     AllHeaders = [{<<":status">>, StatusBin}
-                                  | outbound_response_headers(Status, Headers)],
-                    case validate_outbound_response(AllHeaders) of
+                                  | h2_headers:outbound_response_headers(Status, Headers)],
+                    case h2_headers:validate_outbound_response(AllHeaders) of
                         {error, _} = Err ->
                             {keep_state, State, [{reply, From, Err}]};
                         ok ->
@@ -2717,7 +2370,7 @@ handle_send_response(From, StreamId, Status, Headers, Opts,
                     %% End the stream here; later send_data and send_trailers
                     %% then succeed without touching the wire. A 1xx never
                     %% ends the stream, even on HEAD.
-                    NoContent = no_content_status(ReqMethod, Status),
+                    NoContent = h2_headers:no_content_status(ReqMethod, Status),
                     case send_header_block(StreamId, HeaderBlock, NoContent, State) of
                         ok ->
                             NewTunnel = IsConnectRequest andalso IsSuccess,
@@ -2795,8 +2448,8 @@ handle_respond(From, StreamId, Status, Headers, Body,
                andalso Status =/= 101
                andalso ReqMethod =/= <<"CONNECT">> ->
             AllHeaders = [{<<":status">>, integer_to_binary(Status)}
-                          | outbound_response_headers(Status, Headers)],
-            case validate_outbound_response(AllHeaders) of
+                          | h2_headers:outbound_response_headers(Status, Headers)],
+            case h2_headers:validate_outbound_response(AllHeaders) of
                 {error, _} = Err ->
                     {keep_state, State, [{reply, From, Err}]};
                 ok ->
@@ -2805,7 +2458,7 @@ handle_respond(From, StreamId, Status, Headers, Body,
                     {keep_state, State, [{reply, From, SErr}]};
                 ok ->
             {HeaderBlock, EncCtx1} = h2_hpack:encode(AllHeaders, EncCtx),
-            NoContent = no_content_status(ReqMethod, Status),
+            NoContent = h2_headers:no_content_status(ReqMethod, Status),
             HeadersFit = byte_size(HeaderBlock) =< MaxFrameSize,
             BodySize = byte_size(Body),
             if
@@ -2921,25 +2574,6 @@ data_frames(StreamId, Bin, MaxFrameSize, End) ->
     <<Chunk:MaxFrameSize/binary, Rest/binary>> = Bin,
     [h2_frame:encode_iodata({data, StreamId, Chunk, false})
      | data_frames(StreamId, Rest, MaxFrameSize, End)].
-
-%% RFC 9110 §6.4.1: a final response to HEAD, and any 204 or 304, has no
-%% content. A 1xx is interim and never ends the stream (§15.2).
-no_content_status(ReqMethod, Status) ->
-    Status >= 200 andalso
-        (ReqMethod =:= <<"HEAD">> orelse Status =:= 204 orelse Status =:= 304).
-
-%% RFC 9110 §8.6: a server MUST NOT send Content-Length in a 1xx or 204
-%% response. Drop it if the caller set one; 304 and HEAD keep theirs.
-outbound_response_headers(Status, Headers) when Status < 200; Status =:= 204 ->
-    [H || {Name, _} = H <- Headers, Name =/= <<"content-length">>];
-outbound_response_headers(_Status, Headers) ->
-    Headers.
-
-%% RFC 7540 §8.3: forbidden on a 2xx CONNECT response.
-has_banned_tunnel_header(Headers) ->
-    lists:any(fun({Name, _}) ->
-        Name =:= <<"content-length">> orelse Name =:= <<"transfer-encoding">>
-    end, Headers).
 
 %% Buffer the payload onto the stream's send_buffer (with cap check), then
 %% drain at most one DATA frame synchronously. If more remains and the
@@ -3108,7 +2742,7 @@ handle_send_trailers(From, StreamId, Trailers, #state{streams = Streams} = State
             {keep_state, State, [{reply, From, {error, tunnel_no_trailers}}]};
         {ok, #stream{state = StreamState, send_buffer = Buffer} = Stream}
           when StreamState == open; StreamState == half_closed_remote ->
-            case validate_trailers(Trailers, true) of
+            case h2_headers:validate_trailers(Trailers, true) of
                 {error, _} = Err ->
                     {keep_state, State, [{reply, From, Err}]};
                 ok ->
@@ -4036,70 +3670,6 @@ data_frames_test_() ->
      %% Exact multiple: two full frames, END_STREAM on the second.
      ?_assertEqual([Max, Max], [byte_size(P) || {P, _} <- Frames2]),
      ?_assertEqual([false, true], [E || {_, E} <- Frames2])].
-
-parse_status_test_() ->
-    [?_assertEqual({ok, 200}, parse_status([{<<":status">>, <<"200">>}])),
-     ?_assertEqual({ok, 100}, parse_status([{<<":status">>, <<"100">>}])),
-     ?_assertEqual({ok, 599}, parse_status([{<<":status">>, <<"599">>}])),
-     ?_assertEqual(malformed, parse_status([{<<":status">>, <<"abc">>}])),
-     ?_assertEqual(malformed, parse_status([{<<":status">>, <<"2000">>}])),
-     ?_assertEqual(malformed, parse_status([{<<":status">>, <<"99">>}])),
-     ?_assertEqual(malformed, parse_status([{<<":status">>, <<"600">>}])),
-     ?_assertEqual(malformed, parse_status([{<<":status">>, <<>>}])),
-     ?_assertEqual(malformed, parse_status([]))].
-
-parse_content_length_test_() ->
-    [?_assertEqual({ok, undefined}, parse_content_length([])),
-     ?_assertEqual({ok, 0},  parse_content_length([{<<"content-length">>, <<"0">>}])),
-     ?_assertEqual({ok, 42}, parse_content_length([{<<"content-length">>, <<"42">>}])),
-     %% Duplicate with same value collapses.
-     ?_assertEqual({ok, 42}, parse_content_length([{<<"content-length">>, <<"42">>},
-                                                    {<<"content-length">>, <<"42">>}])),
-     %% Mismatched duplicates → malformed.
-     ?_assertEqual({error, protocol_error},
-                   parse_content_length([{<<"content-length">>, <<"1">>},
-                                         {<<"content-length">>, <<"2">>}])),
-     %% Non-numeric.
-     ?_assertEqual({error, protocol_error},
-                   parse_content_length([{<<"content-length">>, <<"abc">>}])),
-     %% Negative.
-     ?_assertEqual({error, protocol_error},
-                   parse_content_length([{<<"content-length">>, <<"-1">>}]))].
-
-header_value_validation_test_() ->
-    [?_assertEqual({error, protocol_error},
-                   check_lowercase_names([{<<"x">>, <<"a", 0, "b">>}])),
-     ?_assertEqual({error, protocol_error},
-                   check_lowercase_names([{<<"x">>, <<"a\nb">>}])),
-     ?_assertEqual({error, protocol_error},
-                   check_lowercase_names([{<<"x">>, <<"a\rb">>}])),
-     ?_assertEqual({error, protocol_error},
-                   check_lowercase_names([{<<>>, <<"v">>}])),
-     ?_assertEqual(ok,
-                   check_lowercase_names([{<<"x">>, <<"ok">>}]))].
-
-extract_request_headers_test_() ->
-    Req = [{<<":method">>, <<"GET">>},
-           {<<":scheme">>, <<"https">>},
-           {<<":authority">>, <<"example.com:443">>},
-           {<<":path">>, <<"/index">>},
-           {<<":protocol">>, <<"websocket">>},
-           {<<"accept">>, <<"text/html">>}],
-    {Method, Path, Other} = extract_request_headers(Req),
-    [%% :method and :path become separate fields.
-     ?_assertEqual(<<"GET">>, Method),
-     ?_assertEqual(<<"/index">>, Path),
-     %% :authority/:scheme/:protocol survive for adapters.
-     ?_assertEqual(<<"example.com:443">>, proplists:get_value(<<":authority">>, Other)),
-     ?_assertEqual(<<"https">>, proplists:get_value(<<":scheme">>, Other)),
-     ?_assertEqual(<<"websocket">>, proplists:get_value(<<":protocol">>, Other)),
-     %% :method/:path are stripped from the header list.
-     ?_assertEqual(undefined, proplists:get_value(<<":method">>, Other)),
-     ?_assertEqual(undefined, proplists:get_value(<<":path">>, Other)),
-     %% Regular headers pass through.
-     ?_assertEqual(<<"text/html">>, proplists:get_value(<<"accept">>, Other)),
-     %% Defaults when :method/:path absent.
-     ?_assertEqual({<<"GET">>, <<"/">>, []}, extract_request_headers([]))].
 
 %% Extension settings kept under a raw 16-bit id (e.g. SETTINGS_WT_ENABLED,
 %% 0x2b67) go on the wire; ids past 16 bits and unknown atoms do not.
