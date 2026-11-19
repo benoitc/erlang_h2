@@ -1,4 +1,4 @@
-%% @doc HTTP/2 Connection State Machine (RFC 7540)
+%% @doc HTTP/2 Connection State Machine (RFC 9113)
 %%
 %% This module implements the HTTP/2 connection protocol using gen_statem.
 %% It handles both client and server modes, managing the connection preface,
