@@ -597,6 +597,13 @@ Production-oriented: spec-correct and deterministic under the in-tree CT suite. 
 - Stream priorities (§5.3) — deprecated by RFC 9218.
 - Alt-Svc and HTTP/2 cleartext upgrade (§3.2) — ALPN-only in this release.
 
+## Where to read next
+
+- [Features](docs/features.md): what is supported, rule by rule, and the events your process receives.
+- [Architecture](docs/architecture.md): how a connection is built, where events go, and the limits that protect it. Read it before you read the source.
+- [Contributing](docs/contributing.md): the checks to run, how to write a test, and where to change what.
+- [Inside h2_connection](docs/internals/connection.md) and [The wire codecs](docs/internals/wire.md): guides to the source.
+
 ## License
 
 Apache License 2.0
