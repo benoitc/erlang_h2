@@ -1016,8 +1016,7 @@ process_frames_1(StateName, #state{buffer = Buffer, local_settings = Local} = St
         {error, {stream_error, StreamId, ErrorCode}, Rest} ->
             %% Frame-level decode error scoped to a single stream
             %% (e.g. WINDOW_UPDATE 0 on a non-zero stream id).
-            State0 = sent_rst(StreamId, ErrorCode, State),
-            State1 = close_stream(StreamId, rst, State0),
+            State1 = reset_stream(StreamId, ErrorCode, State),
             process_frames(StateName, State1#state{buffer = Rest});
         {error, Reason} ->
             State1 = send_goaway_frame(State#state.last_peer_stream_id, Reason, State),
@@ -1147,9 +1146,8 @@ handle_frame(_StateName, {window_update, StreamId, Increment}, #state{streams = 
             NewWindow = Window + Increment,
             if
                 NewWindow > ?MAX_WINDOW_SIZE ->
-                    State0 = sent_rst(StreamId, flow_control_error, State),
-                    State1 = close_stream(StreamId, rst, State0),
-                    {ok, connected, State1};
+                    {ok, connected,
+                     reset_stream(StreamId, flow_control_error, State)};
                 true ->
                     Stream1 = Stream#stream{window_size = NewWindow},
                     State1 = State#state{streams = maps:put(StreamId, Stream1, Streams)},
@@ -1213,7 +1211,7 @@ handle_frame(_StateName, {rst_stream, StreamId, ErrorCode},
 
 %% RFC 9113 §5.3.1: a stream cannot depend on itself — stream PROTOCOL_ERROR.
 handle_frame(_StateName, {priority, StreamId, _Exclusive, StreamId, _Weight}, State) ->
-    {ok, connected, sent_rst(StreamId, protocol_error, State)};
+    {ok, connected, reset_stream(StreamId, protocol_error, State)};
 handle_frame(_StateName, {priority, _StreamId, _Exclusive, _DependsOn, _Weight}, State) ->
     %% Priority is advisory, ignore
     {ok, connected, State};
@@ -1525,7 +1523,7 @@ reject_header_block(StreamId, ErrorCode, HeaderBlock, EndHeaders, State0) ->
     %% be dropped. Every other reset here is a peer protocol error and counts.
     State = case ErrorCode of
         refused_stream -> _ = send_rst_stream(StreamId, ErrorCode, State0), State0;
-        _              -> sent_rst(StreamId, ErrorCode, State0)
+        _              -> reset_stream(StreamId, ErrorCode, State0)
     end,
     discard_header_block(StreamId, HeaderBlock, EndHeaders, State).
 
@@ -1558,12 +1556,8 @@ decode_and_process_headers(StreamId, HeaderBlock, EndStream, #state{decode_conte
             %% RFC 9113 §6.5.2: enforce our advertised MAX_HEADER_LIST_SIZE.
             case check_local_max_header_list_size(Headers, State1) of
                 {error, _} ->
-                    State1b = sent_rst(StreamId, protocol_error, State1),
-                    State2 = case maps:is_key(StreamId, State1b#state.streams) of
-                        true -> close_stream(StreamId, rst, State1b);
-                        false -> State1b
-                    end,
-                    {ok, connected, State2};
+                    {ok, connected,
+                     reset_stream(StreamId, protocol_error, State1)};
                 ok ->
                     decode_and_process_headers_validated(Mode, StreamId, Headers, EndStream, State1)
             end;
@@ -1594,12 +1588,7 @@ decode_and_process_headers_validated(Mode, StreamId, Headers, EndStream, State1)
                 ok ->
                     decode_and_process_headers_cont(Kind, StreamId, Headers, EndStream, State1);
                 {error, ValidErr} ->
-                    State1b = sent_rst(StreamId, ValidErr, State1),
-                    State2 = case maps:is_key(StreamId, State1b#state.streams) of
-                        true -> close_stream(StreamId, rst, State1b);
-                        false -> State1b
-                    end,
-                    {ok, connected, State2}
+                    {ok, connected, reset_stream(StreamId, ValidErr, State1)}
             end.
 
 classify_headers(server, StreamId, _Headers, State) ->
@@ -1642,11 +1631,11 @@ dispatch_headers(server, trailers, StreamId, Stream, Headers, true, State) ->
 %% RFC 9113 §8.1 / RFC 9110 §15.2: interim responses MUST NOT carry END_STREAM
 %% and MUST NOT carry content (Content-Length is meaningless).
 dispatch_headers(client, interim, StreamId, _Stream, _Headers, true, State) ->
-    stream_reject_and_close(StreamId, protocol_error, State);
+    stream_reject(StreamId, protocol_error, State);
 dispatch_headers(client, interim, StreamId, _Stream, Headers, false, State) ->
     case proplists:is_defined(<<"content-length">>, Headers) of
         true ->
-            stream_reject_and_close(StreamId, protocol_error, State);
+            stream_reject(StreamId, protocol_error, State);
         false ->
             {ok, Status} = parse_status(Headers),
             State1 = dispatch_stream_event(StreamId,
@@ -1657,7 +1646,7 @@ dispatch_headers(client, interim, StreamId, _Stream, Headers, false, State) ->
 %% Client receives the final response HEADERS.
 dispatch_headers(client, initial, StreamId, Stream, Headers, EndStream, State) ->
     case parse_status(Headers) of
-        malformed    -> stream_reject_and_close(StreamId, protocol_error, State);
+        malformed    -> stream_reject(StreamId, protocol_error, State);
         {ok, Status} -> handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State)
     end;
 
@@ -1754,8 +1743,7 @@ handle_client_initial(StreamId, Stream, Headers, Status, EndStream, State) ->
 %% END_STREAM is absent on the header block, the response is malformed
 %% and the stream must not be left open for later frames.
 finalize_client_initial(StreamId, false, _ExpectedCL, true, State) ->
-    State1 = dispatch_stream_event(StreamId, {stream_reset, StreamId, protocol_error}, State),
-    stream_reject_and_close(StreamId, protocol_error, State1);
+    stream_reject(StreamId, protocol_error, State);
 %% Body-less response with END_STREAM — the response is complete. A
 %% non-zero content-length on HEAD is allowed (RFC 9110 §9.3.2, it
 %% indicates what the GET response size would be) — do not reject it.
@@ -1769,7 +1757,7 @@ finalize_client_initial(_StreamId, false, _ExpectedCL, false, State) ->
 %% is malformed: the body can't be both empty and non-empty.
 finalize_client_initial(StreamId, true, ExpectedCL, false, State)
   when ExpectedCL =/= undefined, ExpectedCL > 0 ->
-    stream_reject_and_close(StreamId, protocol_error, State);
+    stream_reject(StreamId, protocol_error, State);
 %% Body-allowed response with END_STREAM and either no content-length or
 %% content-length=0: emit the trailing empty DATA event so owners waiting
 %% on end-of-stream don't hang. Matches quic_h3.
@@ -1823,7 +1811,7 @@ strip_pseudo(Headers) ->
     lists:filter(fun({N, _}) -> not is_pseudo_header(N) end, Headers).
 
 stream_reject(StreamId, ErrorCode, State) ->
-    {ok, connected, sent_rst(StreamId, ErrorCode, State)}.
+    {ok, connected, reset_stream(StreamId, ErrorCode, State)}.
 
 %% A stream whose body is over `max_body_size`.
 %%
@@ -1874,10 +1862,6 @@ max_body_size(Opts) ->
 goaway_timeout(infinity) -> infinity;
 goaway_timeout(Ms) when is_integer(Ms), Ms >= 0 -> Ms;
 goaway_timeout(Other) -> error({badarg, {goaway_timeout, Other}}).
-
-stream_reject_and_close(StreamId, ErrorCode, State) ->
-    State1 = sent_rst(StreamId, ErrorCode, State),
-    {ok, connected, close_stream(StreamId, rst, State1)}.
 
 %% RFC 9113 §8.1.1: Content-Length parser. Multiple headers with the same
 %% value collapse into one; mismatched values are malformed. Non-numeric or
@@ -2277,9 +2261,8 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
                         ReceivedSoFar + DataSize > State#state.max_body_size,
                     if
                         FlowControlled > StreamWindow ->
-                            State0b = sent_rst(StreamId, flow_control_error, State0a),
-                            State1 = close_stream(StreamId, rst, State0b),
-                            {ok, connected, State1};
+                            {ok, connected,
+                             reset_stream(StreamId, flow_control_error, State0a)};
                         TooLarge ->
                             {ok, connected,
                              too_large(StreamId, Stream, true, State0a)};
@@ -2288,13 +2271,8 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
                             %% are never delivered; the owner (or stream
                             %% handler), which has seen the request or
                             %% response, is told the stream failed.
-                            State0r = dispatch_stream_event(
-                                        StreamId,
-                                        {stream_reset, StreamId, protocol_error},
-                                        State0a),
-                            State0b = sent_rst(StreamId, protocol_error, State0r),
-                            State1 = close_stream(StreamId, rst, State0b),
-                            {ok, connected, State1};
+                            {ok, connected,
+                             reset_stream(StreamId, protocol_error, State0a)};
                         true ->
                             NewStreamWindow = StreamWindow - FlowControlled,
                             Stream1 = Stream#stream{
@@ -2335,7 +2313,7 @@ handle_data_frame(StreamId, Data, EndStream, FlowControlled,
                     {ok, connected, sent_rst(StreamId, stream_closed, State0a)};
                 {ok, _} ->
                     %% half_closed_remote etc.: stream-scoped STREAM_CLOSED.
-                    {ok, connected, sent_rst(StreamId, stream_closed, State0a)};
+                    {ok, connected, reset_stream(StreamId, stream_closed, State0a)};
                 error ->
                     case recently_closed_reason(StreamId, State0a) of
                         end_stream ->
@@ -3875,6 +3853,22 @@ sent_rst(StreamId, ErrorCode, #state{sent_rst_flood = {Bucket, Count}} = State) 
         false -> {Now, 1}
     end,
     State#state{sent_rst_flood = NewBC}.
+
+%% Reset a stream because of what the peer sent (RFC 9113 §5.4.2). A stream
+%% that is still live is reported to its handler (or the owner) as
+%% `stream_reset' and closed: sending RST_STREAM closes it (§5.1), and a
+%% handler that is not told keeps waiting on a dead stream. An unknown or
+%% already closed stream only gets the RST_STREAM. The reset counts against
+%% the MadeYouReset budget either way.
+reset_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream{state = StreamState}} when StreamState =/= closed ->
+            State1 = dispatch_stream_event(
+                       StreamId, {stream_reset, StreamId, ErrorCode}, State),
+            close_stream(StreamId, rst, sent_rst(StreamId, ErrorCode, State1));
+        _ ->
+            sent_rst(StreamId, ErrorCode, State)
+    end.
 
 %% True once we have sent more than the per-second cap of peer-triggered
 %% resets in the current second.
