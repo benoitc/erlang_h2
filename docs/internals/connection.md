@@ -67,10 +67,22 @@ written out in several places and the copies drifted apart.
 | `put_stream/3` | store a stream record | the active-stream counters stay exact |
 | `close_stream/3` | close a stream | blocked senders are released, the close reason is remembered for late frames (`h2_closed_streams`), old records are evicted |
 | `bump_flood_counter/2` | count a frame the peer can send cheaply | the per-second cap for that frame type |
+| `check_outbound/3` | check a header block before you send it (request, response or trailers) | it is validated first, then held to the peer's header list limit, and nothing is encoded if it is refused |
+| `send_failed/3` | end a call whose socket write failed | the caller gets the reason and the connection stops |
+| `after_local_end/1`, `close_if_ended/3` | move a stream on after you sent END_STREAM | the same transition on every send path, and the stream is closed once both sides have ended |
+| `open_client_stream/6` | send the HEADERS of a new request | the stream is stored and its id taken only if the write succeeded |
 | `notify_owner/2` | send a connection event | one place that knows who the owner is |
 
 If you find yourself writing `send_rst_stream` followed by `close_stream`,
 you want `reset_stream/3`.
+
+The calls that send a header block (`handle_send_request/6`,
+`handle_send_request_headers/5`, `handle_send_response/6`, `handle_respond/6`)
+each keep their own checks, because the order in which errors are reported is
+part of their contract and `test/h2_send_paths_tests.erl` pins it. Only the
+steps that are identical are shared. The small helpers are inlined by the
+compiler (see the `-compile` attribute at the top of the file), so using them
+costs nothing on the request path.
 
 ## Things that are easy to break
 

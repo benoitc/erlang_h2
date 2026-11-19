@@ -89,7 +89,7 @@ Section names are the banner comments in `src/h2_connection.erl`.
 | Whether a header list is well formed (pseudo-headers, field syntax, Content-Length, trailers) | `src/h2_headers.erl` | in-module tests, `h2_compliance_SUITE`, `h2_interop_SUITE` |
 | What a request, response or trailers do to a stream; tunnels | `h2_connection`: Headers Handling | `h2_compliance_SUITE`, `h2_no_content_tests`, `h2_reset_notify_tests` |
 | Receiving DATA, body length, receive windows | `h2_connection`: Data Frame Handling | `h2_conn_window_tests`, `h2_max_body_size_tests` |
-| Sending responses, data, trailers, send windows | `h2_connection`: Send Operations | `h2_coalesce_tests`, `h2_grpc_tests`, `h2_grpc_frame_tests` |
+| Sending requests, responses, data, trailers, send windows | `h2_connection`: Send Operations | `h2_send_paths_tests`, `h2_coalesce_tests`, `h2_grpc_tests`, `h2_grpc_frame_tests` |
 | Which process receives an event | `dispatch_stream_event/3` | `h2_grpc_tests`, `h2_reset_notify_tests` |
 | Stream table, counts, closing | `h2_connection`: Stream Management, `src/h2_closed_streams.erl` | `h2_stream_count_tests`, `h2_stream_available_tests` |
 | Limits against a hostile peer | the macros at the top of `h2_connection`, `sent_rst/3`, `bump_flood_counter/2` | `h2_made_you_reset_tests`, `h2_settings_flood_tests`, `h2_robustness_SUITE` |
