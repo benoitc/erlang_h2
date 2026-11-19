@@ -2,6 +2,15 @@
 
 All notable changes to `h2` are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.18.3] - 2026-11-19
+
+### Changed
+
+- Internal reorganisation with no change in behaviour or in the API. Header
+  validation and the memory of closed streams moved out of the connection
+  module into their own modules, and the calls that send requests and
+  responses now share their common steps. Nothing to do when upgrading.
+
 ## [0.18.2] - 2026-11-19
 
 ### Fixed
