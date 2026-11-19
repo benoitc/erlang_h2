@@ -140,6 +140,8 @@ Useful to know when extending or debugging. [Architecture](architecture.md) expl
 | `h2` | Besides the public API, holds the accept loop and the per-connection serving code. It is here, not in `h2_listener`, because `h2:serve_socket/2` runs the same code in a process the caller owns (a listener that picks h2 or HTTP/1.1 by ALPN, for example). |
 | `h2_listener` | Per-server process spawned under `h2_sup`: owns the listen socket and the lifetime of the acceptors, which run the loop `h2` gives it. |
 | `h2_server` | Standalone escript entry point; not used by `h2:start_server/2`. |
+| `h2_headers` | Pure validation and reading of header lists: pseudo-headers, field syntax, Content-Length, trailers. |
+| `h2_closed_streams` | Bounded memory of how recently closed streams ended, used to classify late frames. |
 | `h2_frame` | Pure frame encode/decode with per-type stream-id 0 and size validation. |
 | `h2_hpack` | HPACK context type, encode/decode, size updates, Huffman. |
 | `h2_settings` | Typed settings map, encode/decode/validate, parameter defaults. |

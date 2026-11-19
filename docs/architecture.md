@@ -141,7 +141,8 @@ and trailers are a stream error.
 ## Limits against a hostile peer
 
 A peer can reach this code without authentication, so every per-peer resource
-has a bound. They are macros at the top of `h2_connection.erl`.
+has a bound. They are macros at the top of `h2_connection.erl`, except the
+closed-stream bounds, which are in `h2_closed_streams.erl`.
 
 | Limit | Value | Defends against |
 | --- | --- | --- |
@@ -161,7 +162,7 @@ Past a per-second limit the connection sends GOAWAY with ENHANCE_YOUR_CALM.
 | --- | --- |
 | `h2` | The API. Stable. |
 | `h2_capsule`, `h2_varint`, `h2_error` | Called directly by other projects (erlang-webtransport). Treat a change as an API change. |
-| `h2_connection`, `h2_frame`, `h2_hpack`, `h2_settings`, `h2_listener` | Internal. Reach them through `h2`. |
+| `h2_connection`, `h2_headers`, `h2_closed_streams`, `h2_frame`, `h2_hpack`, `h2_settings`, `h2_listener` | Internal. Reach them through `h2`. |
 | `h2_server`, `h2_client` | Standalone command-line tools (escripts). The library does not use them. |
 
 WebTransport is not implemented here. `h2` supplies what a WebTransport
